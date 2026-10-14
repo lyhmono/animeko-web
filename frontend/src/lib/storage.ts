@@ -30,7 +30,7 @@ function removeRaw(key: string): void {
   }
 }
 
-function readJson<T>(key: string, fallback: T): T {
+export function readJson<T>(key: string, fallback: T): T {
   const raw = readRaw(key)
   if (raw == null) return fallback
   try {
@@ -40,7 +40,7 @@ function readJson<T>(key: string, fallback: T): T {
   }
 }
 
-function writeJson(key: string, value: unknown): void {
+export function writeJson(key: string, value: unknown): void {
   writeRaw(key, JSON.stringify(value))
 }
 
@@ -77,7 +77,7 @@ export interface ProgressEntry {
   ts: number
 }
 
-export function progressKeyOf(source: string, playUrl: string): string {
+function progressKeyOf(source: string, playUrl: string): string {
   return `progress:${source}:${playUrl}`
 }
 
@@ -110,9 +110,21 @@ export interface FavoriteSubject {
 export function listFavorites(): FavoriteSubject[] {
   const list = readJson<FavoriteSubject[]>(`favorites`, [])
   if (!Array.isArray(list)) return []
+  // 逐字段归一化：localStorage 是外部输入面（被人改过 / 写入中断 / 旧版本残留），
+  // 只校验 id 的话，score 是字符串就会让 FavoritesPage 抛 toFixed is not a function，
+  // 而唯一的边界在 <Routes> 之上，于是整站变成错误页。
   return list
     .filter((f) => f && typeof f.id === 'number')
-    .sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))
+    .map((f) => ({
+      id: f.id,
+      name: String(f.name ?? ''),
+      name_cn: String(f.name_cn ?? ''),
+      cover: String(f.cover ?? ''),
+      date: String(f.date ?? ''),
+      score: typeof f.score === 'number' ? f.score : null,
+      ts: typeof f.ts === 'number' ? f.ts : 0,
+    }))
+    .sort((a, b) => b.ts - a.ts)
 }
 
 export function isFavorite(id: number): boolean {
@@ -174,6 +186,14 @@ export function listRecent(limit = RECENT_LIMIT): RecentItem[] {
   if (!Array.isArray(list)) return []
   return list
     .filter((r) => r && typeof r.playUrl === 'string' && r.playUrl.startsWith('http'))
+    .map((r) => ({
+      source: String(r.source ?? ''),
+      playUrl: r.playUrl,
+      title: String(r.title ?? ''),
+      anime: String(r.anime ?? ''),
+      ep: String(r.ep ?? ''),
+      ts: typeof r.ts === 'number' ? r.ts : 0,
+    }))
     .slice(0, limit)
 }
 
@@ -184,8 +204,4 @@ export function addRecent(item: RecentItem): RecentItem[] {
   const next = [item, ...list].slice(0, RECENT_LIMIT)
   writeJson('recent', next)
   return next
-}
-
-export function clearRecent(): void {
-  removeRaw('recent')
 }

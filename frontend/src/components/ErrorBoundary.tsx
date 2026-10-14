@@ -23,7 +23,10 @@ export default class ErrorBoundary extends Component<Props, State> {
     console.error('ErrorBoundary caught:', error, info.componentStack)
   }
 
-  private retry = () => this.setState({ error: null })
+  // 只清 state 是不行的：React.lazy 失败后 payload._status 会永久停在 rejected，
+  // 重新渲染抛的还是同一个错误。重新部署导致旧 chunk 404 时（本项目最常见的故障），
+  // 只有整页重载才能拿到新的 index.html 与新的哈希文件名。
+  private retry = () => window.location.reload()
 
   render() {
     const { error } = this.state

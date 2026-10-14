@@ -21,7 +21,9 @@ interface PlayFlow {
 
 export default function SubjectPage() {
   const { id } = useParams<{ id: string }>()
-  const subjectId = Number(id)
+  const idNum = Number(id)
+  // Number('abc') 为 NaN、Number('') 为 0：必须显式校验正整数，否则无效 ID 会让页面卡在「加载中…」
+  const subjectId = Number.isInteger(idNum) && idNum > 0 ? idNum : 0
   const [subject, setSubject] = useState<BgmSubject | null>(null)
   const [error, setError] = useState('')
   const [sources, setSources] = useState<StoredSource[]>([])
@@ -29,16 +31,36 @@ export default function SubjectPage() {
   const [faved, setFaved] = useState(false)
 
   useEffect(() => {
-    if (!subjectId) return
+    // cancelled 守卫：切换条目时旧请求的响应不能覆盖新条目的数据
+    let cancelled = false
+    // 组件复用时必须重置上一条目遗留的错误与数据，否则错误会永久遮住新内容
+    setError('')
+    setSubject(null)
+    setFaved(false)
+    if (!subjectId) {
+      setError('无效的条目 ID')
+      return
+    }
     setFaved(isFavorite(subjectId))
     api
       .bangumiSubject(subjectId)
-      .then(setSubject)
-      .catch((e) => setError(errMsg(e)))
+      .then((s) => {
+        if (!cancelled) setSubject(s)
+      })
+      .catch((e) => {
+        if (!cancelled) setError(errMsg(e))
+      })
     api
       .sources()
-      .then((list) => setSources(list.filter((s) => s.enabled)))
-      .catch(() => setSources([]))
+      .then((list) => {
+        if (!cancelled) setSources(list.filter((s) => s.enabled))
+      })
+      .catch(() => {
+        if (!cancelled) setSources([])
+      })
+    return () => {
+      cancelled = true
+    }
   }, [subjectId])
 
   const enabledSources = sources
@@ -51,7 +73,7 @@ export default function SubjectPage() {
       name_cn: subject.name_cn,
       cover: subject.images?.large ?? subject.images?.common ?? '',
       date: subject.date ?? '',
-      score: subject.rating?.score ?? null,
+      score: subject.rating?.score ?? subject.score ?? null,
       ts: Date.now(),
     })
     setFaved(nowFaved)
@@ -148,19 +170,18 @@ export default function SubjectPage() {
 
   const cover = subject.images?.large ?? subject.images?.common ?? ''
   // 封面多尺寸 srcset：浏览器按实际显示宽度选图
-  const coverSrcSet = subject
-    ? (
-        [
-          [subject.images?.medium, '100w'],
-          [subject.images?.common, '200w'],
-          [subject.images?.large, '400w'],
-        ] as [string | null | undefined, string][]
-      )
-        .filter(([u]) => !!u)
-        .map(([u, w]) => `${u} ${w}`)
-        .join(', ')
-    : ''
-  const episodes = [...(subject.eps ?? [])].sort((a, b) => (a.sort ?? 0) - (b.sort ?? 0))
+  const coverSrcSet = (
+    [
+      [subject.images?.medium, '100w'],
+      [subject.images?.common, '200w'],
+      [subject.images?.large, '400w'],
+    ] as [string | null | undefined, string][]
+  )
+    .filter(([u]) => !!u)
+    .map(([u, w]) => `${u} ${w}`)
+    .join(', ')
+  const epsList = Array.isArray(subject.eps) ? subject.eps : []
+  const episodes = [...epsList].sort((a, b) => (a.sort ?? 0) - (b.sort ?? 0))
 
   return (
     <div>
@@ -181,7 +202,9 @@ export default function SubjectPage() {
             {(subject.rating?.score ?? subject.score) != null && (
               <span>评分 {subject.rating?.score ?? subject.score}</span>
             )}
-            {subject.rating?.rank != null && <span>排名 #{subject.rating.rank}</span>}
+            {(subject.rating?.rank ?? subject.rank) != null && (
+              <span>排名 #{subject.rating?.rank ?? subject.rank}</span>
+            )}
             {subject.date && <span>放送 {subject.date}</span>}
             <span>共 {episodes.length} 话</span>
           </div>

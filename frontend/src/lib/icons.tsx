@@ -166,22 +166,7 @@ export function IconMoon({ size, ...rest }: IconProps) {
   )
 }
 
-export function IconClose({ size, ...rest }: IconProps) {
-  return (
-    <Svg size={size} {...rest}>
-      <path d="M18 6L6 18" />
-      <path d="M6 6l12 12" />
-    </Svg>
-  )
-}
 
-export function IconSpinner({ size = 18, ...rest }: IconProps) {
-  return (
-    <Svg size={size} {...rest} className={`spin ${rest.className ?? ''}`}>
-      <path d="M21 12a9 9 0 1 1-6.2-8.6" />
-    </Svg>
-  )
-}
 
 export function IconHome({ size, ...rest }: IconProps) {
   return (
@@ -254,31 +239,8 @@ export function IconKeyboard({ size, ...rest }: IconProps) {
   )
 }
 
-export function IconChevronLeft({ size, ...rest }: IconProps) {
-  return (
-    <Svg size={size} {...rest}>
-      <path d="M15 18l-6-6 6-6" />
-    </Svg>
-  )
-}
 
-export function IconChevronRight({ size, ...rest }: IconProps) {
-  return (
-    <Svg size={size} {...rest}>
-      <path d="M9 18l6-6-6-6" />
-    </Svg>
-  )
-}
 
-export function IconExternal({ size, ...rest }: IconProps) {
-  return (
-    <Svg size={size} {...rest}>
-      <path d="M14 3h7v7" />
-      <path d="M21 3l-9.5 9.5" />
-      <path d="M19 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5" />
-    </Svg>
-  )
-}
 
 export function IconCheck({ size, ...rest }: IconProps) {
   return (
@@ -288,10 +250,3 @@ export function IconCheck({ size, ...rest }: IconProps) {
   )
 }
 
-export function IconStar({ size, ...rest }: IconProps) {
-  return (
-    <Svg size={size} {...rest}>
-      <path d="M12 2.5l2.9 6 6.6.9-4.8 4.6 1.2 6.5L12 17.4l-5.9 3.1 1.2-6.5L2.5 9.4l6.6-.9z" />
-    </Svg>
-  )
-}

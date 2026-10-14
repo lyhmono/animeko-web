@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, errMsg } from '../api'
-import type { StoredSource, SubjectHit } from '../types'
+import type { StoredSource } from '../types'
 
 export default function SourcesPage() {
   const [sources, setSources] = useState<StoredSource[]>([])
@@ -8,15 +8,26 @@ export default function SourcesPage() {
   const [notice, setNotice] = useState('')
   const [importText, setImportText] = useState('')
   const [importing, setImporting] = useState(false)
-  const [testKeyword, setTestKeyword] = useState('')
+  // 关键词按数据源名分别保存：共用一个 state 会让所有输入框互相覆盖
+  const [testKeyword, setTestKeyword] = useState<Record<string, string>>({})
   const [testResult, setTestResult] = useState<Record<string, string>>({})
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
+  const [pendingToggles, setPendingToggles] = useState<Record<string, boolean>>({})
+  const [loading, setLoading] = useState(true)
+  const [loaded, setLoaded] = useState(false)
 
   const reload = useCallback(() => {
     api
       .sources()
-      .then(setSources)
-      .catch((e) => setError(errMsg(e)))
+      .then((list) => {
+        setSources(list)
+        setLoaded(true)
+      })
+      .catch((e) => {
+        setError(errMsg(e))
+        setLoaded(false)
+      })
+      .finally(() => setLoading(false))
   }, [])
 
   useEffect(reload, [reload])
@@ -39,10 +50,11 @@ export default function SourcesPage() {
   }
 
   const testSearch = async (name: string) => {
-    if (!testKeyword.trim()) return
+    const keyword = (testKeyword[name] ?? '').trim()
+    if (!keyword) return
     setTestResult((r) => ({ ...r, [name]: '搜索中…' }))
     try {
-      const hits = await api.sourceSearch(name, testKeyword.trim())
+      const hits = await api.sourceSearch(name, keyword)
       setTestResult((r) => ({ ...r, [name]: `找到 ${hits.length} 个结果` }))
     } catch (e) {
       setTestResult((r) => ({ ...r, [name]: `失败：${errMsg(e)}` }))
@@ -50,8 +62,16 @@ export default function SourcesPage() {
   }
 
   const toggle = async (name: string, enabled: boolean) => {
-    await api.setSourceEnabled(name, enabled).catch(() => {})
-    reload()
+    setError('')
+    setPendingToggles((p) => ({ ...p, [name]: true }))
+    try {
+      await api.setSourceEnabled(name, enabled)
+      reload()
+    } catch (e) {
+      setError(errMsg(e))
+    } finally {
+      setPendingToggles((p) => ({ ...p, [name]: false }))
+    }
   }
 
   const remove = (name: string) => {
@@ -63,8 +83,13 @@ export default function SourcesPage() {
     const name = pendingDelete
     if (!name) return
     setPendingDelete(null)
-    await api.deleteSource(name).catch(() => {})
-    reload()
+    setError('')
+    try {
+      await api.deleteSource(name)
+      reload()
+    } catch (e) {
+      setError(errMsg(e))
+    }
   }
 
   return (
@@ -91,6 +116,7 @@ export default function SourcesPage() {
         </div>
       )}
 
+      {loading && <div className="loading">数据源加载中…</div>}
       {sources.map((s) => (
         <div className="source-item" key={s.arguments.name}>
           <div className="info">
@@ -107,8 +133,11 @@ export default function SourcesPage() {
           <div className="actions">
             <input
               placeholder="测试关键词"
-              value={testKeyword}
-              onChange={(e) => setTestKeyword(e.target.value)}
+              value={testKeyword[s.arguments.name] ?? ''}
+              onChange={(e) => {
+                const value = e.target.value
+                setTestKeyword((k) => ({ ...k, [s.arguments.name]: value }))
+              }}
               onKeyDown={(e) => e.key === 'Enter' && void testSearch(s.arguments.name)}
               style={{ width: 130 }}
             />
@@ -117,7 +146,12 @@ export default function SourcesPage() {
             </button>
             <button
               className={`switch ${s.enabled ? 'on' : ''}`}
+              role="switch"
+              aria-checked={s.enabled}
+              aria-label={`${s.arguments.name}：${s.enabled ? '已启用，点击停用' : '已停用，点击启用'}`}
               title={s.enabled ? '点击停用' : '点击启用'}
+              disabled={!!pendingToggles[s.arguments.name]}
+              style={pendingToggles[s.arguments.name] ? { opacity: 0.5 } : undefined}
               onClick={() => void toggle(s.arguments.name, !s.enabled)}
             />
             <button className="btn btn-danger btn-sm" onClick={() => remove(s.arguments.name)}>
@@ -146,7 +180,12 @@ export default function SourcesPage() {
         </div>
       )}
 
-      {sources.length === 0 && <div className="empty">暂无数据源，请在下方导入</div>}
+      {!loading && loaded && sources.length === 0 && (
+        <div className="empty">暂无数据源，请在下方导入</div>
+      )}
+      {!loading && !loaded && sources.length === 0 && (
+        <div className="empty">数据源列表加载失败，请检查上方错误提示后重试</div>
+      )}
 
       <h2 className="section-title">导入数据源</h2>
       <div className="card import-box">

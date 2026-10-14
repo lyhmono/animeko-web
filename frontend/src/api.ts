@@ -17,7 +17,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     let message = `${resp.status} ${resp.statusText}`
     try {
       const body = await resp.json()
-      if (body?.error) message = body.error
+      // 服务端对未预期异常只回 INTERNAL_ERROR（细节进服务端日志），
+      // 所以这里必须保留状态码，否则用户报障时没有任何可定位信息
+      if (body?.error) message = `${resp.status} ${body.error}`
     } catch {
       // 非 JSON 错误响应
     }
@@ -88,10 +90,6 @@ export function proxyUrl(video: ResolvedVideo): string {
   if (video.referer) params.set('referer', video.referer)
   if (video.cookies) params.set('cookie', video.cookies)
   return `/api/proxy?${params.toString()}`
-}
-
-export function isHlsUrl(url: string): boolean {
-  return /\.m3u8(\?|$)/i.test(url) || url.includes('m3u8')
 }
 
 /** 是否可直接播放（mp4/webm/ogg 直链，无需 hls.js） */

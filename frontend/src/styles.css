@@ -472,11 +472,6 @@ textarea::placeholder {
   }
 }
 
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
 
 @keyframes pulse-soft {
   0%,
@@ -488,9 +483,6 @@ textarea::placeholder {
   }
 }
 
-.spin {
-  animation: spin 0.9s linear infinite;
-}
 
 .fade-in {
   animation: fade-in 0.25s ease both;
@@ -989,6 +981,14 @@ textarea::placeholder {
   display: block;
 }
 
+/* 播放器外壳铺满舞台。舞台高度由 aspect-ratio 决定，若外壳是 auto 高度，
+   内部 video 的 height:100% 就退化为 intrinsic 高度，控制条会被排到舞台下沿之外，
+   再被 overflow:hidden 裁掉——16:9 内容下整条控制栏不可点。 */
+.video-shell {
+  position: absolute;
+  inset: 0;
+}
+
 .player-danmaku {
   position: absolute;
   inset: 0;
@@ -996,6 +996,13 @@ textarea::placeholder {
 }
 
 .player-controls {
+  /* 叠加在画面下沿而不是排在视频之后（见 .video-shell）。
+     z-index 高于 .danmaku-layer，避免弹幕文字压在按钮上。 */
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 2;
   display: flex;
   align-items: center;
   gap: 10px;

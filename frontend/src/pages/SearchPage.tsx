@@ -9,20 +9,36 @@ export default function SearchPage() {
   const [params] = useSearchParams()
   const q = params.get('q') ?? ''
   const [bgm, setBgm] = useState<BgmSubject[]>([])
-  const [bgmLoading, setBgmLoading] = useState(true)
+  const [bgmLoading, setBgmLoading] = useState(!!q)
   const [bgmError, setBgmError] = useState('')
   const [sources, setSources] = useState<StoredSource[]>([])
   const [sourceHits, setSourceHits] = useState<Record<string, SubjectHit[]>>({})
   const [sourceErrors, setSourceErrors] = useState<Record<string, string>>({})
-  const [sourcesLoading, setSourcesLoading] = useState(true)
+  const [sourcesLoading, setSourcesLoading] = useState(!!q)
   const [favIds, setFavIds] = useState<Set<number>>(() => favoriteIdSet())
 
   useEffect(() => {
-    if (!q) return
     // cancelled 守卫：快速连续搜索时丢弃过期响应，避免旧结果覆盖新结果
     let cancelled = false
+    if (!q) {
+      // 无关键词（直接打开 /search 或清空搜索词）：清空结果与加载态，避免骨架屏常驻
+      setBgm([])
+      setBgmError('')
+      setSources([])
+      setSourceHits({})
+      setSourceErrors({})
+      setBgmLoading(false)
+      setSourcesLoading(false)
+      return
+    }
     addSearchHistory(q)
     setFavIds(favoriteIdSet())
+    // 每次搜索都重置错误与上一轮结果，避免旧结果/旧错误残留
+    setBgm([])
+    setBgmError('')
+    setSources([])
+    setSourceHits({})
+    setSourceErrors({})
     setBgmLoading(true)
     setSourcesLoading(true)
     api
@@ -90,6 +106,7 @@ export default function SearchPage() {
       <h2 className="section-title">
         搜索「{q}」
       </h2>
+      {!q && <div className="empty">输入关键词后开始搜索</div>}
 
       <h3 className="section-title" style={{ fontSize: 15 }}>
         Bangumi 条目 <span className="count">{bgm.length > 0 ? `${bgm.length} 条` : ''}</span>
@@ -106,7 +123,9 @@ export default function SearchPage() {
         </div>
       )}
       {bgmError && <div className="error-box">Bangumi 搜索失败：{bgmError}</div>}
-      {!bgmLoading && !bgmError && bgm.length === 0 && <div className="empty">无 Bangumi 结果</div>}
+      {!!q && !bgmLoading && !bgmError && bgm.length === 0 && (
+        <div className="empty">无 Bangumi 结果</div>
+      )}
       <div className="result-grid">
         {bgm.map((s) => (
           <Link key={s.id} className="subject-card" to={`/subject/${s.id}`}>
@@ -142,7 +161,7 @@ export default function SearchPage() {
         视频数据源 <span className="count">{sources.length} 个已启用</span>
       </h3>
       {sourcesLoading && <div className="loading">数据源搜索中…</div>}
-      {!sourcesLoading && sources.length === 0 && (
+      {!!q && !sourcesLoading && sources.length === 0 && (
         <div className="empty">
           还没有启用的数据源，去 <Link to="/sources" style={{ color: 'var(--accent)' }}>数据源管理</Link> 导入 animeko
           配置

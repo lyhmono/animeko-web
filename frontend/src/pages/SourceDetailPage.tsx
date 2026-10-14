@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
-import { api } from '../api'
+import { api, errMsg } from '../api'
 import type { EpisodeHit, EpisodesResult } from '../types'
 
 export default function SourceDetailPage() {
@@ -13,16 +13,31 @@ export default function SourceDetailPage() {
   const [channel, setChannel] = useState<string | null>(null)
 
   useEffect(() => {
-    if (!name || !subjectUrl) return
+    // cancelled 守卫：切换数据源/条目时旧请求的慢响应不能覆盖新结果
+    let cancelled = false
+    setResult(null)
+    setError('')
+    setChannel(null)
+    if (!name || !subjectUrl) {
+      // 参数缺失时必须给出明确提示，否则页面会停在「正在解析剧集列表…」
+      setError(!name ? '缺少数据源参数' : '缺少条目地址（url 参数），无法解析剧集列表')
+      return
+    }
     // 注意：react-router v6/v7 的 useParams 已自动解码，直接使用；
     // 不能再 decodeURIComponent（含 % 的源名会双重解码而错乱/抛错）
     api
       .sourceEpisodes(name, subjectUrl)
       .then((r) => {
+        if (cancelled) return
         setResult(r)
         setChannel(r.channels[0] ?? null)
       })
-      .catch((e) => setError(String(e.message ?? e)))
+      .catch((e) => {
+        if (!cancelled) setError(errMsg(e))
+      })
+    return () => {
+      cancelled = true
+    }
   }, [name, subjectUrl])
 
   const goPlay = (playUrl: string, epName: string, epSort: string, nextEp?: EpisodeHit) => {
@@ -58,6 +73,13 @@ export default function SourceDetailPage() {
       : groups.flatMap((g) => g.episodes)
     : result.episodes
 
+  // 「下一集」按线路计算：全部线路视图下直接取 idx+1 会跨到下一条线路的首集，连播等于重播
+  const nextEpisodeOf = (ep: EpisodeHit, idx: number): EpisodeHit | undefined => {
+    if (!groups || channel) return visibleEpisodes[idx + 1]
+    const sameChannel = visibleEpisodes.filter((e) => e.channel === ep.channel)
+    return sameChannel[sameChannel.indexOf(ep) + 1]
+  }
+
   return (
     <div>
       <h2 className="section-title">
@@ -88,7 +110,7 @@ export default function SourceDetailPage() {
             {ep.channel && <span className="tag">{ep.channel}</span>}
             <button
               className="btn btn-sm"
-              onClick={() => goPlay(ep.playUrl, ep.name, ep.sort, visibleEpisodes[idx + 1])}
+              onClick={() => goPlay(ep.playUrl, ep.name, ep.sort, nextEpisodeOf(ep, idx))}
             >
               播放
             </button>

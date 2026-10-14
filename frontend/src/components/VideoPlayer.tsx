@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type RefObject } from 'react'
 import Hls from 'hls.js'
 import { isDirectPlayable } from '../api'
 import {
@@ -19,6 +19,13 @@ interface Props {
   /** 加载后一次性定位到的秒数（断点续播） */
   startAt?: number
   danmakuOn?: boolean
+  /**
+   * 全屏目标容器。默认只全屏本组件的 div —— 而弹幕图层是本组件的兄弟节点，
+   * 于是按 F 之后弹幕直接消失。播放页需要把包含弹幕的外层容器传进来。
+   */
+  fullscreenTarget?: RefObject<HTMLElement | null>
+  /** 真实播放/暂停状态：弹幕动画必须跟着它走，否则暂停后弹幕仍在飞 */
+  onPlayingChange?: (playing: boolean) => void
   onToggleDanmaku?: () => void
   onPrevEpisode?: () => void
   onNextEpisode?: () => void
@@ -48,6 +55,8 @@ export default function VideoPlayer({
   src,
   startAt,
   danmakuOn = true,
+  fullscreenTarget,
+  onPlayingChange,
   onToggleDanmaku,
   onPrevEpisode,
   onNextEpisode,
@@ -73,19 +82,26 @@ export default function VideoPlayer({
   const onProgressRef = useRef(onProgress)
   const onEndedRef = useRef(onEnded)
   const onToggleDanmakuRef = useRef(onToggleDanmaku)
+  const onPlayingChangeRef = useRef(onPlayingChange)
+  const fullscreenTargetRef = useRef(fullscreenTarget)
   useEffect(() => {
     onErrorRef.current = onError
     onProgressRef.current = onProgress
     onEndedRef.current = onEnded
     onToggleDanmakuRef.current = onToggleDanmaku
+    onPlayingChangeRef.current = onPlayingChange
+    fullscreenTargetRef.current = fullscreenTarget
   })
 
   // 加载源
+  const startAtAppliedRef = useRef(false)
   useEffect(() => {
     const video = videoRef.current
     if (!video || !src) return
     let hls: Hls | null = null
     setError(null)
+    // 换源（切集）后要重新允许定位一次，否则第二集的断点续播永远不生效
+    startAtAppliedRef.current = false
 
     if (isDirectPlayable(src)) {
       video.src = src
@@ -119,7 +135,6 @@ export default function VideoPlayer({
   }, [src])
 
   // 断点续播：加载后定位一次
-  const startAtAppliedRef = useRef(false)
   useEffect(() => {
     const video = videoRef.current
     if (!video || !startAt || startAtAppliedRef.current) return
@@ -146,11 +161,28 @@ export default function VideoPlayer({
       onProgressRef.current?.(video.currentTime, video.duration || 0)
     }
     const onMeta = () => setDuration(video.duration || 0)
-    const onPlay = () => setPlaying(true)
-    const onPause = () => setPlaying(false)
+    const onPlay = () => {
+      setPlaying(true)
+      onPlayingChangeRef.current?.(true)
+    }
+    const onPause = () => {
+      setPlaying(false)
+      onPlayingChangeRef.current?.(false)
+    }
     const onEnd = () => {
       setPlaying(false)
+      onPlayingChangeRef.current?.(false)
       onEndedRef.current?.()
+    }
+    // 直链（mp4/webm）路径没有 hls.js 的 ERROR 事件可订阅，
+    // 代理 403/404 时以前什么都不会发生：画面黑屏、也没有错误提示。
+    const onMediaError = () => {
+      // 没有 error 对象的 error 事件是切源/卸载清理时补发的，别当成播放失败
+      if (!video.error) return
+      const code = video.error.code
+      const msg = `视频加载失败（MEDIA_ERROR_${code}），源站可能拒绝了代理请求，可尝试下方手动地址播放`
+      setError(msg)
+      onErrorRef.current?.(msg)
     }
     const onFs = () => setFullscreen(document.fullscreenElement != null)
     video.addEventListener('timeupdate', onTime)
@@ -159,6 +191,7 @@ export default function VideoPlayer({
     video.addEventListener('play', onPlay)
     video.addEventListener('pause', onPause)
     video.addEventListener('ended', onEnd)
+    video.addEventListener('error', onMediaError)
     document.addEventListener('fullscreenchange', onFs)
     return () => {
       video.removeEventListener('timeupdate', onTime)
@@ -167,6 +200,7 @@ export default function VideoPlayer({
       video.removeEventListener('play', onPlay)
       video.removeEventListener('pause', onPause)
       video.removeEventListener('ended', onEnd)
+      video.removeEventListener('error', onMediaError)
       document.removeEventListener('fullscreenchange', onFs)
     }
   }, [])
@@ -214,10 +248,12 @@ export default function VideoPlayer({
   }
 
   const toggleFullscreen = () => {
-    const container = containerRef.current
-    if (!container) return
+    // 优先用外层舞台容器：弹幕图层是本组件的兄弟节点，
+    // 只全屏本组件的话按 F 弹幕会整体消失。
+    const target = fullscreenTargetRef.current?.current ?? containerRef.current
+    if (!target) return
     if (document.fullscreenElement) void document.exitFullscreen()
-    else void container.requestFullscreen().catch(() => {})
+    else void target.requestFullscreen().catch(() => {})
   }
 
   // ---- 键盘快捷键（绑一次，弹幕开关回调经 ref 读取） ----
@@ -228,6 +264,11 @@ export default function VideoPlayer({
       if (!video) return
       switch (e.key) {
         case ' ':
+          // 焦点落在按钮/链接上时空格会触发原生 click，这里再 togglePlay 就等于放一下又暂停
+          if (e.target instanceof HTMLElement && e.target.closest('button, a, select')) return
+          e.preventDefault()
+          togglePlay()
+          break
         case 'k':
         case 'K':
           e.preventDefault()
@@ -278,7 +319,7 @@ export default function VideoPlayer({
   }, [])
 
   return (
-    <div ref={containerRef} style={{ position: 'relative' }}>
+    <div ref={containerRef} className="video-shell">
       <video ref={videoRef} playsInline controls={false} onClick={togglePlay} />
       {error && (
         <div

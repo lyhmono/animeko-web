@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { api } from '../api'
+import { api, errMsg } from '../api'
 import { getTheme, setTheme, syncThemeColor, type Theme } from '../lib/storage'
 import { IconMoon, IconSun } from '../lib/icons'
 
@@ -9,10 +9,41 @@ export default function SettingsPage() {
     danmakuConfigured: boolean
     authEnabled: boolean
   } | null>(null)
+  // 健康检查失败 ≠ 功能未开启：混在一起会给出与实际相反的配置建议
+  const [healthError, setHealthError] = useState('')
+  const [healthLoading, setHealthLoading] = useState(true)
   const [theme, setThemeState] = useState<Theme>(getTheme)
 
   useEffect(() => {
-    api.health().then(setHealth).catch(() => setHealth(null))
+    let cancelled = false
+    api
+      .health()
+      .then((h) => {
+        if (cancelled) return
+        setHealth(h)
+        setHealthError('')
+      })
+      .catch((e) => {
+        if (cancelled) return
+        setHealth(null)
+        setHealthError(errMsg(e))
+      })
+      .finally(() => {
+        if (!cancelled) setHealthLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // 导航栏切换主题后同步本页按钮高亮（事件 detail 携带主题名，无 detail 时回退本地存储）
+  useEffect(() => {
+    const onThemeChange = (e: Event) => {
+      const detail = (e as CustomEvent<unknown>).detail
+      setThemeState(detail === 'dark' || detail === 'light' ? detail : getTheme())
+    }
+    window.addEventListener('animeko-theme-change', onThemeChange)
+    return () => window.removeEventListener('animeko-theme-change', onThemeChange)
   }, [])
 
   const applyTheme = (t: Theme) => {
@@ -21,7 +52,7 @@ export default function SettingsPage() {
     syncThemeColor(t)
     setThemeState(t)
     // 同步导航栏的切换按钮状态
-    window.dispatchEvent(new Event('animeko-theme-change'))
+    window.dispatchEvent(new CustomEvent('animeko-theme-change', { detail: t }))
   }
 
   return (
@@ -54,19 +85,31 @@ export default function SettingsPage() {
       <div className="settings-group card">
         <h3>服务信息</h3>
         <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 2 }}>
-          <div>版本：{health?.version ?? '—'}</div>
-          <div>
-            弹幕服务：
-            {health?.danmakuConfigured
-              ? '已配置'
-              : '未配置（在容器环境变量中设置 ANIMEKO_DANMAKU_APP_ID / ANIMEKO_DANMAKU_APP_SECRET）'}
-          </div>
-          <div>
-            访问鉴权：
-            {health?.authEnabled
-              ? '已开启'
-              : '未开启（公网暴露时建议设置 ANIMEKO_AUTH_ENABLED=true 与 ANIMEKO_AUTH_TOKEN）'}
-          </div>
+          <div>版本：{healthLoading ? '检测中…' : (health?.version ?? '—')}</div>
+          {healthError ? (
+            <div>
+              后端不可用：{healthError}（无法确认弹幕服务与访问鉴权状态，请检查服务是否运行、鉴权配置是否正确）
+            </div>
+          ) : (
+            <>
+              <div>
+                弹幕服务：
+                {healthLoading
+                  ? '检测中…'
+                  : health?.danmakuConfigured
+                    ? '已配置'
+                    : '未配置（在容器环境变量中设置 ANIMEKO_DANMAKU_APP_ID / ANIMEKO_DANMAKU_APP_SECRET）'}
+              </div>
+              <div>
+                访问鉴权：
+                {healthLoading
+                  ? '检测中…'
+                  : health?.authEnabled
+                    ? '已开启'
+                    : '未开启（公网暴露时建议设置 ANIMEKO_AUTH_ENABLED=true 与 ANIMEKO_AUTH_TOKEN）'}
+              </div>
+            </>
+          )}
         </div>
       </div>
 

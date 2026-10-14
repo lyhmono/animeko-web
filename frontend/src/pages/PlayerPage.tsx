@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { api, errMsg, proxyUrl } from '../api'
 import type { DdComment, DanmakuOptions } from '../types'
 import VideoPlayer from '../components/VideoPlayer'
@@ -8,11 +8,14 @@ import {
   addRecent,
   clearProgress,
   getProgress,
+  readJson,
   setProgress,
+  writeJson,
 } from '../lib/storage'
 import { IconCheck, IconClock, IconDanmaku, IconKeyboard, IconNext } from '../lib/icons'
 
-const DANMAKU_PREFS_KEY = 'animeko-web:danmaku-prefs'
+// storage.ts 会自动加 animeko-web: 前缀，最终键名与旧版一致，历史偏好不丢
+const DANMAKU_PREFS_KEY = 'danmaku-prefs'
 
 /** 下一集信息（连播用），通过 URL 参数传递 */
 interface NextEpisode {
@@ -53,14 +56,31 @@ const defaultPrefs: DanmakuOptions = {
   blockWords: '',
 }
 
-function loadPrefs(): DanmakuOptions {
-  try {
-    const raw = localStorage.getItem(DANMAKU_PREFS_KEY)
-    if (raw) return { ...defaultPrefs, ...JSON.parse(raw) }
-  } catch {
-    // ignore
+/**
+ * 数值偏好一律限幅：清空数字输入框会得到 ''/NaN，
+ * 原样写进 prefs 会让弹幕字号归零或 density<=0（画布直接不画），
+ * 而且这些脏值会被持久化，刷新后依旧复现。
+ */
+function clampPref(value: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(max, Math.max(min, n))
+}
+
+function normalizePrefs(raw: unknown): DanmakuOptions {
+  const o = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+  return {
+    enabled: typeof o.enabled === 'boolean' ? o.enabled : defaultPrefs.enabled,
+    fontSize: clampPref(o.fontSize, 12, 48, defaultPrefs.fontSize),
+    opacity: clampPref(o.opacity, 0.1, 1, defaultPrefs.opacity),
+    speed: clampPref(o.speed, 0.3, 3, defaultPrefs.speed),
+    density: clampPref(o.density, 0.1, 3, defaultPrefs.density),
+    blockWords: typeof o.blockWords === 'string' ? o.blockWords : defaultPrefs.blockWords,
   }
-  return defaultPrefs
+}
+
+function loadPrefs(): DanmakuOptions {
+  return normalizePrefs(readJson<unknown>(DANMAKU_PREFS_KEY, null))
 }
 
 function fmtTime(seconds: number): string {
@@ -91,11 +111,14 @@ export default function PlayerPage() {
   const [prefs, setPrefs] = useState<DanmakuOptions>(loadPrefs)
   const [showDanmakuPanel, setShowDanmakuPanel] = useState(false)
   const [nextCountdown, setNextCountdown] = useState<number | null>(null)
+  const [videoPlaying, setVideoPlaying] = useState(false)
 
   const lastWriteRef = useRef<number | null>(null)
+  const stageRef = useRef<HTMLDivElement | null>(null)
+  const resolveSeqRef = useRef(0)
 
   useEffect(() => {
-    localStorage.setItem(DANMAKU_PREFS_KEY, JSON.stringify(prefs))
+    writeJson(DANMAKU_PREFS_KEY, prefs)
   }, [prefs])
 
   // 解析视频地址 + 写入最近观看
@@ -108,14 +131,19 @@ export default function PlayerPage() {
     // 注意：manual 是保留源名，若用户把数据源命名为 manual 会走错分支（概率极低，
     // 且失败时仍有错误态与手动播放入口兜底）
     if (source === 'manual') {
+      resolveSeqRef.current++
       setSrc(`/api/proxy?${new URLSearchParams({ url: playUrl }).toString()}`)
       addRecent({ source, playUrl, title: title || playUrl, anime: animeName, ep, ts: Date.now() })
       return
     }
+    // 序号守卫：解析可能耗时几十秒，期间换集或改用手播时过期响应必须丢弃，
+    // 否则它会覆盖新的 src、把「最近观看」记到错误的条目上，并提前熄灭 loading 态
+    const seq = ++resolveSeqRef.current
     setResolving(true)
     api
       .resolveVideo(source, playUrl)
       .then((video) => {
+        if (seq !== resolveSeqRef.current) return
         setSrc(proxyUrl(video))
         addRecent({
           source,
@@ -126,8 +154,13 @@ export default function PlayerPage() {
           ts: Date.now(),
         })
       })
-      .catch((e) => setError(`视频地址解析失败：${errMsg(e)}（可尝试下方手动地址播放）`))
-      .finally(() => setResolving(false))
+      .catch((e) => {
+        if (seq !== resolveSeqRef.current) return
+        setError(`视频地址解析失败：${errMsg(e)}（可尝试下方手动地址播放）`)
+      })
+      .finally(() => {
+        if (seq === resolveSeqRef.current) setResolving(false)
+      })
   }, [source, playUrl, title, animeName, ep])
 
   // 断点续播：读取历史进度
@@ -152,8 +185,16 @@ export default function PlayerPage() {
           return
         }
         const anime = animes[0]
+        // ep 往往是「1」「01」「第1话」这类文本。原先直接 episodeTitle.includes(ep)：
+        // ep='1' 会命中「第11话」，ep='' 则无条件命中第一集 —— 两种都是静默配错弹幕。
+        const want = parseInt(ep.replace(/\D/g, ''), 10)
         const episode =
-          anime.episodes.find((e) => e.episodeTitle.includes(ep)) ?? anime.episodes[0]
+          (Number.isFinite(want)
+            ? anime.episodes.find((e) => {
+                const n = parseInt(e.episodeTitle.replace(/\D/g, ''), 10)
+                return Number.isFinite(n) && n === want
+              })
+            : undefined) ?? anime.episodes[0]
         if (!episode) {
           setDanmakuInfo('未找到匹配剧集的弹幕')
           return
@@ -164,7 +205,15 @@ export default function PlayerPage() {
         setDanmakuInfo(`《${anime.animeTitle}》${episode.episodeTitle} · ${list.length} 条弹幕`)
       })
       .catch((e) => {
-        if (!cancelled) setDanmakuInfo(`弹幕加载失败：${errMsg(e)}`)
+        if (cancelled) return
+        const msg = errMsg(e)
+        // 未配置弹幕是部署选择而非故障（README 承诺「仅无弹幕，不影响播放」），
+        // 不该以「加载失败」的红色文案吓用户
+        setDanmakuInfo(
+          msg.includes('DANMAKU_NOT_CONFIGURED')
+            ? '未配置弹幕服务（服务端缺 appId/appSecret），不影响播放'
+            : `弹幕加载失败：${msg}`,
+        )
       })
     return () => {
       cancelled = true
@@ -221,19 +270,21 @@ export default function PlayerPage() {
     return (
       <div className="empty">
         <span className="empty-emoji">🎬</span>
-        缺少播放参数。请从 <a href="/" style={{ color: 'var(--accent)' }}>首页</a> 搜索进入。
+        缺少播放参数。请从 <Link to="/" style={{ color: 'var(--accent)' }}>首页</Link> 搜索进入。
       </div>
     )
   }
 
   return (
     <div className="player-page fade-in">
-      <div className="player-stage">
+      <div className="player-stage" ref={stageRef}>
         {src && (
           <VideoPlayer
             src={src}
             startAt={startAt}
             danmakuOn={prefs.enabled}
+            fullscreenTarget={stageRef}
+            onPlayingChange={setVideoPlaying}
             onToggleDanmaku={toggleDanmaku}
             onNextEpisode={nextInfo ? gotoNext : undefined}
             onProgress={handleProgress}
@@ -258,7 +309,7 @@ export default function PlayerPage() {
         <DanmakuCanvas
           comments={comments}
           currentTime={currentTime}
-          playing={!!src && !resolving}
+          playing={videoPlaying}
           options={prefs}
         />
       </div>
@@ -324,7 +375,7 @@ export default function PlayerPage() {
                 <input
                   type="checkbox"
                   checked={prefs.enabled}
-                  onChange={(e) => setPrefs({ ...prefs, enabled: e.target.checked })}
+                  onChange={(e) => setPrefs((p) => ({ ...p, enabled: e.target.checked }))}
                 />
                 显示弹幕
               </label>
@@ -335,7 +386,7 @@ export default function PlayerPage() {
                   min={12}
                   max={48}
                   value={prefs.fontSize}
-                  onChange={(e) => setPrefs({ ...prefs, fontSize: Number(e.target.value) })}
+                  onChange={(e) => setPrefs((p) => ({ ...p, fontSize: clampPref(e.target.value, 12, 48, defaultPrefs.fontSize) }))}
                 />
               </label>
               <label>
@@ -346,7 +397,7 @@ export default function PlayerPage() {
                   max={1}
                   step={0.05}
                   value={prefs.opacity}
-                  onChange={(e) => setPrefs({ ...prefs, opacity: Number(e.target.value) })}
+                  onChange={(e) => setPrefs((p) => ({ ...p, opacity: clampPref(e.target.value, 0.1, 1, defaultPrefs.opacity) }))}
                 />
               </label>
               <label>
@@ -357,7 +408,7 @@ export default function PlayerPage() {
                   max={3}
                   step={0.1}
                   value={prefs.speed}
-                  onChange={(e) => setPrefs({ ...prefs, speed: Number(e.target.value) })}
+                  onChange={(e) => setPrefs((p) => ({ ...p, speed: clampPref(e.target.value, 0.3, 3, defaultPrefs.speed) }))}
                 />
               </label>
               <label>
@@ -368,7 +419,7 @@ export default function PlayerPage() {
                   max={3}
                   step={0.1}
                   value={prefs.density}
-                  onChange={(e) => setPrefs({ ...prefs, density: Number(e.target.value) })}
+                  onChange={(e) => setPrefs((p) => ({ ...p, density: clampPref(e.target.value, 0.1, 3, defaultPrefs.density) }))}
                 />
               </label>
               <label style={{ flex: 1, minWidth: 200 }}>
@@ -377,7 +428,7 @@ export default function PlayerPage() {
                   style={{ flex: 1 }}
                   value={prefs.blockWords}
                   placeholder="如：剧透,前方高能"
-                  onChange={(e) => setPrefs({ ...prefs, blockWords: e.target.value })}
+                  onChange={(e) => setPrefs((p) => ({ ...p, blockWords: e.target.value }))}
                 />
               </label>
             </div>

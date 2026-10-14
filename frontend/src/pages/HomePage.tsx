@@ -65,6 +65,8 @@ export default function HomePage() {
         <p>全部跑在你的容器里，浏览器负责播放与弹幕渲染</p>
         <div className="search-bar">
           <input
+            type="search"
+            aria-label="搜索番剧名称"
             placeholder="搜索番剧名称，如：孤独摇滚"
             value={keyword}
             onChange={(e) => setKeyword(e.target.value)}
@@ -180,7 +182,9 @@ export default function HomePage() {
           <span>
             弹幕服务：
             <b style={{ color: health?.danmakuConfigured ? 'var(--success)' : 'var(--text-dim)' }}>
-              {health === null
+              {apiReachable === false
+                ? '未知'
+                : health === null
                 ? '检测中'
                 : health.danmakuConfigured
                   ? '已配置'
@@ -190,7 +194,9 @@ export default function HomePage() {
           <span>
             访问鉴权：
             <b style={{ color: health?.authEnabled ? 'var(--success)' : 'var(--text-dim)' }}>
-              {health === null
+              {apiReachable === false
+                ? '未知'
+                : health === null
                 ? '检测中'
                 : health.authEnabled
                   ? '已开启'
@@ -200,7 +206,7 @@ export default function HomePage() {
         </div>
       </div>
 
-      {sources.length > 0 && (
+      {enabledCount > 0 && (
         <>
           <h2 className="section-title">
             已启用数据源 <span className="count">{enabledCount} 个</span>

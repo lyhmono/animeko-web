@@ -8,6 +8,16 @@
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      // 同步写回主题：入口模块是 deferred 的，等它执行时已经上过一帧暗色，
+      // 亮色用户每次硬加载都会闪一下。键名前缀与 lib/storage.ts 的 PREFIX 一致。
+      try {
+        var t = localStorage.getItem('animeko-web:theme') === 'light' ? 'light' : 'dark'
+        document.documentElement.dataset.theme = t
+        var m = document.querySelector('meta[name="theme-color"]')
+        if (m) m.setAttribute('content', t === 'light' ? '#f5f6fa' : '#0f1115')
+      } catch (e) {}
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

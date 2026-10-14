@@ -33,7 +33,8 @@ export interface BgmSubject {
   rating?: BgmRating | null
   rank?: number | null
   images?: BgmImages | null
-  eps?: BgmEpisode[]
+  /** 详情接口回填为数组；/api/bangumi/search 原样透传 bangumi 的集数整数 */
+  eps?: BgmEpisode[] | number
 }
 
 export interface SubjectHit {
@@ -74,18 +75,63 @@ export interface SelectorSearchConfig {
   requestInterval: number
   searchCacheTtl?: number
   userAgent?: string
+  /** 取值：a / indexed / json-path-indexed */
   subjectFormatId: string
-  /** subjectFormatId=selector-subject-format-a（CSS 列表页） */
+  /** subjectFormatId=a：CSS 选出的 <a>，title/text 作名称、href 作链接 */
   selectorSubjectFormatA?: { selectLists: string; linkTemplate?: string | null }
-  /** subjectFormatId=selector-subject-format-indexed（CSS 索引页） */
-  selectorSubjectFormatIndexed?: { selectNames: string; selectLinks: string }
-  /** subjectFormatId=json-path-indexed（JSON Path 索引） */
-  selectorSubjectFormatJsonPathIndexed?: { selectNames: string; selectLinks: string }
+  /** subjectFormatId=indexed：名字列表与链接列表两条 CSS 按下标对应 */
+  selectorSubjectFormatIndexed?: {
+    selectNames: string
+    selectLinks: string
+    linkTemplate?: string | null
+  }
+  /** subjectFormatId=json-path-indexed：JsonPath 分别取名称与链接 */
+  selectorSubjectFormatJsonPathIndexed?: {
+    selectNames: string
+    selectLinks: string
+    linkTemplate?: string | null
+  }
+  /** 取值：no-channel / index-grouped */
   channelFormatId: string
-  /** channelFormatId=selector-channel-format-no-channel */
-  selectorChannelFormatNoChannel?: { selectEpisodes: string; matchEpisodeSortFromName?: string | null }
-  matchVideo?: { matchVideoUrl: string; enableNestedUrl?: boolean; cookies?: string }
-  autoMatch?: { enabled?: boolean; searchUseOnlyFirstWord?: boolean; searchRemoveSpecial?: boolean }
+  /** channelFormatId=no-channel */
+  selectorChannelFormatNoChannel?: {
+    selectEpisodes: string
+    selectEpisodeLinks?: string
+    matchEpisodeSortFromName?: string
+  }
+  /** channelFormatId=index-grouped：线路 tab + 多个播放列表（后端字段名就是 Flattened） */
+  selectorChannelFormatFlattened?: {
+    selectChannelNames?: string
+    matchChannelName?: string
+    selectEpisodeLists?: string
+    selectEpisodesFromList?: string
+    selectEpisodeLinksFromList?: string
+    matchEpisodeSortFromName?: string
+  }
+  matchVideo?: {
+    matchVideoUrl: string
+    matchNestedUrl?: string
+    enableNestedUrl?: boolean
+    cookies?: string
+    addHeadersToVideo?: { referer?: string; userAgent?: string }
+  }
+  autoMatch?: {
+    enabled?: boolean
+    searchUseOnlyFirstWord?: boolean
+    searchRemoveSpecial?: boolean
+    searchUseSubjectNamesCount?: number
+    preferShorterName?: boolean
+    filterByEpisodeSort?: boolean
+  }
+  selectMedia?: { distinguishSubjectName?: boolean; distinguishChannelName?: boolean }
+  defaultResolution?: string
+  defaultSubtitleLanguage?: string
+  onlySupportsPlayers?: string[]
+  /** 旧版平铺字段，后端解析时会折叠进 autoMatch */
+  searchUseOnlyFirstWord?: boolean | null
+  searchRemoveSpecial?: boolean | null
+  searchUseSubjectNamesCount?: number | null
+  filterByEpisodeSort?: boolean | null
 }
 
 export interface SelectorSourceArguments {
@@ -93,6 +139,8 @@ export interface SelectorSourceArguments {
   description: string
   iconUrl: string
   searchConfig: SelectorSearchConfig
+  tier?: string
+  channelTiers?: Record<string, string>
 }
 
 export interface StoredSource {

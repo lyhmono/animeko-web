@@ -21,6 +21,9 @@ export default function Layout() {
     // 仅写 localStorage/state 不会让当前页面即时换肤
     document.documentElement.dataset.theme = next
     syncThemeColor(next)
+    // 广播给设置页等其它订阅者，否则那里的暗色/亮色按钮还停在旧值上。
+    // 带上 detail，同时也允许订阅方直接回读 getTheme()。
+    window.dispatchEvent(new CustomEvent<Theme>('animeko-theme-change', { detail: next }))
   }
 
   return (
