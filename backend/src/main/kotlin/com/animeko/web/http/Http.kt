@@ -10,6 +10,9 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 
+/** 上游返回非 2xx，或返回的内容无法按预期解析。映射为 502，避免与「本服务自己的错误」混成 500。 */
+class UpstreamException(message: String) : Exception(message)
+
 data class HttpResult(
     val status: Int,
     val headers: Map<String, List<String>>,
@@ -20,6 +23,14 @@ data class HttpResult(
 
     val contentType: String? get() = header("content-type")
     val text: String get() = String(body, Charsets.UTF_8)
+
+    /** 状态码非 2xx 时抛出，附带上游地址便于排查。 */
+    fun requireSuccess(source: String): HttpResult {
+        if (status !in 200..299) {
+            throw UpstreamException("上游 $source 返回 $status")
+        }
+        return this
+    }
 }
 
 data class StreamResult(
@@ -59,6 +70,8 @@ interface Fetcher {
 class JdkFetcher(
     private val timeoutMs: Long = 20_000,
     private val defaultUserAgent: String = DEFAULT_UA,
+    /** 视频代理/分片下载的超时：远大于元数据请求，单独配置（ANIMEKO_PROXY_TIMEOUT_MS）。 */
+    private val streamTimeoutMs: Long = timeoutMs,
 ) : Fetcher {
     private val client: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofMillis(timeoutMs))
@@ -75,7 +88,7 @@ class JdkFetcher(
         headers: Map<String, String>,
         followRedirects: Boolean,
     ): HttpResult = withContext(Dispatchers.IO) {
-        val request = buildRequest(url, headers, followRedirects)
+        val request = buildRequest(url, headers)
         val cl = if (followRedirects) client else noRedirectClient
         val resp = cl.send(request, HttpResponse.BodyHandlers.ofByteArray())
         HttpResult(
@@ -117,7 +130,7 @@ class JdkFetcher(
         headers: Map<String, String>,
         followRedirects: Boolean,
     ): StreamResult = withContext(Dispatchers.IO) {
-        val request = buildRequest(url, headers, followRedirects)
+        val request = buildRequest(url, headers, streamTimeoutMs)
         val cl = if (followRedirects) client else noRedirectClient
         val resp = cl.send(request, HttpResponse.BodyHandlers.ofInputStream())
         StreamResult(
@@ -127,13 +140,24 @@ class JdkFetcher(
         )
     }
 
-    private fun buildRequest(url: String, headers: Map<String, String>, followRedirects: Boolean): HttpRequest {
+    private fun buildRequest(
+        url: String,
+        headers: Map<String, String>,
+        timeout: Long = timeoutMs,
+    ): HttpRequest {
+        // JDK 的 Builder.header() 是「追加」语义，已单独设置的头必须在下面的循环里跳过，
+        // 否则会发出两个 User-Agent / Accept。
         val builder = HttpRequest.newBuilder(URI.create(url))
-            .timeout(Duration.ofMillis(timeoutMs))
+            .timeout(Duration.ofMillis(timeout))
             .header("User-Agent", headers["User-Agent"]?.takeIf { it.isNotBlank() } ?: defaultUserAgent)
             .header("Accept", headers["Accept"] ?: "*/*")
         headers.forEach { (k, v) ->
-            if (!k.equals("User-Agent", ignoreCase = true) && isValidHeaderName(k)) builder.header(k, v)
+            if (!k.equals("User-Agent", ignoreCase = true) &&
+                !k.equals("Accept", ignoreCase = true) &&
+                isValidHeaderName(k)
+            ) {
+                builder.header(k, v)
+            }
         }
         return builder.GET().build()
     }

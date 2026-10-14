@@ -1,6 +1,8 @@
 package com.animeko.web.danmaku
 
 import com.animeko.web.http.Fetcher
+import com.animeko.web.http.UpstreamException
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.net.URLEncoder
@@ -79,6 +81,8 @@ data class DdComment(
  * 签名算法：X-Signature = Base64(SHA-256(AppId + Timestamp + Path + AppSecret))
  * Path 为 API 路径（小写、不含域名与查询参数），请求头携带 X-AppId / X-Timestamp / X-Signature。
  */
+class DanmakuNotConfiguredException : Exception("DANMAKU_NOT_CONFIGURED")
+
 class DandanplayClient(
     private val fetcher: Fetcher,
     private val appId: String,
@@ -113,8 +117,15 @@ class DandanplayClient(
             append("anime=").append(URLEncoder.encode(anime, "UTF-8"))
             if (!episode.isNullOrBlank()) append("&episode=").append(URLEncoder.encode(episode, "UTF-8"))
         }
-        val text = fetcher.fetch("$baseUrl$path?$query", authHeaders(path)).text
-        return json.decodeFromString<DdSearchAnimesResponse>(text).animes
+        val resp = decode(
+            getText(path, "?$query"),
+            DdSearchAnimesResponse.serializer(),
+            "弹弹play 搜索",
+        )
+        if (!resp.success) {
+            throw UpstreamException("弹弹play 搜索失败（code=${resp.errorCode} ${resp.errorMessage}）")
+        }
+        return resp.animes
     }
 
     /** 获取某集的全部弹幕 */
@@ -122,12 +133,35 @@ class DandanplayClient(
         requireConfigured()
         val path = "/api/v2/comment/$episodeId"
         val query = if (withRelated) "?withRelated=true" else ""
-        val text = fetcher.fetch("$baseUrl$path$query", authHeaders(path)).text
-        val resp = json.decodeFromString<DdCommentResponse>(text)
+        val resp = decode(getText(path, query), DdCommentResponse.serializer(), "弹弹play 弹幕")
         return resp.comments.mapNotNull { DdComment.parse(it) }
     }
 
+    private fun <T> decode(text: String, serializer: KSerializer<T>, source: String): T =
+        try {
+            json.decodeFromString(serializer, text)
+        } catch (e: Exception) {
+            // 网关/登录页之类会把 HTML 塞进 200 响应，裸序列化异常只会变成没有上下文的 500
+            throw UpstreamException("$source 返回的不是预期 JSON")
+        }
+
+    /**
+     * 上游非 2xx / 非 JSON 都要转成 [UpstreamException]（→502），
+     * 否则 decode 异常会一路落到兜底 handler，前端只看到一个没有上下文的 500。
+     */
+    private suspend fun getText(path: String, query: String): String {
+        val result = try {
+            fetcher.fetch("$baseUrl$path$query", authHeaders(path))
+                .requireSuccess("弹弹play $path")
+        } catch (e: UpstreamException) {
+            throw e
+        } catch (e: Exception) {
+            throw UpstreamException("弹弹play 请求失败: ${e.message ?: e::class.simpleName}")
+        }
+        return result.text
+    }
+
     private fun requireConfigured() {
-        check(configured) { "DANMAKU_NOT_CONFIGURED" }
+        if (!configured) throw DanmakuNotConfiguredException()
     }
 }

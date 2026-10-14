@@ -2,6 +2,10 @@ package com.animeko.web.selector
 
 import com.animeko.web.http.Fetcher
 import com.animeko.web.http.HttpResult
+import com.animeko.web.http.UrlGuard
+import com.animeko.web.http.UpstreamException
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -63,7 +67,10 @@ class SelectorException(message: String) : Exception(message)
  * 服务端版本改为抓取播放页 HTML 后用 matchVideo 正则从候选 URL 中匹配（对绝大多数源有效；
  * 强依赖 JS 执行的源需在播放页手动粘贴视频地址）。
  */
-class SelectorEngine(private val fetcher: Fetcher) {
+class SelectorEngine(
+    private val fetcher: Fetcher,
+    private val allowPrivateTargets: Boolean = false,
+) {
 
     private val json = Json { ignoreUnknownKeys = true }
     private val lastRequestAt = mutableMapOf<String, Long>()
@@ -74,7 +81,7 @@ class SelectorEngine(private val fetcher: Fetcher) {
         require(cfg.searchUrl.isNotBlank()) { "searchUrl 未配置" }
         val kw = cfg.resolvedAutoMatch().processKeyword(keyword)
         val url = cfg.searchUrl.replace("{keyword}", URLEncoder.encode(kw, "UTF-8"))
-        val body = throttledFetch(cfg, url).text
+        val body = throttledPage(cfg, url)
         val base = baseOf(cfg, url)
         val hits = when (cfg.subjectFormatId) {
             SubjectFormatJsonPathIndexed.ID -> selectJsonPathIndexed(body, cfg, base)
@@ -92,8 +99,9 @@ class SelectorEngine(private val fetcher: Fetcher) {
 
     suspend fun episodes(cfg: SelectorSearchConfig, subjectUrl: String): EpisodesResult {
         require(subjectUrl.startsWith("http")) { "subjectUrl 必须是绝对地址" }
-        val body = fetcher.fetch(subjectUrl, mapOf("User-Agent" to cfg.userAgentOrDefault())).text
-        val base = baseOf(cfg, subjectUrl)
+        val target = UrlGuard.requireNotLiteralInternal(subjectUrl, allowPrivateTargets)
+        val body = fetchPage(target, mapOf("User-Agent" to cfg.userAgentOrDefault()), "数据源详情页")
+        val base = baseOf(cfg, target)
         val doc = Jsoup.parse(body, base)
         return when (cfg.channelFormatId) {
             ChannelFormatIndexGrouped.ID -> selectIndexGrouped(doc, cfg, base)
@@ -105,9 +113,10 @@ class SelectorEngine(private val fetcher: Fetcher) {
 
     suspend fun resolveVideo(cfg: SelectorSearchConfig, playUrl: String): ResolvedVideo {
         require(playUrl.startsWith("http")) { "playUrl 必须是绝对地址" }
+        val target = UrlGuard.requireNotLiteralInternal(playUrl, allowPrivateTargets)
         val mv = cfg.matchVideo
         val ua = mv.addHeadersToVideo.userAgent.ifBlank { cfg.userAgentOrDefault() }
-        val referer = mv.addHeadersToVideo.referer.ifBlank { baseOf(cfg, playUrl) }
+        val referer = mv.addHeadersToVideo.referer.ifBlank { baseOf(cfg, target) }
         val cookies = mv.cookies.lines()
             .map { it.trim() }
             .filter { it.contains("=") }
@@ -121,21 +130,34 @@ class SelectorEngine(private val fetcher: Fetcher) {
             ?: throw SelectorException("matchVideoUrl 正则无效")
         val nestedRegex = runCatching { Regex(mv.matchNestedUrl) }.getOrNull()
 
-        val html = fetcher.fetch(playUrl, headers).text
-        findVideoUrl(html, playUrl, videoRegex)?.let {
+        val html = fetchPage(target, headers, "播放页")
+        findVideoUrl(html, target, videoRegex)?.let {
             return ResolvedVideo(it, referer, ua, cookies)
         }
         if (mv.enableNestedUrl && nestedRegex != null) {
             // 嵌套候选：DOM 中的 iframe/a/video/source 绝对地址 + 原文中的绝对 URL
-            val doc = Jsoup.parse(html, playUrl)
+            val doc = Jsoup.parse(html, target)
             val candidates = LinkedHashSet<String>()
             doc.select("iframe[src]").forEach { candidates.add(it.absUrl("src")) }
             doc.select("a[href]").forEach { candidates.add(it.absUrl("href")) }
             candidateUrls(html).forEach { candidates.add(it) }
             val nested = candidates.filter { it.startsWith("http") && nestedRegex.containsMatchIn(it) }
-                .take(10)
+                .take(MAX_NESTED_PAGES)
+            val deadline = System.currentTimeMillis() + NESTED_BUDGET_MS
             for (n in nested) {
-                val sub = runCatching { fetcher.fetch(n, headers).text }.getOrNull() ?: continue
+                // 每个嵌套页都要一次完整抓取（单次超时 20s），不设总预算的话
+                // 一次解析能拖到一分多钟，前端早已断开而服务端还在跑。
+                if (System.currentTimeMillis() > deadline) break
+                val sub = runCatching {
+                    // 嵌套地址来自页面内容，同样要过校验：否则播放页里塞一个
+                    // iframe="http://127.0.0.1:..." 就能借服务端去敲内网。非法候选直接跳过，
+                    // 不让它把整次解析打断。
+                    fetchPage(
+                        UrlGuard.requireNotLiteralInternal(n, allowPrivateTargets),
+                        headers,
+                        "嵌套播放页",
+                    )
+                }.getOrNull() ?: continue
                 findVideoUrl(sub, n, videoRegex)?.let {
                     return ResolvedVideo(it, referer, ua, cookies)
                 }
@@ -276,18 +298,51 @@ class SelectorEngine(private val fetcher: Fetcher) {
 
     // ---------- 工具 ----------
 
-    private suspend fun throttledFetch(cfg: SelectorSearchConfig, url: String): HttpResult {
-        val key = cfg.searchUrl
+    private suspend fun throttledPage(cfg: SelectorSearchConfig, url: String): String {
+        UrlGuard.requireNotLiteralInternal(url, allowPrivateTargets)
         val interval = cfg.requestInterval.coerceAtLeast(0)
         if (interval > 0) {
-            synchronized(lastRequestAt) {
-                val last = lastRequestAt[key] ?: 0L
-                val wait = interval - (System.currentTimeMillis() - last)
-                if (wait > 0) Thread.sleep(wait)
-                lastRequestAt[key] = System.currentTimeMillis()
+            // 锁内只推进「下一次允许请求的时间戳」，等待用 delay 放到锁外。
+            // 之前是持锁 Thread.sleep：既阻塞协程所在的 IO 线程，
+            // 又让所有数据源的搜索互相排队（A 源的 3 秒间隔会拖住 B 源）。
+            val wait = synchronized(lastRequestAt) {
+                val now = System.currentTimeMillis()
+                val last = lastRequestAt[cfg.searchUrl] ?: 0L
+                val planned = maxOf(now, last + interval)
+                lastRequestAt[cfg.searchUrl] = planned
+                planned - now
             }
+            if (wait > 0) delay(wait)
         }
-        return fetcher.fetch(url, mapOf("User-Agent" to cfg.userAgentOrDefault()))
+        return fetchPage(url, mapOf("User-Agent" to cfg.userAgentOrDefault()), "数据源搜索页")
+    }
+
+    /**
+     * 抓取并取文本。连接超时/拒绝这类异常必须包住：否则一路掉进兜底 handler，
+     * 前端只看到一个没有上下文的 500，而不是「上游不可用」的 502。
+     */
+    private suspend fun fetchPage(url: String, headers: Map<String, String>, source: String): String =
+        try {
+            fetcher.fetch(url, headers).textCapped(source)
+        } catch (e: UpstreamException) {
+            throw e
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            throw UpstreamException("$source 请求失败: ${e.message ?: e::class.simpleName}")
+        }
+
+    /**
+     * 上游状态码 + 体积双重检查：
+     * 非 2xx 时 body 往往是错误页，直接送去正则/选择器既慢又只会得到「没找到」的误导结论；
+     * 体积上限则约束住用户自定义正则的输入规模（JVM 正则没有超时，恶意构造的长文本能挂死线程）。
+     */
+    private fun HttpResult.textCapped(source: String): String {
+        if (status !in 200..299) throw UpstreamException("$source 返回 $status")
+        if (body.size > MAX_PAGE_BYTES) {
+            throw UpstreamException("$source 返回体 ${body.size} 字节，超过 ${MAX_PAGE_BYTES / 1024 / 1024}MB 上限")
+        }
+        return String(body, Charsets.UTF_8)
     }
 
     private fun applyLink(template: String?, raw: String, base: String): String {
@@ -309,6 +364,12 @@ class SelectorEngine(private val fetcher: Fetcher) {
     }
 
     companion object {
+        /** 抓取页面体积上限：同时约束「用户自定义正则」的输入规模（JVM 正则没有超时） */
+        const val MAX_PAGE_BYTES: Long = 8L * 1024 * 1024
+
+        private const val MAX_NESTED_PAGES = 5
+        private const val NESTED_BUDGET_MS = 30_000L
+
         fun isPossiblyMovie(name: String): Boolean {
             if (name == "正片" || name == "高清版") return true
             return listOf("2160P", "1440P", "2K", "4K", "1080P", "720P").any { name.contains(it) }

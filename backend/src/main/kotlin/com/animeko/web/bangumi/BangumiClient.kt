@@ -1,9 +1,17 @@
 package com.animeko.web.bangumi
 
 import com.animeko.web.http.Fetcher
+import com.animeko.web.http.HttpResult
+import com.animeko.web.http.UpstreamException
+import kotlinx.coroutines.CancellationException
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+
+/** 条目在 Bangumi 上不存在/已删除（上游 404），映射为对客户端回 404。 */
+class SubjectNotFoundException(source: String) : Exception("Bangumi 条目不存在: $source")
 
 @Serializable
 data class BgmSearchResponse(
@@ -30,6 +38,12 @@ data class BgmSubject(
     val platform: String? = null,
     val type: Int? = null,
     val rating: BgmRating? = null,
+    /**
+     * v0 搜索/详情结果在顶层也给了评分与排名（详情接口的 responseGroup=large 同样如此）。
+     * 之前没落到字段上被 ignoreUnknownKeys 丢掉，前端 `rating?.score ?? score` 的兜底于是恒为 undefined。
+     */
+    val score: Double? = null,
+    val rank: Int? = null,
     val images: BgmImages? = null,
     /**
      * v0 API 中该字段类型不固定：搜索结果为 int（总集数），详情可能为数组。
@@ -86,8 +100,12 @@ class BangumiClient(
         require(keywords.isNotBlank()) { "keywords must not be blank" }
         val body = """{"keyword":${json.encodeToString(keywords)},"filter":{"type":[$type]},"limit":$limit}"""
         return withFallback { base ->
-            json.decodeFromString<BgmSearchResponse>(
-                fetcher.post("$base/v0/search/subjects", body, headers()).text,
+            decode(
+                text("$base/v0/search/subjects") {
+                    fetcher.post("$base/v0/search/subjects", body, headers())
+                },
+                BgmSearchResponse.serializer(),
+                "Bangumi 搜索",
             ).data
         }
     }
@@ -95,19 +113,72 @@ class BangumiClient(
     /** 条目详情（含剧集列表） */
     suspend fun subject(id: Int): BgmSubject {
         val subject = withFallback { base ->
-            json.decodeFromString<BgmSubject>(
-                fetcher.fetch("$base/v0/subjects/$id?responseGroup=large", headers()).text,
+            decode(
+                text("$base/v0/subjects/$id") {
+                    fetcher.fetch("$base/v0/subjects/$id?responseGroup=large", headers())
+                },
+                BgmSubject.serializer(),
+                "Bangumi 条目",
             )
         }
-        val episodes = withFallback { base ->
-            json.decodeFromString<BgmEpisodesResponse>(
-                fetcher.fetch("$base/v0/episodes?subject_id=$id&limit=200", headers()).text,
-            ).data
+        val episodes = withFallback { base -> episodesOf(base, id) }
+        return subject.copy(
+            eps = JsonArray(episodes.map { json.encodeToJsonElement(BgmEpisode.serializer(), it) }),
+        )
+    }
+
+    /**
+     * 分页拉取剧集：v0 的 limit 上限 200，单次请求会把长篇番剧（海贼王等）
+     * 第 200 集之后静默截断掉。
+     */
+    private suspend fun episodesOf(base: String, id: Int): List<BgmEpisode> {
+        val collected = ArrayList<BgmEpisode>()
+        var offset = 0
+        while (collected.size < MAX_EPISODES) {
+            val pageUrl = "$base/v0/episodes?subject_id=$id&limit=$EPISODES_PAGE&offset=$offset"
+            val resp = decode(
+                text(pageUrl) { fetcher.fetch(pageUrl, headers()) },
+                BgmEpisodesResponse.serializer(),
+                "Bangumi 剧集列表",
+            )
+            if (resp.data.isEmpty()) break
+            collected.addAll(resp.data)
+            if (collected.size >= resp.total) break
+            offset += resp.data.size
         }
-        return subject.copy(eps = kotlinx.serialization.json.JsonArray(episodes.map { json.encodeToJsonElement(BgmEpisode.serializer(), it) }))
+        return collected
     }
 
     private fun headers() = mapOf("User-Agent" to userAgent)
+
+    /** 上游非 2xx / 连接失败都归一成 502；404 单独转成 [SubjectNotFoundException] 便于回 404。 */
+    private suspend fun text(source: String, request: suspend () -> HttpResult): String =
+        try {
+            val result = request()
+            when {
+                result.status == 404 -> throw SubjectNotFoundException(source)
+                result.status in 200..299 -> result.text
+                else -> throw UpstreamException("上游 $source 返回 ${result.status}")
+            }
+        } catch (e: SubjectNotFoundException) {
+            throw e
+        } catch (e: UpstreamException) {
+            throw e
+        } catch (e: CancellationException) {
+            // 取消信号必须原样上抛：包成业务异常会让结构化取消失效，
+            // 客户端早就断开而服务端还把这条当成一次上游失败
+            throw e
+        } catch (e: Exception) {
+            // 连接超时/拒绝之类如果不包住，会一路掉进兜底 handler 变成 500
+            throw UpstreamException("请求 $source 失败: ${e.message ?: e::class.simpleName}")
+        }
+
+    private fun <T> decode(text: String, serializer: KSerializer<T>, source: String): T =
+        try {
+            json.decodeFromString(serializer, text)
+        } catch (e: Exception) {
+            throw UpstreamException("$source 返回的不是预期 JSON")
+        }
 
     /** 按顺序尝试各 base URL，记住第一个可用的 */
     private suspend fun <T> withFallback(block: suspend (base: String) -> T): T {
@@ -131,5 +202,11 @@ class BangumiClient(
     companion object {
         val DEFAULT_BASE_URLS = listOf("https://api.bgm.tv", "https://bgmapi.anibt.net")
         const val TYPE_ANIME = 2
+
+        /** v0 episodes 接口单次上限 200 条 */
+        private const val EPISODES_PAGE = 200
+
+        /** 拉取总上限，避免 total 字段异常时翻页翻不停 */
+        private const val MAX_EPISODES = 2000
     }
 }

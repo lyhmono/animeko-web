@@ -29,6 +29,7 @@ dependencies {
     implementation("io.ktor:ktor-server-content-negotiation:3.1.3")
     implementation("io.ktor:ktor-serialization-kotlinx-json:3.1.3")
     implementation("io.ktor:ktor-server-status-pages:3.1.3")
+    implementation("io.ktor:ktor-server-compression:3.1.3")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
     implementation("org.jsoup:jsoup:1.23.2")

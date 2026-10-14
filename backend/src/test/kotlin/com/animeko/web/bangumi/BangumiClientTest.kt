@@ -3,9 +3,11 @@ package com.animeko.web.bangumi
 import com.animeko.web.http.Fetcher
 import com.animeko.web.http.HttpResult
 import com.animeko.web.http.StreamResult
+import com.animeko.web.http.UpstreamException
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /** 可按 URL 前缀返回不同响应的打桩 Fetcher（支持 POST） */
@@ -13,6 +15,7 @@ class BangumiStubFetcher(
     private val getRoutes: Map<String, String> = emptyMap(),
     private val postRoutes: Map<String, String> = emptyMap(),
     private val failingGetPrefixes: Set<String> = emptySet(),
+    private val notFoundPrefixes: Set<String> = emptySet(),
 ) : Fetcher {
     val requests = mutableListOf<String>()
 
@@ -23,6 +26,9 @@ class BangumiStubFetcher(
     ): HttpResult {
         requests.add("GET $url")
         if (failingGetPrefixes.any { url.startsWith(it) }) throw IllegalStateException("boom")
+        if (notFoundPrefixes.any { url.startsWith(it) }) {
+            return HttpResult(404, mapOf("content-type" to listOf("text/plain")), "not found".toByteArray())
+        }
         val body = getRoutes[url]
             ?: getRoutes.entries.firstOrNull { url.startsWith(it.key) }?.value
             ?: throw IllegalStateException("no fixture for $url")
@@ -64,11 +70,18 @@ class BangumiClientTest {
         "images":{"large":"https://img.example/l/xx.jpg"},"eps":12,"type":2}
     """.trimIndent()
 
-    private val episodesResponse = """
+    private val episodesPage1 = """
         {"data":[
           {"id":1128641,"name":"転がるぼっち","name_cn":"翻转孤独","sort":1,"duration":"00:23:40","airdate":"2022-10-08"},
           {"id":1128642,"name":"","name_cn":"","sort":2,"airdate":"2022-10-15"}
-        ],"total":12,"limit":200,"offset":0}
+        ],"total":4,"limit":200,"offset":0}
+    """.trimIndent()
+
+    private val episodesPage2 = """
+        {"data":[
+          {"id":1128643,"name":"音楽になりたい","name_cn":"想去成为音乐","sort":3,"airdate":"2022-10-22"},
+          {"id":1128644,"name":"転がるぼっち","name_cn":"滚动的孤独","sort":4,"airdate":"2022-10-29"}
+        ],"total":4,"limit":200,"offset":2}
     """.trimIndent()
 
     @Test
@@ -86,20 +99,53 @@ class BangumiClientTest {
     }
 
     @Test
-    fun `subject merges episodes from v0 episodes endpoint`() = runTest {
+    fun `subject pages through episodes past the single page limit`() = runTest {
         val fetcher = BangumiStubFetcher(
             getRoutes = mapOf(
                 "https://api.bgm.tv/v0/subjects/328609" to subjectResponse,
-                "https://api.bgm.tv/v0/episodes" to episodesResponse,
+                "https://api.bgm.tv/v0/episodes?subject_id=328609&limit=200&offset=0" to episodesPage1,
+                "https://api.bgm.tv/v0/episodes?subject_id=328609&limit=200&offset=2" to episodesPage2,
             ),
         )
         val client = BangumiClient(fetcher, listOf("https://api.bgm.tv"))
         val subject = client.subject(328609)
         assertEquals("孤独摇滚！", subject.name_cn)
         val eps = subject.eps as kotlinx.serialization.json.JsonArray
-        assertEquals(2, eps.size)
-        // 剧集按 sort 可解析
-        assertEquals(2, eps.size)
+        // total=4 而单页只有 2 条：旧实现固定单次请求，长篇番剧第 200 集之后会整段丢失
+        assertEquals(4, eps.size)
+        assertEquals(2, fetcher.requests.count { it.contains("/v0/episodes") })
+    }
+
+    @Test
+    fun `upstream 404 surfaces as subject-not-found`() = runTest {
+        val fetcher = BangumiStubFetcher(
+            getRoutes = mapOf("https://api.bgm.tv/v0/episodes" to episodesPage1),
+            notFoundPrefixes = setOf("https://api.bgm.tv/v0/subjects"),
+        )
+        val client = BangumiClient(fetcher, listOf("https://api.bgm.tv"))
+        assertFailsWith<SubjectNotFoundException> { client.subject(999999) }
+    }
+
+    @Test
+    fun `connection failure surfaces as upstream error rather than a bare 500`() = runTest {
+        val fetcher = BangumiStubFetcher(
+            getRoutes = mapOf("https://api.bgm.tv/v0/subjects" to subjectResponse),
+            failingGetPrefixes = setOf("https://api.bgm.tv/v0/subjects"),
+        )
+        val client = BangumiClient(fetcher, listOf("https://api.bgm.tv"))
+        assertFailsWith<UpstreamException> { client.subject(328609) }
+    }
+
+    @Test
+    fun `score and rank from the top level are kept`() = runTest {
+        val withScore = """{"data":[{"id":1,"name":"x","name_cn":"y","score":8.4,"rank":73}],"total":1}"""
+        val fetcher = BangumiStubFetcher(postRoutes = mapOf("https://api.bgm.tv/v0/search/subjects" to withScore))
+        val client = BangumiClient(fetcher, listOf("https://api.bgm.tv"))
+        val hit = client.search("x").single()
+        // 这两个字段以前没落到 DTO 上，被 ignoreUnknownKeys 直接丢掉，
+        // 前端 rating?.score ?? score 的兜底因此恒为空
+        assertEquals(8.4, hit.score)
+        assertEquals(73, hit.rank)
     }
 
     @Test

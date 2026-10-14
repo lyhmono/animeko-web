@@ -42,6 +42,22 @@ data class AppConfig(
 
     val requestTimeoutMs: Long = env("ANIMEKO_REQUEST_TIMEOUT_MS", "20000").toLongOrNull() ?: 20_000,
     val proxyTimeoutMs: Long = env("ANIMEKO_PROXY_TIMEOUT_MS", "120000").toLongOrNull() ?: 120_000,
+
+    /**
+     * 是否允许代理/抓取访问内网与保留地址。默认 false：
+     * 服务默认绑定 0.0.0.0 且鉴权默认关闭，放开内网等于给同网段一台任意端口的跳板。
+     * 只有当你确实要代理局域网内的 NAS/源站时才设为 true。
+     */
+    val allowPrivateTargets: Boolean =
+        env("ANIMEKO_ALLOW_PRIVATE_TARGETS", "false").toBooleanStrictOrNull() ?: false,
+
+    /**
+     * 是否放开「写接口只允许同源」的 CSRF 检查。默认 false。
+     * 只有在反向代理改写了 Host、导致同源判定误报时才需要设为 true，
+     * 那种情况下应当自己确保服务不对不可信网络开放。
+     */
+    val allowCrossOrigin: Boolean =
+        env("ANIMEKO_ALLOW_CROSS_ORIGIN", "false").toBooleanStrictOrNull() ?: false,
 ) {
     val selectorsDir: Path get() = dataDir.resolve("selectors")
     val danmakuConfigured: Boolean get() = danmakuAppId.isNotBlank() && danmakuAppSecret.isNotBlank()
