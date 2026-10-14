@@ -28,7 +28,11 @@ WORKDIR /app
 COPY --from=backend-build /app/build/install/animeko-web /app/
 COPY --from=frontend-build /web/dist /app/frontend/dist
 
-ENV ANIMEKO_HOST=0.0.0.0 \
+# LANG 必须显式设为 UTF-8：数据源文件名由（多为中文的）数据源名派生，
+# 而 sun.jnu.encoding 跟随系统 locale。基础镜像默认 POSIX locale 时，
+# 保存中文名数据源会直接失败（Malformed input or input contains unmappable characters）。
+ENV LANG=C.UTF-8 \
+    ANIMEKO_HOST=0.0.0.0 \
     ANIMEKO_PORT=8080 \
     ANIMEKO_DATA_DIR=/data \
     ANIMEKO_FRONTEND_DIR=/app/frontend/dist \

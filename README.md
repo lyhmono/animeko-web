@@ -11,9 +11,9 @@
 | 模块 | 说明 |
 |---|---|
 | Bangumi 元数据 | 搜索 / 条目详情 / 剧集列表（开放 API，无需密钥） |
-| Selector 数据源 | **与 animeko 数据源配置 JSON 完全兼容**（`factoryId: web-selector`，version 2），可直接导入 animeko 社区配置；支持 CSS / JsonPath 条目格式、线路分组、剧集集号正则 |
+| Selector 数据源 | 可直接导入 animeko 社区配置（`factoryId: web-selector`，version 2）；支持 CSS / XPath / JsonPath 条目格式、线路分组、剧集集号正则。**注意**：与采集相关的字段全部生效，而 `tier`、`channelTiers`、`defaultResolution`、`defaultSubtitleLanguage`、`onlySupportsPlayers`、`selectMedia`、`searchCacheTtl` 这些属于 App 侧选择策略的字段会被接受但**忽略**（服务端不做画质/字幕/源优先级仲裁） |
 | 弹弹play 弹幕 | 剧集自动匹配 + 评论拉取（需自行申请 appId/appSecret），前端 Canvas 渲染（滚动/顶部/底部、屏蔽词、字号/透明度/速度/密度） |
-| 视频代理 | Range 透传、UA/Referer/Cookie 注入、HLS(m3u8) 清单与分片重写、重定向跟随 |
+| 视频代理 | Range 透传、UA/Referer/Cookie 注入、HLS(m3u8) 清单与分片重写（分片同样携带防盗链头）、逐跳校验的重定向跟随、内网地址拦截 |
 | 播放器 | hls.js（m3u8）+ 原生 mp4/webm；倍速、进度、音量、全屏；**手动地址播放**兜底 |
 | 播放体验 | 键盘快捷键（空格/←/→/J/L/↑/↓/M/F/D）、**断点续播**、**自动连播**（下一集倒计时）、最近观看 |
 | 本地功能 | 追番收藏、最近观看、搜索历史（均存浏览器 localStorage，不上传服务端） |
@@ -50,18 +50,44 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
+| `ANIMEKO_HOST` | `0.0.0.0` | 监听地址 |
 | `ANIMEKO_PORT` | `8080` | 服务端口 |
 | `ANIMEKO_DATA_DIR` | `/data`（镜像内） | 数据目录（数据源配置） |
+| `ANIMEKO_FRONTEND_DIR` | `/app/frontend/dist` | 前端构建产物目录 |
 | `ANIMEKO_AUTH_ENABLED` | `false` | 开启访问鉴权（**公网暴露时务必开启**） |
-| `ANIMEKO_AUTH_TOKEN` | — | Bearer Token（开启鉴权后前端需带 `Authorization: Bearer <token>`） |
+| `ANIMEKO_AUTH_USER` / `ANIMEKO_AUTH_PASSWORD` | — | Basic 凭据，**浏览器访问推荐用这一对** |
+| `ANIMEKO_AUTH_TOKEN` | — | Bearer Token，供 API 调用方使用 |
+| `ANIMEKO_ALLOW_PRIVATE_TARGETS` | `false` | 是否允许代理/抓取内网地址（见下方安全说明） |
+| `ANIMEKO_ALLOW_CROSS_ORIGIN` | `false` | 是否放开「写接口仅限同源」的 CSRF 检查（见下方安全说明） |
 | `ANIMEKO_DANMAKU_APP_ID` / `ANIMEKO_DANMAKU_APP_SECRET` | — | [弹弹play 开放平台](https://dev.dandanplay.com) 申请 |
 | `ANIMEKO_BANGUMI_BASE_URLS` | `https://api.bgm.tv,https://bgmapi.anibt.net` | Bangumi API 地址列表（逗号分隔，按顺序故障转移；官方域名在部分地区被墙，可改用社区镜像） |
-| `ANIMEKO_REQUEST_TIMEOUT_MS` | `20000` | 出站请求超时 |
-| `ANIMEKO_PROXY_TIMEOUT_MS` | `120000` | 视频代理超时 |
+| `ANIMEKO_REQUEST_TIMEOUT_MS` | `20000` | 元数据/抓取类出站请求超时 |
+| `ANIMEKO_PROXY_TIMEOUT_MS` | `120000` | 视频代理（分片下载）超时 |
+
+### 鉴权与代理的安全说明
+
+- 开启 `ANIMEKO_AUTH_ENABLED` 后，服务端对未认证的 `/api/*` 请求下发 **Basic 质询**。
+  浏览器弹出的输入框只需输一次，之后的视频分片、封面图片这些子资源会自动带上凭据
+  （`<video>`/`<img>`/hls.js 都无法携带自定义 `Authorization` 头，所以纯 Bearer 模式仅供 API 调用方）。
+  用 `ANIMEKO_AUTH_TOKEN` 时，弹窗里**用户名任意、密码填 token** 即可。
+- `/api/health` 不参与鉴权：容器 `HEALTHCHECK` 和前端都需要免凭据读到它，
+  否则开启鉴权会让容器永久显示 unhealthy。该接口只返回状态、版本与两个布尔开关。
+- `/api/proxy` 与数据源抓取默认**拒绝内网与保留地址**（127.0.0.0/8、10/192.168/172.16 私有段、
+  169.254.169.254 元数据地址、`*.localhost`/`*.internal` 等），并逐跳校验重定向目标。
+  确实要代理局域网内 NAS 时，把 `ANIMEKO_ALLOW_PRIVATE_TARGETS=true` 打开。
+- `/api/*` 的**写操作只允许同源**（对比 `Origin` 与 `Host`）：服务默认无鉴权且监听 0.0.0.0，
+  否则用户访问任意恶意网页即可被跨站 POST 塞入数据源（`text/plain` 属简单请求，不会触发预检）。
+  被拦时返回 `403 CROSS_SITE_REQUEST`。反向代理若改写了 `Host` 造成误判，用
+  `ANIMEKO_ALLOW_CROSS_ORIGIN=true` 关闭该检查（此时请自行保证服务不被不可信网络访问）。
+  命令行/API 客户端不带 `Origin`，不受影响。
+- 静态资源缓存：`/assets/*`（带内容哈希）为 `max-age=31536000, immutable`，
+  `index.html` 为 `no-cache`；缺失的资源请求返回 **404** 而不是回退 `index.html`——
+  否则重新部署后，浏览器会把 HTML 当 ES module 执行，且 `React.lazy` 会永久记住这次失败。
 
 > Bangumi 说明：官方 `api.bgm.tv` 在部分地区不可达。客户端按列表顺序尝试，首个可用的会被记住。
 > 如果部署环境访问官方域名会长时间超时，建议直接把 `ANIMEKO_BANGUMI_BASE_URLS` 设为可用的镜像
 > （如 `https://bgmapi.anibt.net`），避免每次冷启动等待官方超时。
+> 旧版单值变量 `ANIMEKO_BANGUMI_BASE_URL` 仍作为兼容别名生效（优先于默认列表，被 `..._URLS` 覆盖）。
 
 ## 使用流程
 
@@ -115,7 +141,7 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 │    /api/bangumi/*     Bangumi 开放 API                             │
 │    /api/selector/*    Selector 引擎（Jsoup + JsonPath + 正则）     │
 │    /api/danmaku/*     弹弹play（签名代理，密钥只在服务端）          │
-│    /api/proxy/*       视频/HLS 代理（Range 透传 + 清单重写）        │
+│    /api/proxy          视频/HLS 代理（Range 透传 + 清单重写）        │
 │    /*                 前端静态资源（React + hls.js + Canvas 弹幕） │
 │  卷 /data：数据源配置                                              │
 └───────────────────────────────────────────────────────────────────┘
@@ -132,7 +158,7 @@ ANIMEKO_FRONTEND_DIR=../frontend/dist ./build/install/animeko-web/bin/animeko-we
 cd frontend && npm install && npm run dev   # http://localhost:5173，/api 代理到 8080
 ```
 
-测试：`cd backend && ./gradlew test`（JsonPath / Selector 引擎 / 弹幕签名 / HLS 重写 / API 路由 / Bangumi 客户端）。
+测试：`cd backend && ./gradlew test`（JsonPath / Selector 引擎 / 弹幕签名 / HLS 重写 / 视频代理与 SSRF 防护 / API 路由 / Bangumi 客户端）。
 
 ## 目录结构
 

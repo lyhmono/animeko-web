@@ -12,9 +12,16 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - ANIMEKO_PORT=8080
-      # ---- 公网暴露时取消下面两行注释 ----
+      # ---- 公网暴露时取消下面注释（浏览器会弹账号密码框；用户名任意、密码填 token）----
       # - ANIMEKO_AUTH_ENABLED=true
       # - ANIMEKO_AUTH_TOKEN=请改成足够长的随机字符串
+      # ---- 或用 Basic 账号密码（浏览器/播放器都直接可用）----
+      # - ANIMEKO_AUTH_USER=animeko
+      # - ANIMEKO_AUTH_PASSWORD=***
+      # ---- 代理/抓取内网地址（默认拒绝，防 SSRF）----
+      # - ANIMEKO_ALLOW_PRIVATE_TARGETS=true
+      # ---- 反代改写了 Host 导致同源判定误报时才需要放开 ----
+      # - ANIMEKO_ALLOW_CROSS_ORIGIN=true
       # ---- 弹幕（在 https://dev.dandanplay.com 申请）----
       # - ANIMEKO_DANMAKU_APP_ID=
       # - ANIMEKO_DANMAKU_APP_SECRET=
