@@ -5,7 +5,6 @@ import com.animeko.web.danmaku.DdComment
 import com.animeko.web.module
 import com.animeko.web.selector.EpisodeHit
 import com.animeko.web.selector.EpisodesResult
-import com.animeko.web.selector.ResolvedVideo
 import com.animeko.web.selector.SubjectHit
 import io.ktor.client.request.delete
 import io.ktor.client.request.get
@@ -295,10 +294,13 @@ class ApiRoutesTest {
         assertTrue(episodes.contains("\"episodes\""), episodes)
 
         val video = json.encodeToString(
-            ResolvedVideo.serializer(),
-            ResolvedVideo("https://example-site.test/v/index.m3u8", "https://example-site.test", "ua", ""),
+            VideoSourceResponse.serializer(),
+            VideoSourceResponse(
+                "https://example-site.test/v/index.m3u8",
+                "/api/proxy?url=https%3A%2F%2Fexample-site.test%2Fv%2Findex.m3u8&sid=ab12",
+            ),
         )
-        assertTrue(video.contains("\"url\":\"https://example-site.test/v/index.m3u8\""), video)
+        assertTrue(video.contains("\"proxyPath\":\"/api/proxy?url="), video)
 
         val comment = json.encodeToString(
             DdComment.serializer(),

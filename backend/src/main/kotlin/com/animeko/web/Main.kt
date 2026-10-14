@@ -11,6 +11,7 @@ import com.animeko.web.http.Fetcher
 import com.animeko.web.http.JdkFetcher
 import com.animeko.web.http.UpstreamException
 import com.animeko.web.http.UrlGuard
+import com.animeko.web.proxy.ProxySessionStore
 import com.animeko.web.selector.SelectorEngine
 import com.animeko.web.selector.SelectorException
 import com.animeko.web.selector.SelectorRepository
@@ -37,7 +38,11 @@ fun main() {
     }.start(wait = true)
 }
 
-fun Application.module(cfg: AppConfig = AppConfig(), fetcherOverride: Fetcher? = null) {
+fun Application.module(
+    cfg: AppConfig = AppConfig(),
+    fetcherOverride: Fetcher? = null,
+    proxySessions: ProxySessionStore = ProxySessionStore(),
+) {
     install(ContentNegotiation) {
         json(Json { ignoreUnknownKeys = true; encodeDefaults = true })
     }
@@ -103,7 +108,8 @@ fun Application.module(cfg: AppConfig = AppConfig(), fetcherOverride: Fetcher? =
     val repo = SelectorRepository(cfg.selectorsDir)
     repo.seedIfEmpty()
     val engine = SelectorEngine(fetcher, cfg.allowPrivateTargets)
+    val sessions = proxySessions
 
-    configureApiRoutes(cfg, bangumi, danmaku, repo, engine, fetcher)
+    configureApiRoutes(cfg, bangumi, danmaku, repo, engine, fetcher, sessions)
     configureStaticFrontend(cfg)
 }

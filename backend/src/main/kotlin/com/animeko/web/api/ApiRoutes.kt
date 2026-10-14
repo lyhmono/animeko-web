@@ -9,6 +9,7 @@ import com.animeko.web.http.StreamResult
 import com.animeko.web.http.UrlGuard
 import com.animeko.web.http.UpstreamException
 import com.animeko.web.proxy.HlsRewriter
+import com.animeko.web.proxy.ProxySessionStore
 import com.animeko.web.selector.SelectorEngine
 import com.animeko.web.selector.SelectorException
 import com.animeko.web.selector.SelectorRepository
@@ -48,6 +49,8 @@ private val prettyJson = Json { ignoreUnknownKeys = true }
 
 private const val HEALTH_PATH = "/api/health"
 
+private const val PROXY_PATH = "/api/proxy"
+
 /** 播放清单体积上限：防止有人把 .m3u8 指向一个大文件，readText() 直接把堆吃光。 */
 private const val MAX_PLAYLIST_BYTES = 4L * 1024 * 1024
 
@@ -57,6 +60,14 @@ data class HealthResponse(
     val version: String,
     val danmakuConfigured: Boolean,
     val authEnabled: Boolean,
+)
+
+@kotlinx.serialization.Serializable
+data class VideoSourceResponse(
+    /** 解析出的媒体地址，仅便于排查与手动复放 */
+    val url: String,
+    /** 交给播放器的代理地址（凭据不在里面） */
+    val proxyPath: String,
 )
 
 @kotlinx.serialization.Serializable
@@ -72,6 +83,7 @@ fun Application.configureApiRoutes(
     repo: SelectorRepository,
     engine: SelectorEngine,
     fetcher: Fetcher,
+    sessions: ProxySessionStore,
 ) {
     routing {
         // ---- 可选鉴权（默认关闭；公网暴露时开启）----
@@ -213,7 +225,15 @@ fun Application.configureApiRoutes(
                 if (playUrl.isNullOrBlank()) {
                     call.respond(HttpStatusCode.BadRequest, mapOf("error" to "missing playUrl"))
                 } else {
-                    call.respond(engine.resolveVideo(source.arguments.searchConfig, playUrl))
+                    val target = engine.resolveVideo(source.arguments.searchConfig, playUrl)
+                    // 凭据换成服务端会话号后再交给前端：浏览器只需要一个能用的代理地址
+                    val sid = sessions.put(target.userAgent, target.referer, target.cookie)
+                    call.respond(
+                        VideoSourceResponse(
+                            url = target.url,
+                            proxyPath = HlsRewriter.proxyUrl(PROXY_PATH, target.url, sid),
+                        ),
+                    )
                 }
             }
         }
@@ -239,7 +259,7 @@ fun Application.configureApiRoutes(
         }
 
         // ---- 视频/HLS 代理 ----
-        get("/api/proxy") { proxyVideo(call, fetcher, cfg) }
+        get("/api/proxy") { proxyVideo(call, fetcher, cfg, sessions) }
     }
 }
 
@@ -350,7 +370,12 @@ private fun constantTimeEquals(a: String, b: String): Boolean =
 
 private const val MAX_REDIRECTS = 5
 
-private suspend fun proxyVideo(call: ApplicationCall, fetcher: Fetcher, cfg: AppConfig) {
+private suspend fun proxyVideo(
+    call: ApplicationCall,
+    fetcher: Fetcher,
+    cfg: AppConfig,
+    sessions: ProxySessionStore,
+) {
     // Ktor 已经解码过查询参数，不能再 URLDecoder 一次：
     // 带签名/令牌的地址几乎都含 % 和 +，二次解码会把 ?sign=a%2Bb 变成 ?sign=a b，
     // 表现为「解析成功但播放/清单 404」，且日志里看不出原因。
@@ -361,19 +386,20 @@ private suspend fun proxyVideo(call: ApplicationCall, fetcher: Fetcher, cfg: App
     }
     var url = UrlGuard.requireAllowed(requested, cfg.allowPrivateTargets)
 
-    // 上游所需请求头由查询参数带入（数据源解析出的 ua/referer/cookie）。
-    // 同一份参数还要写进改写后的分片地址，否则分片请求丢防盗链头 → 清单能拉、画面播不出。
-    val forwardParams = LinkedHashMap<String, String>()
-    for (key in listOf("ua", "referer", "cookie")) {
-        call.request.queryParameters[key]
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
-            ?.let { forwardParams[key] = it }
-    }
+    // 上游所需请求头不再由查询参数带入：UA/Referer/Cookie 留在服务端会话库里，
+    // URL 里只出现一个随机 sid。此前这些值会被复制到每一个分片地址上，
+    // 等于把源站凭据批量写进浏览器历史与访问日志。
+    val sid = call.request.queryParameters["sid"]?.trim().orEmpty()
     val headers = LinkedHashMap<String, String>()
-    forwardParams["ua"]?.let { headers["User-Agent"] = it }
-    forwardParams["referer"]?.let { headers["Referer"] = it }
-    forwardParams["cookie"]?.let { headers["Cookie"] = it }
+    if (sid.isNotEmpty()) {
+        val stored = sessions.headers(sid)
+        if (stored == null) {
+            // 会话过期与「源站拒绝」必须可区分，否则排查播放故障只能猜
+            call.respond(HttpStatusCode.Gone, mapOf("error" to "PROXY_SESSION_EXPIRED"))
+            return
+        }
+        headers.putAll(stored)
+    }
     call.request.headers["Range"]?.let { if (it.isNotBlank()) headers["Range"] = it }
 
     var result = fetchStream(fetcher, url, headers)
@@ -392,7 +418,6 @@ private suspend fun proxyVideo(call: ApplicationCall, fetcher: Fetcher, cfg: App
         if (hostOf(next) != hostOf(url)) {
             // 跨主机重定向不再带 Cookie，避免源站凭据被送给第三个域名
             headers.remove("Cookie")
-            forwardParams.remove("cookie")
         }
         url = next
         result = fetchStream(fetcher, url, headers)
@@ -405,7 +430,7 @@ private suspend fun proxyVideo(call: ApplicationCall, fetcher: Fetcher, cfg: App
 
     if (isHls) {
         val text = readCapped(result.body, MAX_PLAYLIST_BYTES)
-        val rewritten = HlsRewriter.rewrite(text, url, forwardParams = forwardParams)
+        val rewritten = HlsRewriter.rewrite(text, url, sid = sid)
         call.respondText(rewritten, ContentType.parse("application/vnd.apple.mpegurl"))
         return
     }

@@ -13,7 +13,7 @@
 | Bangumi 元数据 | 搜索 / 条目详情 / 剧集列表（开放 API，无需密钥） |
 | Selector 数据源 | 可直接导入 animeko 社区配置（`factoryId: web-selector`，version 2）；支持 CSS / XPath / JsonPath 条目格式、线路分组、剧集集号正则。**注意**：与采集相关的字段全部生效，而 `tier`、`channelTiers`、`defaultResolution`、`defaultSubtitleLanguage`、`onlySupportsPlayers`、`selectMedia`、`searchCacheTtl` 这些属于 App 侧选择策略的字段会被接受但**忽略**（服务端不做画质/字幕/源优先级仲裁） |
 | 弹弹play 弹幕 | 剧集自动匹配 + 评论拉取（需自行申请 appId/appSecret），前端 Canvas 渲染（滚动/顶部/底部、屏蔽词、字号/透明度/速度/密度） |
-| 视频代理 | Range 透传、UA/Referer/Cookie 注入、HLS(m3u8) 清单与分片重写（分片同样携带防盗链头）、逐跳校验的重定向跟随、内网地址拦截 |
+| 视频代理 | Range 透传、服务端会话化的 UA/Referer/Cookie 注入、HLS(m3u8) 清单与分片重写（分片同样带防盗链凭据）、逐跳校验的重定向跟随、内网地址拦截 |
 | 播放器 | hls.js（m3u8）+ 原生 mp4/webm；倍速、进度、音量、全屏；**手动地址播放**兜底 |
 | 播放体验 | 键盘快捷键（空格/←/→/J/L/↑/↓/M/F/D）、**断点续播**、**自动连播**（下一集倒计时）、最近观看 |
 | 本地功能 | 追番收藏、最近观看、搜索历史（均存浏览器 localStorage，不上传服务端） |
@@ -72,6 +72,14 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
   用 `ANIMEKO_AUTH_TOKEN` 时，弹窗里**用户名任意、密码填 token** 即可。
 - `/api/health` 不参与鉴权：容器 `HEALTHCHECK` 和前端都需要免凭据读到它，
   否则开启鉴权会让容器永久显示 unhealthy。该接口只返回状态、版本与两个布尔开关。
+- 解析出的源站 `UA/Referer/Cookie` **只留在服务端**：`/api/.../video` 返回一个
+  `/api/proxy?url=…&sid=…` 地址，`sid` 是 128 位随机十六进制、6 小时空闲即失效、
+  使用中自动续期。HLS 清单改写出的每个分片/密钥地址同样只带 `sid`。
+  旧做法是把凭据拼进查询参数，而一张清单会把它复制到成百上千个分片 URL 上，
+  这些地址会进浏览器历史与访问日志。凭据因此不再下发给浏览器。
+  会话过期后代理返回 `410 PROXY_SESSION_EXPIRED`（与「源站拒绝」可区分），
+  重新点播放即可拿到新会话。`/api/proxy` 不再接受 `ua`/`referer`/`cookie` 参数，
+  顺带也关掉了「任意 URL + 任意请求头」这个组合面。
 - `/api/proxy` 与数据源抓取默认**拒绝内网与保留地址**（127.0.0.0/8、10/192.168/172.16 私有段、
   169.254.169.254 元数据地址、`*.localhost`/`*.internal` 等），并逐跳校验重定向目标。
   确实要代理局域网内 NAS 时，把 `ANIMEKO_ALLOW_PRIVATE_TARGETS=true` 打开。
@@ -158,7 +166,7 @@ ANIMEKO_FRONTEND_DIR=../frontend/dist ./build/install/animeko-web/bin/animeko-we
 cd frontend && npm install && npm run dev   # http://localhost:5173，/api 代理到 8080
 ```
 
-测试：`cd backend && ./gradlew test`（JsonPath / Selector 引擎 / 弹幕签名 / HLS 重写 / 视频代理与 SSRF 防护 / API 路由 / Bangumi 客户端）。
+测试：`cd backend && ./gradlew test`（JsonPath / Selector 引擎与数据源仓库 / 弹幕签名 / HLS 重写 / 代理会话 / 视频代理与 SSRF 防护 / API 路由 / Bangumi 客户端）。
 
 ## 目录结构
 

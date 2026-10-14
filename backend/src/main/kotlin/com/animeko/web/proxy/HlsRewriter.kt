@@ -14,28 +14,28 @@ object HlsRewriter {
     private val uriAttrRegex = Regex("""URI="([^"]+)"""")
 
     /**
-     * @param forwardParams 拉取本清单时使用的 ua/referer/cookie 等参数，
-     *   必须一并写进每个分片地址：源站对分片同样做防盗链校验，
-     *   只带 url 参数的分片请求会被判 403（清单能拉到、画面却播不出来）。
+     * @param sid 服务端会话号：UA/Referer/Cookie 存在 ProxySessionStore 里，
+     *   分片地址只带这个号。清单能拉到、分片也必须能拉到（源站对分片同样做防盗链校验），
+     *   但凭据本身不该被复制到成百上千个分片 URL 上（浏览器历史与访问日志都会留下）。
      */
     fun rewrite(
         body: String,
         playlistUrl: String,
         proxyPath: String = "/api/proxy",
-        forwardParams: Map<String, String> = emptyMap(),
+        sid: String = "",
     ): String {
         return body.lines().joinToString("\n") { line ->
             val t = line.trim()
             when {
                 t.isEmpty() -> line
-                t.startsWith("#") -> rewriteTagAttributes(line, playlistUrl, proxyPath, forwardParams)
+                t.startsWith("#") -> rewriteTagAttributes(line, playlistUrl, proxyPath, sid)
                 else -> {
                     val abs = if (t.startsWith("http://") || t.startsWith("https://")) {
                         t
                     } else {
                         SelectorEngine.absUrl(playlistUrl, t)
                     }
-                    proxyUrl(proxyPath, abs, forwardParams)
+                    proxyUrl(proxyPath, abs, sid)
                 }
             }
         }
@@ -46,7 +46,7 @@ object HlsRewriter {
         line: String,
         playlistUrl: String,
         proxyPath: String,
-        forwardParams: Map<String, String>,
+        sid: String,
     ): String =
         uriAttrRegex.replace(line) { m ->
             val url = m.groupValues[1]
@@ -55,13 +55,12 @@ object HlsRewriter {
             } else {
                 SelectorEngine.absUrl(playlistUrl, url)
             }
-            """URI="${proxyUrl(proxyPath, abs, forwardParams)}""""
+            """URI="${proxyUrl(proxyPath, abs, sid)}""""
         }
 
-    fun proxyUrl(proxyPath: String, url: String, forwardParams: Map<String, String> = emptyMap()): String {
-        val extra = forwardParams.entries
-            .filter { it.value.isNotBlank() }
-            .joinToString("") { "&${it.key}=${URLEncoder.encode(it.value, "UTF-8")}" }
+    fun proxyUrl(proxyPath: String, url: String, sid: String = ""): String {
+        // sid 是本服务生成的十六进制串，不需要再编码
+        val extra = if (sid.isEmpty()) "" else "&sid=$sid"
         return "$proxyPath?url=${URLEncoder.encode(url, "UTF-8")}$extra"
     }
 }

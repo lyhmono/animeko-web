@@ -62,11 +62,13 @@ export interface EpisodesResult {
   groups: ChannelGroupHit[]
 }
 
-export interface ResolvedVideo {
+/**
+ * 数据源解析结果。服务端只给出可直接播放的代理地址：
+ * UA/Referer/Cookie 换成一个短期会话号留在服务端，不再下发给浏览器。
+ */
+export interface VideoSource {
   url: string
-  referer: string
-  userAgent: string
-  cookies: string
+  proxyPath: string
 }
 
 export interface SelectorSearchConfig {

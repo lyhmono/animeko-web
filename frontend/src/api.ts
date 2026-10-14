@@ -3,7 +3,7 @@ import type {
   DdAnime,
   DdComment,
   EpisodesResult,
-  ResolvedVideo,
+  VideoSource,
   StoredSource,
   SubjectHit,
 } from './types'
@@ -63,7 +63,7 @@ export const api = {
       body: JSON.stringify({ subjectUrl }),
     }),
   resolveVideo: (name: string, playUrl: string) =>
-    request<ResolvedVideo>(`/api/selector/sources/${encodeURIComponent(name)}/video`, {
+    request<VideoSource>(`/api/selector/sources/${encodeURIComponent(name)}/video`, {
       method: 'POST',
       body: JSON.stringify({ playUrl }),
     }),
@@ -83,16 +83,6 @@ export function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
-/** 把解析出的视频地址改写为经过服务端代理的地址（携带 UA/Referer/Cookie） */
-export function proxyUrl(video: ResolvedVideo): string {
-  const params = new URLSearchParams({ url: video.url })
-  if (video.userAgent) params.set('ua', video.userAgent)
-  if (video.referer) params.set('referer', video.referer)
-  if (video.cookies) params.set('cookie', video.cookies)
-  return `/api/proxy?${params.toString()}`
-}
-
-/** 是否可直接播放（mp4/webm/ogg 直链，无需 hls.js） */
 export function isDirectPlayable(url: string): boolean {
   // 注意：播放地址通常是 /api/proxy?url=<encoded>&ua=...&referer=... 形式，
   // url 参数后面还带有 ua/referer/cookie，媒体后缀不在字符串末尾。

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { api, errMsg, proxyUrl } from '../api'
+import { api, errMsg } from '../api'
 import type { DdComment, DanmakuOptions } from '../types'
 import VideoPlayer from '../components/VideoPlayer'
 import DanmakuCanvas from '../components/DanmakuCanvas'
@@ -144,7 +144,7 @@ export default function PlayerPage() {
       .resolveVideo(source, playUrl)
       .then((video) => {
         if (seq !== resolveSeqRef.current) return
-        setSrc(proxyUrl(video))
+        setSrc(video.proxyPath)
         addRecent({
           source,
           playUrl,

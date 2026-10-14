@@ -5,6 +5,7 @@ import com.animeko.web.http.Fetcher
 import com.animeko.web.http.HttpResult
 import com.animeko.web.http.StreamResult
 import com.animeko.web.module
+import com.animeko.web.proxy.ProxySessionStore
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.parameter
@@ -40,7 +41,7 @@ private class StreamStubFetcher(private val specs: List<Spec>) : Fetcher {
         headers: Map<String, String>,
         followRedirects: Boolean,
     ): StreamResult {
-        // 存副本：代理会在跨主机重定向后就地 remove("Cookie")，
+        // 存副本：代理在跨主机重定向后会就地 remove("Cookie")，
         // 直接持有同一个 map 会让第一次请求的记录被改写，断言失去意义。
         requests.add(url to LinkedHashMap(headers))
         val spec = specs[minOf(requests.lastIndex, specs.lastIndex)]
@@ -75,47 +76,108 @@ private fun redirect(location: String) = StreamStubFetcher.Spec(
     headers = mapOf("location" to listOf(location)),
 )
 
+private const val UA = "SecretUA/1.0"
+private const val REFERER = "https://v.example.com/watch"
+private const val COOKIE = "token=***"
+
 class ProxyRouteTest {
 
     /**
-     * allowPrivate 默认 true：本类的用例都带 .example.com 这类假域名，
+     * allowPrivate 默认 true：本类用例都带 .example.com 这类假域名，
      * 严格的 UrlGuard 会做真实 DNS 解析；SSRF 用例单独传 false（目标全是字面 IP，不触发解析）。
      */
-    private fun cfg(
+    private class Harness(
+        specs: List<StreamStubFetcher.Spec>,
         allowPrivate: Boolean = true,
         authEnabled: Boolean = false,
         token: String? = null,
-    ) = AppConfig(
-        dataDir = Files.createTempDirectory("animeko-proxy-test"),
-        frontendDir = "definitely-not-exist",
-        allowPrivateTargets = allowPrivate,
-        authEnabled = authEnabled,
-        authToken = token,
-    )
+    ) {
+        val stub = StreamStubFetcher(specs)
+        val sessions = ProxySessionStore()
+        val sid: String = sessions.put(UA, REFERER, COOKIE)
+        val cfg = AppConfig(
+            dataDir = Files.createTempDirectory("animeko-proxy-test"),
+            frontendDir = "definitely-not-exist",
+            allowPrivateTargets = allowPrivate,
+            authEnabled = authEnabled,
+            authToken = token,
+        )
+    }
 
     @Test
-    fun `rewritten segments keep ua referer and cookie`() = testApplication {
-        val stub = StreamStubFetcher(listOf(hlsPlaylist("seg1.ts")))
-        application { module(cfg(), stub) }
+    fun `segments carry the session id and never the credentials`() = testApplication {
+        val h = Harness(listOf(hlsPlaylist("seg1.ts")))
+        application { module(h.cfg, h.stub, h.sessions) }
         val resp = client.get("/api/proxy") {
             parameter("url", "https://cdn.example.com/hls/index.m3u8")
-            parameter("ua", "SecretUA/1.0")
-            parameter("referer", "https://v.example.com/watch")
-            parameter("cookie", "token=abc")
+            parameter("sid", h.sid)
         }
         val text = resp.bodyAsText()
         assertEquals(HttpStatusCode.OK, resp.status)
-        assertEquals(1, stub.requests.size)
-        // 分片地址必须带上同一套头，否则清单能拉、分片全 403
-        assertTrue(text.contains("ua=SecretUA%2F1.0"), text)
-        assertTrue(text.contains("referer=https%3A%2F%2Fv.example.com%2Fwatch"), text)
-        assertTrue(text.contains("cookie=token%3Dabc"), text)
-        assertEquals("SecretUA/1.0", stub.requests.single().second["User-Agent"])
+
+        // 凭据从服务端会话库取，上游照样收得到
+        val sent = h.stub.requests.single().second
+        assertEquals(UA, sent["User-Agent"])
+        assertEquals(REFERER, sent["Referer"])
+        assertEquals(COOKIE, sent["Cookie"])
+
+        // 但改写出来的分片地址只带 sid，不带任何凭据
+        assertTrue(text.contains("sid=${h.sid}"), text)
+        assertFalse(text.contains(UA), "凭据被复制到分片 URL 上了：$text")
+        assertFalse(text.contains(COOKIE), "凭据被复制到分片 URL 上了：$text")
+        assertFalse(text.contains("referer="), "凭据被复制到分片 URL 上了：$text")
+    }
+
+    @Test
+    fun `unknown session is reported as gone rather than a silent unauthenticated fetch`() = testApplication {
+        val h = Harness(listOf(hlsPlaylist("seg1.ts")))
+        application { module(h.cfg, h.stub, h.sessions) }
+        val resp = client.get("/api/proxy") {
+            parameter("url", "https://cdn.example.com/hls/index.m3u8")
+            parameter("sid", "deadbeefdeadbeefdeadbeefdeadbeef")
+        }
+        assertEquals(HttpStatusCode.Gone, resp.status)
+        assertTrue(resp.bodyAsText().contains("PROXY_SESSION_EXPIRED"))
+        assertTrue(h.stub.requests.isEmpty(), "会话已失效就不该再打上游")
+    }
+
+    @Test
+    fun `requests without a session still proxy plain links`() = testApplication {
+        val h = Harness(
+            listOf(StreamStubFetcher.Spec(contentType = "video/mp4", body = "BYTES")),
+        )
+        application { module(h.cfg, h.stub, h.sessions) }
+        val resp = client.get("/api/proxy") { parameter("url", "https://cdn.example.com/video.mp4") }
+        assertEquals(HttpStatusCode.OK, resp.status)
+        assertEquals("BYTES", resp.bodyAsText())
+        // 没有会话就没有额外头：手动直链播放本来就是无凭据场景
+        assertEquals(emptyMap(), h.stub.requests.single().second.filterKeys { it != "Range" })
+    }
+
+    @Test
+    fun `media url is decoded exactly once`() = testApplication {
+        val h = Harness(listOf(StreamStubFetcher.Spec(contentType = "video/mp4", body = "X")))
+        application { module(h.cfg, h.stub, h.sessions) }
+        val signed = "https://cdn.example.com/v.mp4?sign=abc%2Bdef%2Fghi&exp=1"
+        client.get("/api/proxy") { parameter("url", signed) }
+        // Ktor 已解码一次；再解一次会把 %2B 变成 +、再把 + 变成空格，直链就废了
+        assertEquals(signed, h.stub.requests.single().first)
+    }
+
+    @Test
+    fun `session header values are passed through unchanged`() {
+        // UA/cookie 里含空格、字面 + 和 % 很常见（base64 令牌、带签名的 referer）
+        val tricky = ProxySessionStore()
+        val sid = tricky.put("Player/1.0 build+7 q=50%", "https://a.example/x?y=1&z=2", "sid=a+b%2Bc")
+        val stored = checkNotNull(tricky.headers(sid))
+        assertEquals("Player/1.0 build+7 q=50%", stored["User-Agent"])
+        assertEquals("https://a.example/x?y=1&z=2", stored["Referer"])
+        assertEquals("sid=a+b%2Bc", stored["Cookie"])
     }
 
     @Test
     fun `range request is forwarded and content-range echoed`() = testApplication {
-        val stub = StreamStubFetcher(
+        val h = Harness(
             listOf(
                 StreamStubFetcher.Spec(
                     status = 206,
@@ -128,89 +190,133 @@ class ProxyRouteTest {
                 ),
             ),
         )
-        application { module(cfg(), stub) }
+        application { module(h.cfg, h.stub, h.sessions) }
         val resp = client.get("/api/proxy") {
             parameter("url", "https://cdn.example.com/video.mp4")
-            parameter("referer", "https://v.example.com/watch")
+            parameter("sid", h.sid)
             header("Range", "bytes=0-1")
         }
         assertEquals(HttpStatusCode.PartialContent, resp.status)
         assertEquals("bytes 0-1/10", resp.headers["Content-Range"])
         assertEquals("bytes", resp.headers["Accept-Ranges"])
         assertEquals("0123456789", resp.bodyAsText())
-        assertEquals("bytes=0-1", stub.requests.single().second["Range"])
-        assertEquals("https://v.example.com/watch", stub.requests.single().second["Referer"])
+        val sent = h.stub.requests.single().second
+        assertEquals("bytes=0-1", sent["Range"])
+        assertEquals(REFERER, sent["Referer"])
     }
 
     @Test
-    fun `cross host redirect drops cookie`() = testApplication {
-        val stub = StreamStubFetcher(
+    fun `cross host redirect drops cookie without poisoning the session`() = testApplication {
+        val h = Harness(
             listOf(
                 redirect("https://other-host.example.com/hls/index.m3u8"),
                 hlsPlaylist("seg1.ts"),
             ),
         )
-        application { module(cfg(), stub) }
+        application { module(h.cfg, h.stub, h.sessions) }
         client.get("/api/proxy") {
             parameter("url", "https://cdn.example.com/hls/index.m3u8")
-            parameter("cookie", "token=abc")
+            parameter("sid", h.sid)
         }
-        assertEquals(2, stub.requests.size)
-        assertEquals("token=abc", stub.requests[0].second["Cookie"])
-        assertFalse("Cookie" in stub.requests[1].second, "跨主机重定向后不该继续携带源站 Cookie")
+        assertEquals(2, h.stub.requests.size)
+        assertEquals(COOKIE, h.stub.requests[0].second["Cookie"])
+        assertFalse("Cookie" in h.stub.requests[1].second, "跨主机重定向后不该继续携带源站 Cookie")
+        // 会话本身不能被这次跳转改坏，否则后续分片会莫名丢凭据
+        assertEquals(COOKIE, h.sessions.headers(h.sid)?.get("Cookie"))
     }
 
     @Test
     fun `same host redirect keeps cookie and resolves relative location`() = testApplication {
-        val stub = StreamStubFetcher(
+        val h = Harness(
             listOf(
                 redirect("/hls/index2.m3u8"),
                 hlsPlaylist("seg1.ts"),
             ),
         )
-        application { module(cfg(), stub) }
+        application { module(h.cfg, h.stub, h.sessions) }
         val resp = client.get("/api/proxy") {
             parameter("url", "https://cdn.example.com/hls/index.m3u8")
-            parameter("cookie", "token=abc")
+            parameter("sid", h.sid)
         }
         assertEquals(HttpStatusCode.OK, resp.status)
-        assertEquals(2, stub.requests.size)
-        assertEquals("https://cdn.example.com/hls/index2.m3u8", stub.requests[1].first)
-        assertEquals("token=abc", stub.requests[1].second["Cookie"])
+        assertEquals(2, h.stub.requests.size)
+        assertEquals("https://cdn.example.com/hls/index2.m3u8", h.stub.requests[1].first)
+        assertEquals(COOKIE, h.stub.requests[1].second["Cookie"])
     }
 
     @Test
-    fun `forwarded header values survive the query round trip`() = testApplication {
-        val stub = StreamStubFetcher(listOf(hlsPlaylist("seg1.ts")))
-        application { module(cfg(), stub) }
-        // 含空格、字面 + 和 %XX 的 UA/cookie 很常见（base64 口令、带签名的 referer）。
-        // 若服务端对已解码的查询参数再解码一次，这些值会被静默改写。
-        val tricky = "Player/1.0 build+7 q=50%25"
-        client.get("/api/proxy") {
-            parameter("url", "https://cdn.example.com/hls/index.m3u8")
-            parameter("ua", tricky)
-            parameter("cookie", "sid=abc%2Bdef")
+    fun `loopback target is rejected before any upstream request`() = testApplication {
+        val h = Harness(listOf(hlsPlaylist("seg1.ts")), allowPrivate = false)
+        application { module(h.cfg, h.stub, h.sessions) }
+        val resp = client.get("/api/proxy") {
+            parameter("url", "http://127.0.0.1:8080/api/selector/sources")
         }
-        val sent = stub.requests.single().second
-        assertEquals(tricky, sent["User-Agent"], "UA 在解码环节被改写了")
-        assertEquals("sid=abc%2Bdef", sent["Cookie"], "cookie 里的 %2B 被二次解码成了 +")
+        assertEquals(HttpStatusCode.Forbidden, resp.status)
+        assertTrue(h.stub.requests.isEmpty(), "被拦下时不该发出任何上游请求")
+    }
+
+    @Test
+    fun `redirect into metadata address is rejected`() = testApplication {
+        // 只校验入口地址会被 302 绕过，所以每一跳都要重新校验。
+        // 入口用字面公网 IP，避免测试环境做真实 DNS 解析。
+        val h = Harness(
+            listOf(
+                redirect("http://169.254.169.254/latest/meta-data/"),
+                hlsPlaylist("seg1.ts"),
+            ),
+            allowPrivate = false,
+        )
+        application { module(h.cfg, h.stub, h.sessions) }
+        val resp = client.get("/api/proxy") {
+            parameter("url", "https://93.184.216.34/hls/index.m3u8")
+        }
+        assertEquals(HttpStatusCode.Forbidden, resp.status)
+        assertEquals(1, h.stub.requests.size, "跳转到内网地址后必须中断，不能再请求第二跳")
+    }
+
+    @Test
+    fun `inline credential params are no longer accepted as headers`() = testApplication {
+        // 旧协议允许 ?ua=&referer=&cookie= 直接注入任意请求头，
+        // 现在这些参数必须被完全忽略（否则又回到「任意头 + 任意地址」的 SSRF 组合）
+        val h = Harness(listOf(StreamStubFetcher.Spec(contentType = "video/mp4", body = "X")))
+        application { module(h.cfg, h.stub, h.sessions) }
+        client.get("/api/proxy") {
+            parameter("url", "https://cdn.example.com/v.mp4")
+            parameter("ua", "Injected/1.0")
+            parameter("cookie", "session=stolen")
+            parameter("referer", "https://attacker.example")
+        }
+        val sent = h.stub.requests.single().second
+        assertFalse("User-Agent" in sent, "内联 ua 仍被当请求头：$sent")
+        assertFalse("Cookie" in sent, "内联 cookie 仍被当请求头：$sent")
+        assertFalse("Referer" in sent, "内联 referer 仍被当请求头：$sent")
+    }
+
+    @Test
+    fun `missing or non http url is a bad request`() = testApplication {
+        val h = Harness(listOf(hlsPlaylist("seg1.ts")))
+        application { module(h.cfg, h.stub, h.sessions) }
+        assertEquals(HttpStatusCode.BadRequest, client.get("/api/proxy").status)
+        assertEquals(
+            HttpStatusCode.BadRequest,
+            client.get("/api/proxy") { parameter("url", "file:///etc/passwd") }.status,
+        )
+        assertTrue(h.stub.requests.isEmpty())
     }
 
     @Test
     fun `gzip applies to playlists but never to streamed media`() = testApplication {
-        // Compression 是按内容类型白名单开的。这里同时验证两件事：
-        // 文本清单确实被压缩（移动端首屏），而视频/分片绝不能被压缩——
-        // 那会白烧 CPU、改变 Content-Length，并破坏 Range 断点续播。
-        val specs = listOf(
-            StreamStubFetcher.Spec(
-                status = 206,
-                contentType = "video/mp4",
-                body = "0123456789",
-                headers = mapOf("content-range" to listOf("bytes 0-1/10")),
+        val h = Harness(
+            listOf(
+                StreamStubFetcher.Spec(
+                    status = 206,
+                    contentType = "video/mp4",
+                    body = "0123456789",
+                    headers = mapOf("content-range" to listOf("bytes 0-1/10")),
+                ),
             ),
         )
-        val stub = StreamStubFetcher(specs)
-        application { module(cfg(), stub) }
+        application { module(h.cfg, h.stub, h.sessions) }
         val resp = client.get("/api/proxy") {
             parameter("url", "https://cdn.example.com/video.mp4")
             header(HttpHeaders.AcceptEncoding, "gzip")
@@ -222,50 +328,9 @@ class ProxyRouteTest {
     }
 
     @Test
-    fun `loopback target is rejected before any upstream request`() = testApplication {
-        val stub = StreamStubFetcher(listOf(hlsPlaylist("seg1.ts")))
-        application { module(cfg(allowPrivate = false), stub) }
-        val resp = client.get("/api/proxy") {
-            parameter("url", "http://127.0.0.1:8080/api/selector/sources")
-        }
-        assertEquals(HttpStatusCode.Forbidden, resp.status)
-        assertTrue(stub.requests.isEmpty(), "被拦下时不该发出任何上游请求")
-    }
-
-    @Test
-    fun `redirect into metadata address is rejected`() = testApplication {
-        // 只校验入口地址会被 302 绕过，所以每一跳都要重新校验。
-        // 入口用字面公网 IP，避免测试环境做真实 DNS 解析。
-        val stub = StreamStubFetcher(
-            listOf(
-                redirect("http://169.254.169.254/latest/meta-data/"),
-                hlsPlaylist("seg1.ts"),
-            ),
-        )
-        application { module(cfg(allowPrivate = false), stub) }
-        val resp = client.get("/api/proxy") {
-            parameter("url", "https://93.184.216.34/hls/index.m3u8")
-        }
-        assertEquals(HttpStatusCode.Forbidden, resp.status)
-        assertEquals(1, stub.requests.size, "跳转到内网地址后必须中断，不能再请求第二跳")
-    }
-
-    @Test
-    fun `missing or non http url is a bad request`() = testApplication {
-        val stub = StreamStubFetcher(listOf(hlsPlaylist("seg1.ts")))
-        application { module(cfg(), stub) }
-        assertEquals(HttpStatusCode.BadRequest, client.get("/api/proxy").status)
-        assertEquals(
-            HttpStatusCode.BadRequest,
-            client.get("/api/proxy") { parameter("url", "file:///etc/passwd") }.status,
-        )
-        assertTrue(stub.requests.isEmpty())
-    }
-
-    @Test
     fun `health stays reachable when auth is on but proxy does not`() = testApplication {
-        val stub = StreamStubFetcher(listOf(hlsPlaylist("seg1.ts")))
-        application { module(cfg(authEnabled = true, token = "t0ken"), stub) }
+        val h = Harness(listOf(hlsPlaylist("seg1.ts")), authEnabled = true, token = "t0ken")
+        application { module(h.cfg, h.stub, h.sessions) }
 
         // 容器 HEALTHCHECK 与前端都要能免鉴权读到 /api/health
         assertEquals(HttpStatusCode.OK, client.get("/api/health").status)
@@ -283,7 +348,7 @@ class ProxyRouteTest {
         }
         assertEquals(HttpStatusCode.OK, viaBearer.status)
 
-        // 只配了 token 的部署：浏览器弹窗用户名任填、密码填 token 也要能通过
+        // 只配 token 的部署：浏览器弹窗用户名任填、密码填 token 也要能通过
         val viaBasic = client.get("/api/proxy") {
             parameter("url", "https://cdn.example.com/a.m3u8")
             header(

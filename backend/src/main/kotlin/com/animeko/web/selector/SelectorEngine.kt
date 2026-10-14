@@ -49,12 +49,16 @@ data class EpisodesResult(
     val groups: List<ChannelGroupHit>,
 )
 
-@Serializable
-data class ResolvedVideo(
+/**
+ * 播放页解析结果，仅服务端内部使用。
+ * referer/userAgent/cookie 交给 ProxySessionStore 换成会话号，
+ * 因此这个类型不再出现在任何 API 响应里，也不再标注 @Serializable。
+ */
+data class ResolvedTarget(
     val url: String,
     val referer: String,
     val userAgent: String,
-    val cookies: String,
+    val cookie: String,
 )
 
 class SelectorException(message: String) : Exception(message)
@@ -111,7 +115,7 @@ class SelectorEngine(
 
     // ---- Phase 5: 从播放页提取视频地址 ----
 
-    suspend fun resolveVideo(cfg: SelectorSearchConfig, playUrl: String): ResolvedVideo {
+    suspend fun resolveVideo(cfg: SelectorSearchConfig, playUrl: String): ResolvedTarget {
         require(playUrl.startsWith("http")) { "playUrl 必须是绝对地址" }
         val target = UrlGuard.requireNotLiteralInternal(playUrl, allowPrivateTargets)
         val mv = cfg.matchVideo
@@ -132,7 +136,7 @@ class SelectorEngine(
 
         val html = fetchPage(target, headers, "播放页")
         findVideoUrl(html, target, videoRegex)?.let {
-            return ResolvedVideo(it, referer, ua, cookies)
+            return ResolvedTarget(it, referer, ua, cookies)
         }
         if (mv.enableNestedUrl && nestedRegex != null) {
             // 嵌套候选：DOM 中的 iframe/a/video/source 绝对地址 + 原文中的绝对 URL
@@ -159,7 +163,7 @@ class SelectorEngine(
                     )
                 }.getOrNull() ?: continue
                 findVideoUrl(sub, n, videoRegex)?.let {
-                    return ResolvedVideo(it, referer, ua, cookies)
+                    return ResolvedTarget(it, referer, ua, cookies)
                 }
             }
         }
