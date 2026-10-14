@@ -1,0 +1,187 @@
+package com.animeko.web.selector
+
+import com.animeko.web.http.Fetcher
+import com.animeko.web.http.HttpResult
+import com.animeko.web.http.StreamResult
+import kotlinx.coroutines.test.runTest
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
+
+/** 按 URL 前缀返回 fixture 的打桩 Fetcher */
+class StubFetcher(private val routes: Map<String, String>) : Fetcher {
+    val requested = mutableListOf<String>()
+
+    override suspend fun fetch(
+        url: String,
+        headers: Map<String, String>,
+        followRedirects: Boolean,
+    ): HttpResult {
+        requested.add(url)
+        val body = routes[url]
+            ?: routes.entries.firstOrNull { (prefix, _) -> url.startsWith(prefix) }?.value
+            ?: throw IllegalStateException("no fixture for $url")
+        return HttpResult(200, mapOf("content-type" to listOf("text/html")), body.toByteArray())
+    }
+
+    override suspend fun post(
+        url: String,
+        body: String,
+        headers: Map<String, String>,
+        contentType: String,
+    ): HttpResult = throw UnsupportedOperationException()
+
+    override suspend fun fetchStream(
+        url: String,
+        headers: Map<String, String>,
+        followRedirects: Boolean,
+    ): StreamResult = throw UnsupportedOperationException()
+}
+
+private fun fixture(name: String): String =
+    checkNotNull(SelectorEngineTest::class.java.getResourceAsStream("/fixtures/$name")) {
+        "fixture $name not found"
+    }.bufferedReader().use { it.readText() }
+
+class SelectorEngineTest {
+
+    private val base = "https://example-site.test"
+
+    private fun config(
+        subjectFormatId: String = SubjectFormatA.ID,
+        channelFormatId: String = ChannelFormatNoChannel.ID,
+    ) = SelectorSearchConfig(
+        searchUrl = "$base/search?keyword={keyword}",
+        rawBaseUrl = base,
+        requestInterval = 0,
+        subjectFormatId = subjectFormatId,
+        channelFormatId = channelFormatId,
+    )
+
+    @Test
+    fun `search with subject format A`() = runTest {
+        val fetcher = StubFetcher(mapOf("$base/search" to fixture("search_page.html")))
+        val hits = SelectorEngine(fetcher).search(config(), "示例")
+        assertEquals(3, hits.size)
+        // preferShorterName 默认开启，按名称长度升序：另一个番剧(5) < 示例番剧 第一季 < 较长的番剧名称测试
+        assertEquals("另一个番剧", hits.first().name)
+        assertEquals("$base/anime/5678.html", hits.first().url)
+        assertTrue(hits.map { it.name }.contains("示例番剧 第一季"))
+        assertTrue(hits.first().name.length <= hits.last().name.length)
+    }
+
+    @Test
+    fun `search with indexed format`() = runTest {
+        val fetcher = StubFetcher(mapOf("$base/search" to fixture("search_indexed.html")))
+        val hits = SelectorEngine(fetcher).search(config(subjectFormatId = SubjectFormatIndexed.ID), "番剧")
+        assertEquals(
+            listOf("番剧A" to "$base/a/1.html", "番剧B" to "$base/a/2.html"),
+            hits.map { it.name to it.url },
+        )
+    }
+
+    @Test
+    fun `search with json-path indexed format`() = runTest {
+        val fetcher = StubFetcher(mapOf("$base/search" to fixture("search.json")))
+        val hits = SelectorEngine(fetcher).search(config(subjectFormatId = SubjectFormatJsonPathIndexed.ID), "JSON")
+        assertEquals(
+            listOf("JSON番剧一" to "$base/j/1.html", "JSON番剧二" to "$base/j/2.html"),
+            hits.map { it.name to it.url },
+        )
+    }
+
+    @Test
+    fun `episodes with no-channel format`() = runTest {
+        val fetcher = StubFetcher(mapOf("$base/anime/1.html" to fixture("detail_nochannel.html")))
+        val cfg = config().copy(
+            selectorChannelFormatNoChannel = ChannelFormatNoChannel.Config(selectEpisodes = "#glist-1 a"),
+        )
+        val result = SelectorEngine(fetcher).episodes(cfg, "$base/anime/1.html")
+        assertEquals(3, result.episodes.size)
+        assertTrue(result.channels.isEmpty())
+        val first = result.episodes.first()
+        assertEquals("第1话 起始之日", first.name)
+        assertEquals("1", first.sort)
+        assertEquals(1, first.sortNum)
+        assertEquals("$base/play/9-1.html", first.playUrl)
+        assertNull(first.channel)
+    }
+
+    @Test
+    fun `episodes with index-grouped format`() = runTest {
+        val fetcher = StubFetcher(mapOf("$base/anime/1.html" to fixture("detail_grouped.html")))
+        val result = SelectorEngine(fetcher).episodes(
+            config(channelFormatId = ChannelFormatIndexGrouped.ID),
+            "$base/anime/1.html",
+        )
+        assertEquals(listOf("线路一", "备用线路"), result.channels)
+        assertEquals(4, result.episodes.size)
+        assertEquals(2, result.groups.size)
+        assertEquals("线路一", result.groups[0].name)
+        assertEquals(2, result.groups[0].episodes.size)
+        // 集号从「第N话」提取
+        assertEquals(1, result.episodes[0].sortNum)
+        assertEquals(2, result.episodes[1].sortNum)
+        assertEquals("$base/play/2-2.html", result.episodes[3].playUrl)
+    }
+
+    @Test
+    fun `resolve video url from play page`() = runTest {
+        val fetcher = StubFetcher(mapOf("$base/play/1-1.html" to fixture("play_page.html")))
+        val video = SelectorEngine(fetcher).resolveVideo(config(), "$base/play/1-1.html")
+        assertEquals("https://cdn.example.com/video/12345/index.m3u8?token=abcdef", video.url)
+        assertEquals(base, video.referer)
+        // 播放页 UA 默认来自 userAgent
+        assertTrue(video.userAgent.contains("Mozilla"))
+    }
+
+    @Test
+    fun `resolve video follows nested iframe`() = runTest {
+        val outer = """
+            <html><body><iframe src="/player/frame.php?id=9"></iframe></body></html>
+        """.trimIndent()
+        val inner = """
+            <html><body><script>var u="https://cdn.example.net/hls/movie.m3u8?sig=1";</script></body></html>
+        """.trimIndent()
+        val fetcher = StubFetcher(
+            mapOf(
+                "$base/play/outer.html" to outer,
+                "$base/player/frame.php?id=9" to inner,
+            ),
+        )
+        // 外层页面没有直接视频地址；matchNestedUrl 自定义为匹配 frame.php
+        val cfg = config().copy(
+            matchVideo = MatchVideoConfig(
+                enableNestedUrl = true,
+                matchNestedUrl = """frame\.php""",
+            ),
+        )
+        val video = SelectorEngine(fetcher).resolveVideo(cfg, "$base/play/outer.html")
+        assertEquals("https://cdn.example.net/hls/movie.m3u8?sig=1", video.url)
+        assertTrue(fetcher.requested.contains("$base/player/frame.php?id=9"))
+    }
+
+    @Test
+    fun `resolve video throws when not found`() = runTest {
+        val fetcher = StubFetcher(mapOf("$base/play/x.html" to "<html><body>no video</body></html>"))
+        assertFailsWith<SelectorException> {
+            SelectorEngine(fetcher).resolveVideo(config(), "$base/play/x.html")
+        }
+    }
+
+    @Test
+    fun `keyword processing removes specials and keeps first word`() {
+        val auto = SelectorAutoMatchConfig(searchUseOnlyFirstWord = true, searchRemoveSpecial = true)
+        assertEquals("孤独摇滚", auto.processKeyword("孤独摇滚！ 第二季"))
+    }
+
+    @Test
+    fun `autoMatch legacy flat fields are folded`() {
+        val cfg = SelectorSearchConfig(searchUseOnlyFirstWord = false, searchRemoveSpecial = false)
+        val resolved = cfg.resolvedAutoMatch()
+        assertEquals(false, resolved.searchUseOnlyFirstWord)
+        assertEquals(false, resolved.searchRemoveSpecial)
+    }
+}

@@ -1,0 +1,22 @@
+services:
+  animeko-web:
+    build: .
+    image: animeko-web:latest
+    container_name: animeko-web
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # 数据源配置等持久化（删除容器不丢）
+      - ./data:/data
+    environment:
+      - TZ=Asia/Shanghai
+      - ANIMEKO_PORT=8080
+      # ---- 公网暴露时取消下面两行注释 ----
+      # - ANIMEKO_AUTH_ENABLED=true
+      # - ANIMEKO_AUTH_TOKEN=请改成足够长的随机字符串
+      # ---- 弹幕（在 https://dev.dandanplay.com 申请）----
+      # - ANIMEKO_DANMAKU_APP_ID=
+      # - ANIMEKO_DANMAKU_APP_SECRET=
+      # ---- Bangumi API（默认官方+社区镜像故障转移，可自定义）----
+      # - ANIMEKO_BANGUMI_BASE_URLS=https://api.bgm.tv,https://bgmapi.anibt.net

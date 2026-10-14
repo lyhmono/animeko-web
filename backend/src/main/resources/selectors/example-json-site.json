@@ -1,0 +1,33 @@
+{
+  "factoryId": "web-selector",
+  "version": 2,
+  "arguments": {
+    "name": "示例站点-JSON",
+    "description": "示例数据源：演示 JsonPath 条目格式 + 无线路剧集列表（请替换为真实站点后使用）",
+    "iconUrl": "",
+    "searchConfig": {
+      "searchUrl": "https://example-json-site.test/api/search?keyword={keyword}",
+      "rawBaseUrl": "https://example-json-site.test",
+      "requestInterval": 1000,
+      "subjectFormatId": "json-path-indexed",
+      "selectorSubjectFormatJsonPathIndexed": {
+        "selectNames": "$[*]['title','name']",
+        "selectLinks": "$[*]['url', 'link']",
+        "linkTemplate": null
+      },
+      "channelFormatId": "no-channel",
+      "selectorChannelFormatNoChannel": {
+        "selectEpisodes": "#glist-1 a",
+        "selectEpisodeLinks": "",
+        "matchEpisodeSortFromName": "第\\s*(?<ep>.+)\\s*[话集]"
+      },
+      "matchVideo": {
+        "enableNestedUrl": true,
+        "matchVideoUrl": "(^http(s)?:\\/\\/(?!.*http(s)?:\\/\\/).+((\\.mp4)|(\\.mkv)|(m3u8)).*(\\?.+)?)|(akamaized)|(bilivideo.com)"
+      },
+      "autoMatch": {
+        "enabled": true
+      }
+    }
+  }
+}

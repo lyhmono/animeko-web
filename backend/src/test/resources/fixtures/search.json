@@ -1,0 +1,7 @@
+{
+  "code": 0,
+  "data": [
+    { "title": "JSON番剧一", "url": "/j/1.html" },
+    { "title": "JSON番剧二", "link": "/j/2.html" }
+  ]
+}

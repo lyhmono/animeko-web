@@ -1,0 +1,41 @@
+{
+  "factoryId": "web-selector",
+  "version": 2,
+  "arguments": {
+    "name": "示例站点-CSS",
+    "description": "示例数据源：演示 CSS 选择器 + 线路分组配置（请替换为真实站点后使用）",
+    "iconUrl": "",
+    "searchConfig": {
+      "searchUrl": "https://example-site.test/search?keyword={keyword}",
+      "rawBaseUrl": "https://example-site.test",
+      "requestInterval": 1000,
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
+      "subjectFormatId": "a",
+      "selectorSubjectFormatA": {
+        "selectLists": "div.video-info-header > a",
+        "linkTemplate": null
+      },
+      "channelFormatId": "index-grouped",
+      "selectorChannelFormatFlattened": {
+        "selectChannelNames": ".anthology-tab > .swiper-wrapper a",
+        "matchChannelName": "^(?<ch>.+?)(\\d+)?$",
+        "selectEpisodeLists": ".anthology-list-box",
+        "selectEpisodesFromList": "a",
+        "selectEpisodeLinksFromList": "",
+        "matchEpisodeSortFromName": "第\\s*(?<ep>.+)\\s*[话集]"
+      },
+      "matchVideo": {
+        "enableNestedUrl": true,
+        "matchVideoUrl": "(^http(s)?:\\/\\/(?!.*http(s)?:\\/\\/).+((\\.mp4)|(\\.mkv)|(m3u8)).*(\\?.+)?)|(akamaized)|(bilivideo.com)"
+      },
+      "autoMatch": {
+        "enabled": true,
+        "searchUseOnlyFirstWord": true,
+        "searchRemoveSpecial": true,
+        "searchUseSubjectNamesCount": 1,
+        "preferShorterName": true,
+        "filterByEpisodeSort": true
+      }
+    }
+  }
+}

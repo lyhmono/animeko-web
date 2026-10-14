@@ -1,0 +1,19 @@
+# 构建产物
+backend/build/
+backend/.gradle/
+backend/out/
+frontend/dist/
+frontend/node_modules/
+
+# 运行时数据（挂载卷）
+data/
+
+#  IDE / 系统
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# Gradle / Node
+backend/gradle/wrapper/gradle-wrapper.jar
+npm-debug.log*
