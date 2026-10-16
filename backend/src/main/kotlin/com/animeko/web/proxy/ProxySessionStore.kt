@@ -1,6 +1,6 @@
 package com.animeko.web.proxy
 
-import java.net.URI
+import com.animeko.web.http.UrlGuard
 import java.security.SecureRandom
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
@@ -73,8 +73,12 @@ class ProxySessionStore(
             return Grant(Kind.EXPIRED, emptyMap())
         }
         val host = hostOf(targetUrl)
-        // 解析不出主机时不放开：宁可不带凭据，也不把 Cookie 送给一个认不出的目标
-        if (host != null && host !in entry.allowedHosts) return Grant(Kind.HOST_NOT_ALLOWED, emptyMap())
+        // 主机名认不出来 = 无法判断它是不是当初授权的那台，必须**拒绝带凭据**：
+        // 之前写的是 `host != null && host !in allowedHosts`，等于 URI 解析失败时
+        // 直接放行并把源站 Cookie 发出去 —— 和下面这行注释正好相反。
+        // sid 是能力令牌，必须绑定目标主机：否则拿到一个 sid 就能用受害者的
+        // Cookie 去请求攻击者指定的任意地址。
+        if (host == null || host !in entry.allowedHosts) return Grant(Kind.HOST_NOT_ALLOWED, emptyMap())
         // maxOf 保证续期只会往后推：线程在两次 now() 之间被挂起时，
         // 直接赋值会把过期点提前，把正在播放的会话踢掉
         entry.expiresAt = maxOf(entry.expiresAt, now() + ttlMs)
@@ -100,8 +104,10 @@ class ProxySessionStore(
         return bytes.joinToString("") { "%02x".format(it) }
     }
 
-    private fun hostOf(url: String): String? =
-        runCatching { URI(url).host?.lowercase()?.trim('[', ']') }.getOrNull()
+    // 和 UrlGuard 共用同一套主机名提取：两边算法不一致时，会出现
+    // 「守卫按 A 主机放行、会话按 B 主机绑定」的错位；下划线主机名还会让
+    // URI.host 直接返回 null。
+    private fun hostOf(url: String): String? = UrlGuard.hostOf(url)
 
     private fun purgeIfNeeded() {
         if (sessions.size < maxEntries) return

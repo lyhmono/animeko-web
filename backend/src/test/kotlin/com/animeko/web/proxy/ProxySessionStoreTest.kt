@@ -60,6 +60,31 @@ class ProxySessionStoreTest {
     }
 
     @Test
+    fun `a host URI cannot parse still gets bound instead of releasing credentials`() {
+        // 回归：grant() 写的是 `host != null && host !in allowedHosts`，
+        // 于是 URI.host 解析不出主机名的地址（带下划线的主机名，DNS 里真实存在）
+        // 会跳过绑定检查、直接把源站 Cookie 交出去 —— 与它上面那行注释正好相反。
+        val s = store()
+        val sid = s.put("https://v_1.example/index.m3u8", "UA/1.0", "https://v_1.example/watch", "")
+        assertEquals(
+            ProxySessionStore.Kind.GRANTED,
+            s.grant(sid, "https://v_1.example/seg.ts").kind,
+            "同一个带下划线的主机应当正常放行",
+        )
+        val evil = s.grant(sid, "https://evil.example/log?x=1")
+        assertEquals(ProxySessionStore.Kind.HOST_NOT_ALLOWED, evil.kind, "主机绑定不能因为解析不出名字就形同虚设")
+        assertTrue(evil.headers.isEmpty(), "被拒时不该交出任何凭据")
+    }
+
+    @Test
+    fun `an address with no extractable authority is refused`() {
+        val s = store()
+        val sid = mint(s)
+        assertEquals(ProxySessionStore.Kind.HOST_NOT_ALLOWED, s.grant(sid, "https:///x.ts").kind)
+        assertEquals(ProxySessionStore.Kind.HOST_NOT_ALLOWED, s.grant(sid, "not-a-url").kind)
+    }
+
+    @Test
     fun `playlist hosts registered by the server become usable`() {
         // 真实源站常见清单在一个域、分片在另一个 CDN 域：绑定不能把播放弄坏
         val s = store()

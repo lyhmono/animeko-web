@@ -83,4 +83,24 @@ class HlsRewriterTest {
         val encoded = result.lines().last().substringAfter("url=").substringBefore("&")
         assertEquals(signed, URLDecoder.decode(encoded, "UTF-8"))
     }
+
+    @Test
+    fun `a leading BOM does not turn the playlist header into a segment`() {
+        // U+FEFF 不是 isWhitespace，trim() 带不走它。曾经 "＃EXTM3U"（带 BOM）被当成
+        // 一行分片地址改写进代理，清单就此丢掉 #EXTM3U 头 → 播放器判定不是 m3u8
+        val body = "﻿#EXTM3U\n#EXTINF:10,\nseg1.ts\n"
+        val result = HlsRewriter.rewrite(body, "https://cdn.example.com/hls/index.m3u8")
+        assertTrue(result.startsWith("#EXTM3U"), "清单头必须还在，实际：${result.take(40)}")
+        assertTrue(result.contains("/api/proxy?url=https%3A%2F%2Fcdn.example.com%2Fhls%2Fseg1.ts"), result)
+    }
+
+    @Test
+    fun `a malformed segment uri is passed through instead of becoming a broken proxy url`() {
+        // `%` 后面不是两位十六进制 → URI 解析失败，absUrl 只能退回相对路径。
+        // 以前会把这条相对路径直接塞进代理地址，于是 /api/proxy?url=seg%zz.ts 每个分片 400
+        val body = "#EXTM3U\n#EXTINF:10,\nseg%zz.ts\n"
+        val result = HlsRewriter.rewrite(body, "https://cdn.example.com/hls/index.m3u8")
+        assertTrue(result.contains("seg%zz.ts"), result)
+        assertFalse(result.contains("/api/proxy?url=seg"), "畸形地址不该被改写成必然 400 的代理地址：$result")
+    }
 }

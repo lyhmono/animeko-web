@@ -161,6 +161,31 @@ class ProxyRouteTest {
     }
 
     @Test
+    fun `an upstream refusal on a playlist is not served as a valid 200 playlist`() = testApplication {
+        // 回归：HLS 分支以前无论上游回什么都走 respondText(...)，而它默认 200。
+        // 源站一个 403 防盗链页会被包装成「一份合法的 m3u8」发给播放器：
+        // hls.js 不会报错、也不会切下一条线路或下一个源，用户只看到黑屏。
+        val h = Harness(
+            listOf(
+                StreamStubFetcher.Spec(
+                    status = 403,
+                    contentType = "text/html",
+                    body = "<html>Access Denied</html>",
+                ),
+            ),
+        )
+        application { module(h.cfg, h.stub, h.sessions) }
+        val resp = client.get("/api/proxy") {
+            parameter("url", "https://cdn.example.com/hls/index.m3u8")
+            parameter("sid", h.sid)
+        }
+        assertEquals(HttpStatusCode.Forbidden, resp.status, "上游的拒绝必须原样传给播放器")
+        assertTrue(resp.bodyAsText().contains("Access Denied"))
+        val ct = resp.contentType()?.toString().orEmpty()
+        assertFalse(ct.contains("mpegurl", ignoreCase = true), "错误页不能被标成 m3u8：$ct")
+    }
+
+    @Test
     fun `unknown session is reported as gone rather than a silent unauthenticated fetch`() = testApplication {
         val h = Harness(listOf(hlsPlaylist("seg1.ts")))
         application { module(h.cfg, h.stub, h.sessions) }

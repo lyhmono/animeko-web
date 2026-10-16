@@ -767,12 +767,25 @@ private suspend fun proxyVideo(
         contentType?.contains("mpegurl", ignoreCase = true) == true
 
     if (isHls) {
+        val upstreamOk = result.status == 200 || result.status == 206
         val text = readCapped(result.body, MAX_PLAYLIST_BYTES)
-        val rewritten = HlsRewriter.rewrite(text, url, sid = sid)
-        // 分片与密钥常在另一个主机（清单域 vs CDN 域）：由服务端从清单内容里登记，
-        // 客户端无法自行扩大允许范围
-        sessions.allowPlaylistHosts(sid, rewritten)
-        call.respondText(rewritten, ContentType.parse("application/vnd.apple.mpegurl"))
+        // 只有 2xx 才改写。以前无论上游回什么都 respondText(...)，而它默认 200：
+        // 源站一个 403 防盗链页会被包装成「一份合法的 m3u8 清单」发回播放器，
+        // hls.js 既不会报错也不会切下一条线路/下一个源，用户只看到「加载中」然后黑屏。
+        val body = if (upstreamOk) HlsRewriter.rewrite(text, url, sid = sid) else text
+        if (upstreamOk) {
+            // 分片与密钥常在另一个主机（清单域 vs CDN 域）：由服务端从清单内容里登记，
+            // 客户端无法自行扩大允许范围
+            sessions.allowPlaylistHosts(sid, body)
+        }
+        val outType = if (upstreamOk) {
+            ContentType.parse("application/vnd.apple.mpegurl")
+        } else {
+            // 拒绝/出错时沿用上游的类型：把 403 的 HTML 错误页标成 m3u8，
+            // 播放器就会把它当清单去解析，而不是当失败去换一条线路
+            contentType?.let { runCatching { ContentType.parse(it) }.getOrNull() } ?: ContentType.Text.Plain
+        }
+        call.respondText(body, outType, if (upstreamOk) HttpStatusCode.OK else HttpStatusCode.fromValue(result.status))
         return
     }
 

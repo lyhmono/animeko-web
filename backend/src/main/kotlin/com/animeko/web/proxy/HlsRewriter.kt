@@ -24,7 +24,10 @@ object HlsRewriter {
         proxyPath: String = "/api/proxy",
         sid: String = "",
     ): String {
-        return body.lines().joinToString("\n") { line ->
+        // 去掉开头的 BOM：U+FEFF 不是 isWhitespace，trim() 不会把它带走，
+        // 于是 "\uFEFF#EXTM3U" 会被当成一行**分片地址**改写进代理，
+        // 清单丢掉 #EXTM3U 头 → 播放器直接判定不是 m3u8（部分 Windows/国内打包站会带 BOM）
+        return body.removePrefix("\uFEFF").lines().joinToString("\n") { line ->
             val t = line.trim()
             when {
                 t.isEmpty() -> line
@@ -35,7 +38,12 @@ object HlsRewriter {
                     } else {
                         SelectorEngine.absUrl(playlistUrl, t)
                     }
-                    proxyUrl(proxyPath, abs, sid)
+                    // 解析不出绝对地址时原样留着这一行。absUrl 失败会返回相对路径本身
+                    // （`%` 后面不是两位十六进制一类畸形 URI，国内 CDN 真会吐出来），
+                    // 那种情况改写成 /api/proxy?url=seg.ts 会让代理直接 400 ——
+                    // 每个分片都失败，还把原因藏进了一个看不懂的代理地址里。
+                    // 原样透传至少让播放器自己去按清单地址解析一次。
+                    if (abs.startsWith("http")) proxyUrl(proxyPath, abs, sid) else t
                 }
             }
         }

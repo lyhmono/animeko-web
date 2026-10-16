@@ -3,10 +3,13 @@ package com.animeko.web.data
 import com.animeko.web.appLog
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
 
 /**
@@ -33,26 +36,52 @@ class UserDataStore(
     /** If-Match 与当前内容不一致：客户端必须重读再合并，不能直接覆盖。 */
     class Stale : Exception("DATA_STALE")
 
-    /** 文件不存在或内容坏掉时返回空文档，让前端从干净状态继续，而不是 500。 */
-    fun read(): Snapshot {
+    /**
+     * 一次读取。必须和写入共用同一把锁：坏文件在这里会被移走（*.bad），
+     * 而并发的 write() 正在往同一个路径上 rename ——
+     * 不加锁时读侧能把写侧刚提交好的文件当坏文件搬走，盘上直接没有文档了。
+     */
+    fun read(): Snapshot = synchronized(this) { readLocked() }
+
+    private fun readLocked(): Snapshot {
         val bytes = try {
-            if (!Files.isRegularFile(file)) return empty()
-            Files.readAllBytes(file)
+            if (!Files.isRegularFile(file)) null else Files.readAllBytes(file)
         } catch (e: Exception) {
             appLog.warn("读取个人数据失败: {}", e.message)
-            return empty()
+            null
         }
-        if (bytes.size == 0) return empty()
-        return try {
-            val parsed = json.parseToJsonElement(String(bytes, Charsets.UTF_8))
-            if (parsed is JsonObject) Snapshot(String(bytes, Charsets.UTF_8), sha256Hex(bytes))
-            else empty()
-        } catch (e: Exception) {
+        if (bytes != null && bytes.isNotEmpty()) {
+            val text = String(bytes, Charsets.UTF_8)
+            val parsed = runCatching { json.parseToJsonElement(text) }.getOrNull()
+            if (parsed is JsonObject) return Snapshot(text, sha256Hex(bytes))
             // 坏文件不能连带把整个页面打挂，也不能被下一次写入静默覆盖前先备份
-            appLog.error("个人数据文件不是合法 JSON，已备份为 *.bad：{}", e.message)
+            appLog.error("个人数据文件不是合法 JSON，已备份为 *.bad")
             runCatching { Files.move(file, sib("bad"), StandardCopyOption.REPLACE_EXISTING) }
-            empty()
         }
+        // 主文件缺失、为空或已损坏：先试上一份备份。
+        // 这一步不是锦上添花 —— .bak 一直在写却没人读，等于「备了份没人看的档案」：
+        // 掉电/中断让主文件只剩半个，读侧就返回 {}，前端把它当空文档，
+        // 用户下一次点收藏就把整份数据覆盖掉，而完好的一份就在同一个目录里。
+        restoreFromBackup()?.let { return it }
+        return EMPTY
+    }
+
+    /** 备份存在且能解析成 JSON 对象时恢复它，否则 null。 */
+    private fun restoreFromBackup(): Snapshot? {
+        val bak = sib("bak")
+        val bytes = runCatching { if (Files.isRegularFile(bak)) Files.readAllBytes(bak) else null }.getOrNull()
+        if (bytes == null || bytes.isEmpty()) return null
+        val text = String(bytes, Charsets.UTF_8)
+        val parsed = runCatching { json.parseToJsonElement(text) }.getOrNull()
+        if (parsed !is JsonObject) {
+            appLog.error("个人数据备份 *.bak 也不是合法 JSON，无法恢复")
+            return null
+        }
+        // 恢复回主文件用复制而不是移动：留着 .bak，恢复动作本身再被打断也还能再来一次
+        runCatching { Files.copy(bak, file, StandardCopyOption.REPLACE_EXISTING) }
+            .onFailure { appLog.warn("恢复 *.bak 到主文档失败，本次仍按空文档处理：{}", it.message) }
+        appLog.warn("个人数据主文档不可用，已从 *.bak 恢复（{} 字节）", bytes.size)
+        return Snapshot(text, sha256Hex(bytes))
     }
 
     /**
@@ -78,10 +107,20 @@ class UserDataStore(
             if (ifMatch != null && ifMatch != current) throw Stale()
             Files.createDirectories(file.parent)
             val tmp = sib("tmp")
-            Files.newOutputStream(tmp).use { it.write(bytes) }
+            // 先写临时文件、fsync、再 rename：写入中途被 kill 或被断电都不会留下半个文件。
+            // 少了 fsync，rename 只保证元数据进了目录项，掉电后文件可能存在但内容是旧的/全零。
+            FileChannel.open(
+                tmp,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING,
+            ).use { ch ->
+                ch.write(ByteBuffer.wrap(bytes))
+                ch.force(true)
+            }
             // 备份必须是「复制」而不是「挪走」：原来是先 move 走旧文件再 rename 新的，
-            // 两次操作之间进程被 kill，userdata.json 就不存在了（只剩 .bak），
-            // 而读的一侧不看 .bak —— 等于一次崩溃抹掉全部收藏。
+            // 两次操作之间进程被 kill，userdata.json 就不存在了（只剩 .bak）。
+            // 现在读的一侧会认这份 .bak（见 restoreFromBackup），两头合起来才真的不丢数据。
             if (Files.isRegularFile(file)) {
                 runCatching { Files.copy(file, sib("bak"), StandardCopyOption.REPLACE_EXISTING) }
             }
@@ -100,8 +139,6 @@ class UserDataStore(
         val bytes = if (Files.isRegularFile(file)) runCatching { Files.readAllBytes(file) }.getOrNull() else null
         return if (bytes == null || bytes.isEmpty()) EMPTY.etag else sha256Hex(bytes)
     }
-
-    private fun empty(): Snapshot = EMPTY
 
     private fun sib(suffix: String) = file.resolveSibling("${file.fileName}.$suffix")
 

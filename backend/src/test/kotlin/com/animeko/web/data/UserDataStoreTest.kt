@@ -117,4 +117,63 @@ class UserDataStoreTest {
         // 并发写最怕留下交错内容：读回来必须仍然是一个合法文档
         assertTrue(doc(s.read().text).containsKey("writer"))
     }
+
+    @Test
+    fun `a corrupt main file recovers from the backup instead of reporting empty`() {
+        // 回归：.bak 一直在写，却从来没有一侧去读它。
+        // 掉电/中断把主文件只剩半个时，读侧返回 {} → 前端认为「文档是空的」→
+        // 用户下一次点收藏就把整份数据覆盖掉，而完好的一份就在同一个目录里。
+        val (s, file) = store()
+        s.write("""{"favorites":[{"id":1},{"id":2}]}""", null)
+        s.write("""{"favorites":[{"id":3}]}""", s.read().etag)
+        // 模拟第二次写入中途被打断：主文件成了半截 JSON，.bak 里是上一份完整数据
+        Files.writeString(file, """{"favorites":[{"id":3}""")
+
+        val restored = s.read()
+        assertTrue(restored.text.contains("\"id\":1"), "必须从 .bak 恢复，实际读到：${restored.text}")
+        assertEquals("""{"favorites":[{"id":1},{"id":2}]}""", Files.readString(file), "恢复要写回主文件，不能只在内存里给")
+        assertTrue(Files.exists(file.resolveSibling("${file.fileName}.bad")), "坏掉的那份要留证据")
+
+        // 恢复出来的 etag 必须对应真实内容，否则客户端的条件写会永远 409
+        assertEquals(restored.etag, s.read().etag)
+        s.write("""{"favorites":[{"id":1},{"id":2},{"id":9}]}""", restored.etag)
+        assertTrue(s.read().text.contains("\"id\":9"))
+    }
+
+    @Test
+    fun `a missing main file also recovers from the backup`() {
+        val (s, file) = store()
+        s.write("""{"v":1}""", null)
+        s.write("""{"v":2}""", s.read().etag)
+        Files.delete(file)
+        assertEquals("""{"v":1}""", s.read().text, "主文件没了也不该把备份当不存在")
+    }
+
+    @Test
+    fun `a corrupt backup degrades to empty rather than restoring garbage`() {
+        val (s, file) = store()
+        s.write("""{"v":1}""", null)
+        Files.writeString(file, "{半截")
+        Files.writeString(file.resolveSibling("${file.fileName}.bak"), "{也半截")
+        assertEquals("{}", s.read().text)
+    }
+
+    @Test
+    fun `reading while writing never quarantines the freshly committed file`() {
+        // 回归：read() 不在写锁里，而它遇到坏文件会把主文件 move 成 .bad。
+        // 与并发 write() 的非原子回退路径交错时，读侧能把写侧刚提交好的文件搬走，
+        // 盘上就此没有文档了，而 write() 还回了 200。
+        val (s, file) = store()
+        s.write("""{"seed":true}""", null)
+        var lost = 0
+        repeat(200) {
+            val writer = Thread { s.write("""{"tick":$it}""", null) }
+            val reader = Thread { runCatching { s.read() } }
+            writer.start(); reader.start()
+            writer.join(); reader.join()
+            if (!Files.isRegularFile(file)) lost++
+        }
+        assertEquals(0, lost, "有 $lost 次读操作把主文档弄没了")
+        assertTrue(s.read().text.contains("tick"))
+    }
 }

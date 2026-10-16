@@ -61,6 +61,16 @@ object UrlGuard {
      * `URI.getHost()` 对含下划线等非法字符的主机名返回 null（RFC 2396 的字符集比现实里的
      * 内网 NAS/CDN 域名严格），这里退回到手工拆 authority，避免把合法地址判成「缺少主机名」。
      */
+    /**
+     * 取主机名（小写、去 IPv6 方括号）。
+     *
+     * 公开给会话绑定用：主机名必须只有**一种**算法，否则会出现「守卫认为放行的是
+     * A 主机、会话认为它是 B 主机」的错位。`URI.host` 对带下划线这类非法但 DNS
+     * 里真实存在的主机名返回 null，所以下面还要退回 rawAuthority 自己切。
+     */
+    fun hostOf(url: String): String? =
+        runCatching { hostOf(URI(url)) }.getOrNull()
+
     private fun hostOf(uri: URI): String? {
         uri.host?.let { return it.ifBlank { null }?.let { h -> h.trim('[', ']').lowercase() } }
         val authority = uri.rawAuthority?.substringAfterLast('@') ?: return null
