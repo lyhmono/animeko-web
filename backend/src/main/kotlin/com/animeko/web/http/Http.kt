@@ -2,7 +2,6 @@ package com.animeko.web.http
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.io.FilterInputStream
 import java.io.InputStream
 import java.net.URI
 import java.net.URLEncoder
@@ -43,35 +42,6 @@ data class StreamResult(
         headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value?.firstOrNull()
 
     val contentType: String? get() = header("content-type")
-}
-
-/**
- * 带绝对期限的输入流包装：视频代理转发 body 时，超过 deadline 仍未读完就抛
- * [java.io.IOException]，避免上游慢流/死流无限占用连接。
- *
- * 局限：已阻塞在一次 read() 内部的连接无法被中断（需 NIO 才能彻底解决），
- * 但可挡住「每次吐几字节的慢速拖流」这类最常见的资源占用形态 ——
- * JDK HttpClient 的 timeout 只覆盖到响应头，body 阶段没有任何保护。
- */
-class DeadlineInputStream(
-    private val delegate: InputStream,
-    private val deadlineNanos: Long,
-) : FilterInputStream(delegate) {
-    override fun read(): Int {
-        checkDeadline()
-        return super.read()
-    }
-
-    override fun read(b: ByteArray, off: Int, len: Int): Int {
-        checkDeadline()
-        return super.read(b, off, len)
-    }
-
-    private fun checkDeadline() {
-        if (System.nanoTime() > deadlineNanos) {
-            throw java.io.IOException("upstream stream exceeded deadline")
-        }
-    }
 }
 
 /** 出站 HTTP 抽象，便于测试时打桩。 */

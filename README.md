@@ -95,7 +95,7 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 | `ANIMEKO_TRUSTED_PROXY_HOPS` | `0` | 服务前面有几层**你控制**的反代。0=直连（X-Forwarded-* 一律不信）；填 N 后限速按 XFF 从右数第 N 个真实客户端记账、同源判定改看 `X-Forwarded-Host`。层数要如实填：少了把代理 IP 当客户端（限速全员共享），多了把客户端伪造的 XFF 当真值 |
 | `ANIMEKO_BANGUMI_BASE_URLS` | `https://api.bgm.tv,https://bgmapi.anibt.net` | Bangumi API 地址列表（逗号分隔，按顺序故障转移；官方域名在部分地区被墙，可改用社区镜像） |
 | `ANIMEKO_REQUEST_TIMEOUT_MS` | `20000` | 元数据/抓取类出站请求超时 |
-| `ANIMEKO_PROXY_TIMEOUT_MS` | `120000` | 视频代理（分片下载）超时 |
+| `ANIMEKO_PROXY_TIMEOUT_MS` | `120000` | 视频代理的连接与**响应头**超时（body 阶段刻意不设时限，见下方安全说明） |
 
 ### 接口一览
 
@@ -206,6 +206,15 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
   原因：Ktor 的路由按段匹配，`//api/data`、`/%61pi/data` 都会打到真接口，
   而 `request.local.uri` 与 `request.path()` 拿到的原串都不以 `/api/` 开头 ——
   用前缀判断时这两个写法能无凭据读走数据源列表、覆写个人数据（已修，并有回归用例）。
+- 视频代理的 **body 阶段不设超时**，这是权衡后的结论而不是遗漏。两种直观做法都验证过：
+  按总时长切断会砍掉健康的慢速长传输（实测一部 700KB 的慢流被 4 秒期限切断后，
+  声明了 `Content-Length` 的响应既不补字节也不关闭，客户端等满 90 秒仍在等 ——
+  播放器表现成卡死，比不切断更糟）；按空闲间隔切断同样不成立，因为这条链路是同步
+  `copyTo`，两次 read 之间耗的主要是**客户端背压**的等待时间，误伤的是边看边缓冲的正常观众，
+  而真正危险的「read 自己永久卡住」在阻塞读返回之前根本没有检查点。
+  要正确解决需换成非阻塞写出（或带超时的异步 read 包裹），那是另一套机制。
+  现在兜住它的是：连接与响应头超时、上游 EOF/断连时 `copyTo` 自然返回、Netty 的空闲连接处理。
+  回归用例见 `ProxyRouteTest` 的「a slow but live upstream is forwarded in full」。
 - 静态资源缓存：`/assets/*`（带内容哈希）为 `max-age=31536000, immutable`，
   `index.html` 为 `no-cache`；缺失的资源请求返回 **404** 而不是回退 `index.html`——
   否则重新部署后，浏览器会把 HTML 当 ES module 执行，且 `React.lazy` 会永久记住这次失败。

@@ -11,6 +11,7 @@ import io.ktor.client.request.header
 import io.ktor.client.request.parameter
 import io.ktor.client.request.setBody
 import io.ktor.client.request.post
+import io.ktor.client.statement.bodyAsBytes
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
@@ -42,6 +43,8 @@ private class StreamStubFetcher(
         val contentType: String = "application/vnd.apple.mpegurl",
         val body: String = "",
         val headers: Map<String, List<String>> = emptyMap(),
+        /** 需要自定义上游流时用这个（例如「给完 8 字节就不再给」的卡死上游） */
+        val stream: (() -> java.io.InputStream)? = null,
     )
 
     override suspend fun fetchStream(
@@ -56,7 +59,7 @@ private class StreamStubFetcher(
         val merged = LinkedHashMap<String, List<String>>()
         merged["content-type"] = listOf(spec.contentType)
         spec.headers.forEach { (k, v) -> merged[k] = v }
-        return StreamResult(spec.status, merged, spec.body.byteInputStream())
+        return StreamResult(spec.status, merged, spec.stream?.invoke() ?: spec.body.byteInputStream())
     }
 
     val fetchHeaders = mutableListOf<Pair<String, Map<String, String>>>()
@@ -110,6 +113,7 @@ class ProxyRouteTest {
         authEnabled: Boolean = false,
         token: String? = null,
         val html: Map<String, String> = emptyMap(),
+        proxyTimeoutMs: Long = 120_000,
     ) {
         val stub = StreamStubFetcher(specs, html)
         val sessions = ProxySessionStore()
@@ -123,6 +127,7 @@ class ProxyRouteTest {
             allowPrivateTargets = allowPrivate,
             authEnabled = authEnabled,
             authToken = token,
+            proxyTimeoutMs = proxyTimeoutMs,
         )
     }
 
@@ -482,5 +487,45 @@ class ProxyRouteTest {
         assertEquals(HttpStatusCode.NotFound, resp.status)
         assertNull(resp.headers["Content-Length"])
         assertEquals("gone", resp.bodyAsText())
+    }
+
+    @Test
+    fun `a slow but live upstream is forwarded in full`() = testApplication {
+        // 这条用例守的是「给 body 加绝对超时」那个改动的回归：
+        // 每段之间睡 40ms 的健康慢流，在 ANIMEKO_PROXY_TIMEOUT_MS 很短时被砍断，
+        // 而客户端拿到的是声明 1000 字节、实际只给了几十十字节且不结束的响应 ——
+        // 播放器表现成卡死。慢但活着就该转完，宁可没有超时也不要误伤正常播放。
+        val total = 120
+        var sent = 0
+        val h = Harness(
+            listOf(
+                StreamStubFetcher.Spec(
+                    status = 200,
+                    contentType = "video/mp4",
+                    headers = mapOf("content-length" to listOf(total.toString())),
+                    stream = {
+                        object : java.io.InputStream() {
+                            override fun read(b: ByteArray, off: Int, len: Int): Int {
+                                if (sent >= total) return -1
+                                Thread.sleep(4) // 模拟一段一段慢慢吐的上游
+                                val n = minOf(8, total - sent, len)
+                                java.util.Arrays.fill(b, off, off + n, 'x'.code.toByte())
+                                sent += n
+                                return n
+                            }
+
+                            override fun read(): Int = read(ByteArray(1), 0, 1)
+                        }
+                    },
+                ),
+            ),
+            // 比整段传输所需时间小得多：任何「按总时长切断」的实现都会在这里被抓住
+            proxyTimeoutMs = 1,
+        )
+        application { module(h.cfg, h.stub, h.sessions) }
+        // 用 .mp4 而不是 harness 里那个 .m3u8 常量：后缀会决定走不走清单重写分支
+        val resp = client.get("/api/proxy") { parameter("url", "https://cdn.example.com/movie.mp4") }
+        assertEquals(HttpStatusCode.OK, resp.status)
+        assertEquals(total, resp.bodyAsBytes().size, "慢但活着的流必须完整转完")
     }
 }

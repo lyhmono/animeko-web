@@ -6,7 +6,6 @@ import com.animeko.web.bangumi.BangumiClient
 import com.animeko.web.config.AppConfig
 import com.animeko.web.appLog
 import com.animeko.web.data.UserDataStore
-import com.animeko.web.http.DeadlineInputStream
 import com.animeko.web.http.Fetcher
 import com.animeko.web.http.StreamResult
 import com.animeko.web.http.UrlGuard
@@ -793,13 +792,20 @@ private suspend fun proxyVideo(
     } else {
         null
     }
-    // body 阶段的兜底超时：HttpClient 的 timeout 只到响应头，之后就是裸 copyTo，
-    // 上游一个每 30 秒吐 1 字节的连接能把会话挂住几分钟。
-    val deadlineNanos = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(cfg.proxyTimeoutMs)
+    // body 阶段刻意**不设**超时。试过，两种做法都不成立，理由写在这里免得被人再加回来：
+    //  1) 绝对期限（从响应头开始计时）会砍掉健康的慢速长传输。实测一部 700KB 的
+    //     「每秒给一段」的流被 4 秒期限砍断后，声明了 Content-Length 的响应既不补字节也不关闭，
+    //     客户端等满 90 秒仍在等 —— 播放器表现成卡死，比不设超时更糟。
+    //  2) 空闲期限也不成立：这条链路是同步 copyTo，两次 read 之间的耗时主要是
+    //     写出被客户端背压堵住的时间。按「距上次读到的间隔」判上游死活，误伤的是
+    //     边看边缓冲的正常观众；而真正危险的那种「read 自己永久卡住」，
+    //     在阻塞读返回之前根本没有任何检查点可以生效。
+    // 也就是说：在同步写出这条路径上，期限要么误伤正常播放，要么打不到真正的死流。
+    // 要正确解决得换成非阻塞写出（或对每个 read 做带超时的异步包裹），那是另一套机制。
+    // 现在靠三件已有的东西兜住：连接超时 + 响应头超时（JDK 层）、上游 EOF/断连时
+    // copyTo 自然返回、以及 Netty 对空闲连接的处理。
     call.respondOutputStream(ct, status, contentLength) {
-        result.body.use { input ->
-            DeadlineInputStream(input, deadlineNanos).copyTo(this)
-        }
+        result.body.use { input -> input.copyTo(this) }
     }
 }
 
