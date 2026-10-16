@@ -2,11 +2,12 @@ package com.animeko.web
 
 import com.animeko.web.api.configureApiRoutes
 import com.animeko.web.api.configureStaticFrontend
+import com.animeko.web.auth.LoginRateLimiter
+import com.animeko.web.auth.SessionStore
 import com.animeko.web.bangumi.BangumiClient
 import com.animeko.web.bangumi.SubjectNotFoundException
 import com.animeko.web.config.AppConfig
-import com.animeko.web.danmaku.DandanplayClient
-import com.animeko.web.danmaku.DanmakuNotConfiguredException
+import com.animeko.web.data.UserDataStore
 import com.animeko.web.http.Fetcher
 import com.animeko.web.http.JdkFetcher
 import com.animeko.web.http.UpstreamException
@@ -15,6 +16,7 @@ import com.animeko.web.proxy.ProxySessionStore
 import com.animeko.web.selector.SelectorEngine
 import com.animeko.web.selector.SelectorException
 import com.animeko.web.selector.SelectorRepository
+import com.animeko.web.selector.SubscriptionService
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
@@ -43,6 +45,8 @@ fun Application.module(
     cfg: AppConfig = AppConfig(),
     fetcherOverride: Fetcher? = null,
     proxySessions: ProxySessionStore = ProxySessionStore(),
+    siteSessions: SessionStore = SessionStore(),
+    loginLimiter: LoginRateLimiter = LoginRateLimiter(),
 ) {
     install(ContentNegotiation) {
         json(Json { ignoreUnknownKeys = true; encodeDefaults = true })
@@ -84,14 +88,6 @@ fun Application.module(
             appLog.warn("上游失败: {} <- {}", cause.message, call.request.path())
             call.respond(HttpStatusCode.BadGateway, mapOf("error" to (cause.message ?: "upstream error")))
         }
-        // 弹幕未配置属于服务端缺配置，返回 503 而不是被兜底当成内部错误。
-        // 注意：消息里的 DANMAKU_NOT_CONFIGURED 是与前端 PlayerPage 的字符串契约，别改
-        exception<DanmakuNotConfiguredException> { call, cause ->
-            call.respond(
-                HttpStatusCode.ServiceUnavailable,
-                mapOf("error" to (cause.message ?: "DANMAKU_NOT_CONFIGURED")),
-            )
-        }
         exception<IllegalArgumentException> { call, cause ->
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to (cause.message ?: "bad request")))
         }
@@ -107,12 +103,41 @@ fun Application.module(
         streamTimeoutMs = cfg.proxyTimeoutMs,
     )
     val bangumi = BangumiClient(fetcher, cfg.bangumiBaseUrls)
-    val danmaku = DandanplayClient(fetcher, cfg.danmakuAppId, cfg.danmakuAppSecret)
     val repo = SelectorRepository(cfg.selectorsDir)
     repo.seedIfEmpty()
     val engine = SelectorEngine(fetcher, cfg.allowPrivateTargets)
     val sessions = proxySessions
+    val userData = UserDataStore(cfg.userDataFile)
+    val subscriptions = SubscriptionService(fetcher, repo, cfg.allowPrivateTargets)
 
-    configureApiRoutes(cfg, bangumi, danmaku, repo, engine, fetcher, sessions)
+    configureApiRoutes(
+        cfg, bangumi, repo, engine, fetcher, sessions,
+        siteSessions, loginLimiter, userData, subscriptions,
+    )
     configureStaticFrontend(cfg)
+
+    if (cfg.authEnabled) {
+        appLog.info("登录鉴权已启用，未登录只能访问 /api/health 与登录接口（监听 {}）", cfg.host)
+    } else {
+        appLog.warn(
+            "登录鉴权未启用：设置 ANIMEKO_AUTH_USER/ANIMEKO_AUTH_PASSWORD 或 ANIMEKO_AUTH_TOKEN 即可开启。" +
+                "服务监听 {}，若这台机器可从公网访问，所有数据源与代理接口都是裸奔状态。",
+            cfg.host,
+        )
+    }
+    checkFileNameEncoding()
+}
+
+/**
+ * LANG 没设置时 sun.jnu.encoding 会退化成 ASCII，中文数据源名在 Paths.get 这一步就失败。
+ * 症状是「导入永远失败 / 示例源凭空消失」，而原始报错没人看得懂，所以启动时自检并说人话。
+ */
+private fun checkFileNameEncoding() {
+    val probe = runCatching { java.nio.file.Paths.get("编码自检-测试.json") }
+    if (probe.isSuccess) return
+    appLog.error(
+        "文件名字符集不可用（sun.jnu.encoding={}）：包含中文的数据源名将无法落盘。" +
+            "请给进程设置 LANG=C.UTF-8 与 LC_ALL=C.UTF-8 后重启。",
+        System.getProperty("sun.jnu.encoding") ?: "未知",
+    )
 }

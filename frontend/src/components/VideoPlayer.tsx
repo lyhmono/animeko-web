@@ -2,7 +2,6 @@ import { useEffect, useRef, useState, type RefObject } from 'react'
 import Hls from 'hls.js'
 import { isDirectPlayable } from '../api'
 import {
-  IconDanmaku,
   IconFullscreen,
   IconFullscreenExit,
   IconMute,
@@ -18,15 +17,8 @@ interface Props {
   src: string
   /** 加载后一次性定位到的秒数（断点续播） */
   startAt?: number
-  danmakuOn?: boolean
-  /**
-   * 全屏目标容器。默认只全屏本组件的 div —— 而弹幕图层是本组件的兄弟节点，
-   * 于是按 F 之后弹幕直接消失。播放页需要把包含弹幕的外层容器传进来。
-   */
+  /** 全屏目标容器；播放页传入包含控制条的舞台，缺省时全屏本组件 */
   fullscreenTarget?: RefObject<HTMLElement | null>
-  /** 真实播放/暂停状态：弹幕动画必须跟着它走，否则暂停后弹幕仍在飞 */
-  onPlayingChange?: (playing: boolean) => void
-  onToggleDanmaku?: () => void
   onPrevEpisode?: () => void
   onNextEpisode?: () => void
   onProgress?: (time: number, duration: number) => void
@@ -55,10 +47,7 @@ function isTypingTarget(target: EventTarget | null): boolean {
 export default function VideoPlayer({
   src,
   startAt,
-  danmakuOn = true,
   fullscreenTarget,
-  onPlayingChange,
-  onToggleDanmaku,
   onPrevEpisode,
   onNextEpisode,
   onProgress,
@@ -82,15 +71,11 @@ export default function VideoPlayer({
   const onErrorRef = useRef(onError)
   const onProgressRef = useRef(onProgress)
   const onEndedRef = useRef(onEnded)
-  const onToggleDanmakuRef = useRef(onToggleDanmaku)
-  const onPlayingChangeRef = useRef(onPlayingChange)
   const fullscreenTargetRef = useRef(fullscreenTarget)
   useEffect(() => {
     onErrorRef.current = onError
     onProgressRef.current = onProgress
     onEndedRef.current = onEnded
-    onToggleDanmakuRef.current = onToggleDanmaku
-    onPlayingChangeRef.current = onPlayingChange
     fullscreenTargetRef.current = fullscreenTarget
   })
 
@@ -164,17 +149,10 @@ export default function VideoPlayer({
       onProgressRef.current?.(video.currentTime, video.duration || 0)
     }
     const onMeta = () => setDuration(video.duration || 0)
-    const onPlay = () => {
-      setPlaying(true)
-      onPlayingChangeRef.current?.(true)
-    }
-    const onPause = () => {
-      setPlaying(false)
-      onPlayingChangeRef.current?.(false)
-    }
+    const onPlay = () => setPlaying(true)
+    const onPause = () => setPlaying(false)
     const onEnd = () => {
       setPlaying(false)
-      onPlayingChangeRef.current?.(false)
       onEndedRef.current?.()
     }
     // 直链（mp4/webm）路径没有 hls.js 的 ERROR 事件可订阅，
@@ -251,15 +229,15 @@ export default function VideoPlayer({
   }
 
   const toggleFullscreen = () => {
-    // 优先用外层舞台容器：弹幕图层是本组件的兄弟节点，
-    // 只全屏本组件的话按 F 弹幕会整体消失。
+    // 优先用外层舞台容器：本组件只是舞台里的一个子层，
+    // 只全屏本组件会把舞台里的占位/提示排除在画面外。
     const target = fullscreenTargetRef.current?.current ?? containerRef.current
     if (!target) return
     if (document.fullscreenElement) void document.exitFullscreen()
     else void target.requestFullscreen().catch(() => {})
   }
 
-  // ---- 键盘快捷键（绑一次，弹幕开关回调经 ref 读取） ----
+  // ---- 键盘快捷键（绑一次，回调经 ref 读取，避免重绑监听） ----
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (isTypingTarget(e.target) || e.ctrlKey || e.altKey || e.metaKey) return
@@ -308,10 +286,6 @@ export default function VideoPlayer({
         case 'f':
         case 'F':
           toggleFullscreen()
-          break
-        case 'd':
-        case 'D':
-          onToggleDanmakuRef.current?.()
           break
         default:
           break
@@ -402,14 +376,6 @@ export default function VideoPlayer({
           <option value={1.5}>1.5x</option>
           <option value={2}>2.0x</option>
         </select>
-        <button
-          className={`player-btn ${danmakuOn ? 'active' : ''}`}
-          onClick={() => onToggleDanmaku?.()}
-          aria-label="弹幕开关"
-          title="弹幕开关（D）"
-        >
-          <IconDanmaku size={16} />
-        </button>
         <button
           className="player-btn"
           onClick={toggleFullscreen}

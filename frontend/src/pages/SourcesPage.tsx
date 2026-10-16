@@ -1,6 +1,14 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, errMsg } from '../api'
-import type { StoredSource } from '../types'
+import type { StoredSource, SubscriptionCandidate, SubscriptionPreview } from '../types'
+import { IconLink } from '../lib/icons'
+
+/** 订阅来源：填地址（服务端去取）或贴正文（站点挂了/需要登录时自己导出） */
+function subSource(url: string, text: string): { url?: string; text?: string } | null {
+  if (text.trim()) return { text: text.trim() }
+  if (url.trim()) return { url: url.trim() }
+  return null
+}
 
 export default function SourcesPage() {
   const [sources, setSources] = useState<StoredSource[]>([])
@@ -8,6 +16,14 @@ export default function SourcesPage() {
   const [notice, setNotice] = useState('')
   const [importText, setImportText] = useState('')
   const [importing, setImporting] = useState(false)
+  // ---- 聚合订阅 ----
+  const [subUrl, setSubUrl] = useState('')
+  const [subText, setSubText] = useState('')
+  const [showSubText, setShowSubText] = useState(false)
+  const [preview, setPreview] = useState<SubscriptionPreview | null>(null)
+  const [picked, setPicked] = useState<Record<string, boolean>>({})
+  const [previewing, setPreviewing] = useState(false)
+  const [subImporting, setSubImporting] = useState(false)
   // 关键词按数据源名分别保存：共用一个 state 会让所有输入框互相覆盖
   const [testKeyword, setTestKeyword] = useState<Record<string, string>>({})
   const [testResult, setTestResult] = useState<Record<string, string>>({})
@@ -49,8 +65,73 @@ export default function SourcesPage() {
     }
   }
 
-  const testSearch = async (name: string) => {
-    const keyword = (testKeyword[name] ?? '').trim()
+  const pickedNames = useMemo(
+    () => (preview ? preview.candidates.filter((c) => picked[c.name]).map((c) => c.name) : []),
+    [preview, picked],
+  )
+
+  /** 拉订阅：只做「看清楚有哪些源」，写不写进仓库由下一步的勾选决定 */  const fetchPreview = async () => {
+    const source = subSource(subUrl, subText)
+    if (!source) {
+      setError('填一个聚合订阅地址，或展开「贴订阅正文」直接粘 JSON')
+      return
+    }
+    setPreviewing(true)
+    setError('')
+    setNotice('')
+    try {
+      const result = await api.previewSubscription(source)
+      setPreview(result)
+      // 默认勾选「本机还没有」的条目：已存在的源很可能是自己改过的，
+      // 默认把它们勾上等于诱导一次静默覆盖
+      setPicked(
+        Object.fromEntries(result.candidates.map((c) => [c.name, !c.exists])) as Record<string, boolean>,
+      )
+      if (result.candidates.length === 0) {
+        setError(`这个订阅里没有可用的数据源${result.rejected.length ? `（${result.rejected.length} 条被跳过）` : ''}`)
+      }
+    } catch (e) {
+      setError(errMsg(e))
+      setPreview(null)
+    } finally {
+      setPreviewing(false)
+    }
+  }
+
+  const importPicked = async () => {
+    const source = subSource(subUrl, subText)
+    const names = pickedNames
+    if (!source || names.length === 0) return
+    setSubImporting(true)
+    setError('')
+    setNotice('')
+    try {
+      const result = await api.importSubscription({ ...source, names })
+      const parts = [
+        result.added.length ? `新增 ${result.added.length} 个` : '',
+        result.updated.length ? `覆盖 ${result.updated.length} 个` : '',
+        result.failed.length ? `失败 ${result.failed.length} 个` : '',
+      ].filter(Boolean)
+      setNotice(`导入完成：${parts.join('、') || '没有变化'}`)
+      if (result.failed.length) {
+        setError(result.failed.join('；'))
+      }
+      setPreview(null)
+      setSubText('')
+      reload()
+    } catch (e) {
+      setError(errMsg(e))
+    } finally {
+      setSubImporting(false)
+    }
+  }
+
+  const pickAll = (value: boolean) => {
+    if (!preview) return
+    setPicked(Object.fromEntries(preview.candidates.map((c) => [c.name, value])))
+  }
+
+  const testSearch = async (name: string) => {    const keyword = (testKeyword[name] ?? '').trim()
     if (!keyword) return
     setTestResult((r) => ({ ...r, [name]: '搜索中…' }))
     try {
@@ -187,7 +268,117 @@ export default function SourcesPage() {
         <div className="empty">数据源列表加载失败，请检查上方错误提示后重试</div>
       )}
 
-      <h2 className="section-title">导入数据源</h2>
+      <h2 className="section-title">
+        <IconLink size={15} /> 聚合订阅导入
+      </h2>
+      <div className="card">
+        <p className="card-hint">
+          社区订阅是一条 URL 背后打包几十上百个数据源。先拉取预览，再只勾自己要的那几个 ——
+          整包导入的坏处是：每次搜索都会把那些已经打不开的站点各试一遍，慢且没有结果。
+        </p>
+        <div className="sub-url-row">
+          <input
+            value={subUrl}
+            placeholder="订阅地址，例如 https://sub.example.org/v1/css1.json"
+            onChange={(e) => setSubUrl(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && void fetchPreview()}
+          />
+          <button
+            className="btn"
+            disabled={previewing || (!subUrl.trim() && !subText.trim())}
+            onClick={() => void fetchPreview()}
+          >
+            {previewing ? '拉取中…' : '拉取订阅'}
+          </button>
+        </div>
+        <button className="link-btn" onClick={() => setShowSubText((v) => !v)}>
+          {showSubText ? '收起订阅正文输入' : '订阅站打不开？直接贴订阅正文'}
+        </button>
+        {showSubText && (
+          <textarea
+            className="sub-text"
+            placeholder='粘贴订阅 JSON，例如 {"exportedMediaSourceDataList":{"mediaSources":[…]}}'
+            value={subText}
+            onChange={(e) => setSubText(e.target.value)}
+          />
+        )}
+
+        {preview && (
+          <div className="sub-preview">
+            <div className="sub-preview-head">
+              <span>
+                可导入 <b>{preview.candidates.length}</b> 个
+                {preview.rejected.length > 0 && <>，跳过 {preview.rejected.length} 个</>}
+                {preview.subscription && <span className="sub-from"> · 来自 {preview.subscription}</span>}
+              </span>
+              <span className="keys">
+                <button className="btn btn-secondary btn-sm" onClick={() => pickAll(true)}>
+                  全选
+                </button>
+                <button className="btn btn-secondary btn-sm" onClick={() => pickAll(false)}>
+                  全不选
+                </button>
+              </span>
+            </div>
+            <ul className="sub-list">
+              {preview.candidates.map((c: SubscriptionCandidate) => (
+                <li className="sub-item" key={c.name}>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={!!picked[c.name]}
+                      onChange={(e) => {
+                        const value = e.target.checked
+                        setPicked((p) => ({ ...p, [c.name]: value }))
+                      }}
+                    />
+                    <span className="sub-name">{c.name}</span>
+                  </label>
+                  <span className="sub-meta">
+                    {c.tier && <span className="tag">T{c.tier}</span>}
+                    {c.site && <span className="sub-site">{c.site}</span>}
+                    {c.exists && (
+                      <span className="tag tag-warn" title={c.enabled ? '本机已有同名源，导入会覆盖它的配置' : '本机已有同名源且当前停用'}>
+                        已存在
+                      </span>
+                    )}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            {preview.rejected.length > 0 && (
+              <details className="sub-rejected">
+                <summary>跳过的 {preview.rejected.length} 条（订阅里结构不完整，导入也搜不出东西）</summary>
+                <ul>
+                  {preview.rejected.map((r, i) => (
+                    <li key={i}>{r}</li>
+                  ))}
+                </ul>
+              </details>
+            )}
+            <div className="sub-actions">
+              <button
+                className="btn"
+                disabled={pickedNames.length === 0 || subImporting}
+                onClick={() => void importPicked()}
+              >
+                {subImporting ? '导入中…' : `导入所选（${pickedNames.length} 个）`}
+              </button>
+              <button
+                className="btn btn-secondary"
+                onClick={() => {
+                  setPreview(null)
+                  setPicked({})
+                }}
+              >
+                放弃这次预览
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <h2 className="section-title">导入单个数据源</h2>
       <div className="card import-box">
         <textarea
           placeholder='粘贴 animeko 数据源 JSON，例如：{"factoryId":"web-selector","version":2,"arguments":{"name":"...","searchConfig":{...}}}'

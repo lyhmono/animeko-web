@@ -263,11 +263,25 @@ textarea::placeholder {
 }
 
 .footer {
-  padding: 22px 20px;
-  text-align: center;
+  padding: 16px 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
   color: var(--text-dim);
   font-size: 12px;
   border-top: 1px solid var(--border);
+}
+
+.footer-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.footer-user {
+  color: var(--text-secondary);
 }
 
 /* ============================================================
@@ -989,15 +1003,9 @@ textarea::placeholder {
   inset: 0;
 }
 
-.player-danmaku {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-}
-
 .player-controls {
-  /* 叠加在画面下沿而不是排在视频之后（见 .video-shell）。
-     z-index 高于 .danmaku-layer，避免弹幕文字压在按钮上。 */
+  /* 叠加在画面下沿而不是排在视频之后（见 .video-shell）：
+     舞台高度由 aspect-ratio 决定，排在后面会被 overflow:hidden 裁掉。 */
   position: absolute;
   left: 0;
   right: 0;
@@ -1144,32 +1152,6 @@ input[type='range']::-moz-range-thumb {
   font-size: 13px;
 }
 
-.danmaku-settings {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 14px;
-  align-items: center;
-  font-size: 13px;
-  color: var(--text-secondary);
-}
-
-.danmaku-settings label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.danmaku-settings input[type='number'] {
-  width: 64px;
-  padding: 4px 8px;
-}
-
-.danmaku-settings input[type='checkbox'] {
-  accent-color: var(--accent);
-  width: 15px;
-  height: 15px;
-}
-
 /* 续播提示条 */
 .resume-bar {
   display: flex;
@@ -1260,17 +1242,7 @@ input[type='range']::-moz-range-thumb {
    弹幕渲染层
    ============================================================ */
 
-.danmaku-layer {
-  position: absolute;
-  inset: 0;
-  overflow: hidden;
-  pointer-events: none;
-}
 
-.danmaku-layer canvas {
-  width: 100%;
-  height: 100%;
-}
 
 /* ============================================================
    数据源管理
@@ -1597,4 +1569,416 @@ input[type='range']::-moz-range-thumb {
   .player-side {
     grid-template-columns: 1fr;
   }
+}
+
+/* ============================================================
+   登录 / 启动门控
+   ============================================================ */
+
+.login-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    radial-gradient(60% 50% at 50% 0%, var(--hero-glow-1), transparent 70%),
+    radial-gradient(40% 40% at 80% 20%, var(--hero-glow-2), transparent 70%),
+    var(--bg);
+}
+
+.login-card {
+  width: 100%;
+  max-width: 380px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 30px 28px 24px;
+  box-shadow: var(--shadow-hover);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.login-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--text-secondary);
+  letter-spacing: 0.3px;
+}
+
+.login-brand .dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 12px var(--accent);
+}
+
+.login-title {
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -0.3px;
+}
+
+.login-sub {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-top: -6px;
+  line-height: 1.55;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field > span {
+  font-size: 12px;
+  color: var(--text-dim);
+  letter-spacing: 0.4px;
+}
+
+.field input {
+  padding: 11px 13px;
+  border-radius: 10px;
+  background: var(--bg);
+}
+
+.btn-block {
+  width: 100%;
+  padding: 11px 16px;
+  border-radius: 10px;
+  margin-top: 4px;
+}
+
+.login-hint {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.55;
+  text-align: center;
+}
+
+.boot-screen {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  color: var(--text-secondary);
+  font-size: 14px;
+  background:
+    radial-gradient(50% 40% at 50% 0%, var(--hero-glow-1), transparent 70%), var(--bg);
+}
+
+.boot-card {
+  max-width: 420px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 24px;
+}
+
+.boot-actions {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+/* ============================================================
+   同步状态（个人数据是否已经回到服务器）
+   ============================================================ */
+
+.sync-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: default;
+}
+
+.sync-pill::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+}
+
+.sync-pill.pending::before,
+.sync-pill.saving::before {
+  background: var(--warn);
+  animation: sync-blink 1s ease-in-out infinite;
+}
+
+.sync-pill.error {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.sync-pill.error::before {
+  background: var(--danger);
+}
+
+@keyframes sync-blink {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+/* ============================================================
+   聚合订阅导入
+   ============================================================ */
+
+.card-hint {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.link-btn {
+  align-self: flex-start;
+  color: var(--accent);
+  font-size: 13px;
+  padding: 2px;
+  background: none;
+}
+
+.link-btn:hover {
+  text-decoration: underline;
+}
+
+.sub-url-row {
+  display: flex;
+  gap: 10px;
+  margin: 12px 0 10px;
+  flex-wrap: wrap;
+}
+
+.sub-url-row input {
+  flex: 1;
+  min-width: 220px;
+}
+
+.sub-text {
+  width: 100%;
+  min-height: 110px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.sub-preview {
+  border-top: 1px solid var(--border);
+  margin-top: 14px;
+  padding-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.sub-preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  flex-wrap: wrap;
+}
+
+.sub-from {
+  color: var(--text-dim);
+}
+
+.sub-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 340px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 4px;
+  background: var(--bg);
+}
+
+.sub-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+}
+
+.sub-item:hover {
+  background: var(--bg-hover);
+}
+
+.sub-item label {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.sub-item input[type='checkbox'] {
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.sub-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sub-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.sub-site {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.tag-warn {
+  background: var(--danger-dim);
+  color: var(--danger);
+}
+
+.sub-rejected {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.sub-rejected summary {
+  cursor: pointer;
+  color: var(--text-dim);
+}
+
+.sub-rejected ul {
+  margin: 8px 0 0 18px;
+  color: var(--text-dim);
+  line-height: 1.7;
+}
+
+.sub-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 720px) {
+  .sub-item {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .sub-meta {
+    padding-left: 25px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sync-pill.pending::before,
+  .sync-pill.saving::before {
+    animation: none;
+  }
+}
+
+/* ============================================================
+   视觉细节
+   ============================================================ */
+
+body {
+  background-image: linear-gradient(180deg, var(--hero-glow-1), transparent 340px);
+  background-repeat: no-repeat;
+}
+
+input:hover:not(:focus),
+textarea:hover:not(:focus),
+select:hover:not(:focus) {
+  border-color: var(--text-dim);
+}
+
+.btn:not(.btn-secondary):not(.btn-danger) {
+  background-image: linear-gradient(180deg, var(--accent-hover), var(--accent));
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+}
+
+.btn:not(.btn-secondary):not(.btn-danger):hover {
+  background-image: linear-gradient(180deg, var(--accent), var(--accent-hover));
+}
+
+.section-title {
+  padding-left: 10px;
+  border-left: 3px solid var(--accent);
+  border-radius: 2px;
+}
+
+.nav-logo {
+  background: linear-gradient(120deg, var(--text) 20%, var(--accent) 90%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.card {
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.source-item,
+.subject-card,
+.fav-card,
+.recent-card {
+  transition: transform 0.12s ease, border-color 0.15s, box-shadow 0.15s, background 0.15s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn:active,
+  .card,
+  .source-item,
+  .subject-card,
+  .fav-card,
+  .recent-card,
+  .theme-toggle {
+    transition: none;
+    transform: none;
+  }
+}
+
+/* 数据同步出问题的公告条：读取失败时写入是被禁止的，
+   这种「点了收藏但什么都没发生」必须明说 */
+.banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.banner.error-box {
+  text-align: left;
 }

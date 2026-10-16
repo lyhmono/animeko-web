@@ -6,6 +6,8 @@ import com.animeko.web.http.HttpResult
 import com.animeko.web.http.UrlGuard
 import com.animeko.web.http.UpstreamException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -347,32 +349,56 @@ class SelectorEngine(
     }
 
     /**
-     * 抓取并取文本。连接超时/拒绝这类异常必须包住：否则一路掉进兜底 handler，
+     * 抓取并取文本，并逐跳重新校验重定向。
+     *
+     * 两件事必须自己做，不能交给 HTTP 客户端：
+     *  - 体积上限要在读取过程中生效（见 Fetcher.fetchBounded），
+     *    否则「上限」只是把整个响应读进堆之后量一下；
+     *  - 每一跳都过 UrlGuard。源站 302 指向 169.254.169.254 或 127.0.0.1 时，
+     *    自动跟随重定向等于绕过入口校验 —— 社区数据源及其页面上的链接都是别人写的内容。
+     *
+     * 连接超时/拒绝这类异常也要包住：否则一路掉进兜底 handler，
      * 前端只看到一个没有上下文的 500，而不是「上游不可用」的 502。
      */
-    private suspend fun fetchPage(url: String, headers: Map<String, String>, source: String): String =
-        try {
-            fetcher.fetch(url, headers).textCapped(source)
-        } catch (e: UpstreamException) {
-            throw e
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            throw UpstreamException("$source 请求失败: ${e.message ?: e::class.simpleName}")
+    private suspend fun fetchPage(url: String, headers: Map<String, String>, source: String): String {
+        var target = guard(url)
+        var hops = 0
+        while (true) {
+            val result = try {
+                fetcher.fetchBounded(target, headers, MAX_PAGE_BYTES)
+            } catch (e: UpstreamException) {
+                throw e
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                throw UpstreamException("$source 请求失败: ${e.message ?: e::class.simpleName}")
+            }
+            if (result.status !in 301..399) {
+                if (result.status !in 200..299) throw UpstreamException("$source 返回 ${result.status}")
+                return String(result.body, Charsets.UTF_8)
+            }
+            val location = result.header("location")
+                ?: throw UpstreamException("$source 返回 ${result.status} 但没有 Location")
+            if (hops >= MAX_PAGE_REDIRECTS) throw UpstreamException("$source 重定向次数过多")
+            hops++
+            target = guard(absUrl(target, location))
         }
+    }
 
     /**
-     * 上游状态码 + 体积双重检查：
-     * 非 2xx 时 body 往往是错误页，直接送去正则/选择器既慢又只会得到「没找到」的误导结论；
-     * 体积上限则约束住用户自定义正则的输入规模（JVM 正则没有超时，恶意构造的长文本能挂死线程）。
+     * 出站点校验：会真的解析 DNS。
+     * 之前用的是不解析的 requireNotLiteralInternal，一个「公网域名 -> 内网 IP」
+     * 的解析记录就能绕过，而数据源与它页面里的链接都是社区内容，不可信。
+     * 解析不出来时 UrlGuard 放行（交给真实请求去失败），所以测试里的 .test 保留域名不受影响。
+     * 阻塞的解析放在 IO 线程上做。
      */
-    private fun HttpResult.textCapped(source: String): String {
-        if (status !in 200..299) throw UpstreamException("$source 返回 $status")
-        if (body.size > MAX_PAGE_BYTES) {
-            throw UpstreamException("$source 返回体 ${body.size} 字节，超过 ${MAX_PAGE_BYTES / 1024 / 1024}MB 上限")
+    private suspend fun guard(url: String): String =
+        withContext(Dispatchers.IO) {
+            // 原样抛 Blocked：StatusPages 会对外回 403 + 一句通用文案。
+            // 在这里换成 SelectorException 会把拒绝原因（含「主机名 -> 内网 IP」）
+            // 回显给任何能连到这台机器的人，那是网络拓扑泄露。
+            UrlGuard.requireAllowed(url, allowPrivateTargets)
         }
-        return String(body, Charsets.UTF_8)
-    }
 
     private fun applyLink(template: String?, raw: String, base: String): String {
         val link = if (template.isNullOrBlank()) raw else template.replace("{value}", raw)
@@ -395,6 +421,7 @@ class SelectorEngine(
     companion object {
         /** 抓取页面体积上限：同时约束「用户自定义正则」的输入规模（JVM 正则没有超时） */
         const val MAX_PAGE_BYTES: Long = 8L * 1024 * 1024
+        private const val MAX_PAGE_REDIRECTS = 5
 
         private const val MAX_NESTED_PAGES = 5
         private const val NESTED_BUDGET_MS = 30_000L

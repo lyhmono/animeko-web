@@ -5,25 +5,30 @@ services:
     container_name: animeko-web
     restart: unless-stopped
     ports:
+      # 直接对外（只在本机或已有反代/防火墙兜底时用）
       - "8080:8080"
+      # 更稳妥的姿势：只绑本机回环，访问时用 SSH 隧道
+      #   ssh -N -L 8080:127.0.0.1:8080 user@your-vps
+      # - "127.0.0.1:8080:8080"
     volumes:
-      # 数据源配置等持久化（删除容器不丢）
+      # 数据源配置 + 个人数据（收藏/进度）持久化（删除容器不丢）
       - ./data:/data
     environment:
       - TZ=Asia/Shanghai
       - ANIMEKO_PORT=8080
-      # ---- 公网暴露时取消下面注释（浏览器会弹账号密码框；用户名任意、密码填 token）----
-      # - ANIMEKO_AUTH_ENABLED=true
-      # - ANIMEKO_AUTH_TOKEN=请改成足够长的随机字符串
-      # ---- 或用 Basic 账号密码（浏览器/播放器都直接可用）----
+      # ---- 登录：配了凭据就自动开启登录页（不配则站点打开即用）----
+      # 建议单账号自用；口令请换成足够长的随机串
       # - ANIMEKO_AUTH_USER=animeko
       # - ANIMEKO_AUTH_PASSWORD=***
+      # 也可以只配一个口令（登录页用户名任意、密码填它；API 调用可用 Bearer）
+      # - ANIMEKO_AUTH_TOKEN=请改成足够长的随机字符串
+      # 前面已有反代鉴权时才需要显式关掉登录页
+      # - ANIMEKO_AUTH_ENABLED=false
+      # ---- 反代配好 HTTPS 后打开；纯 HTTP 下开着会让浏览器丢弃会话 Cookie（登录页反复回弹）----
+      # - ANIMEKO_COOKIE_SECURE=true
       # ---- 代理/抓取内网地址（默认拒绝，防 SSRF）----
       # - ANIMEKO_ALLOW_PRIVATE_TARGETS=true
       # ---- 反代改写了 Host 导致同源判定误报时才需要放开 ----
       # - ANIMEKO_ALLOW_CROSS_ORIGIN=true
-      # ---- 弹幕（在 https://dev.dandanplay.com 申请）----
-      # - ANIMEKO_DANMAKU_APP_ID=
-      # - ANIMEKO_DANMAKU_APP_SECRET=
       # ---- Bangumi API（默认官方+社区镜像故障转移，可自定义）----
       # - ANIMEKO_BANGUMI_BASE_URLS=https://api.bgm.tv,https://bgmapi.anibt.net

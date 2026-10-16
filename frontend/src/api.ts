@@ -1,38 +1,119 @@
 import type {
   BgmSubject,
-  DdAnime,
-  DdComment,
   EpisodesResult,
   VideoSource,
   StoredSource,
   SubjectHit,
+  SubscriptionPreview,
+  SubscriptionImport,
+  UserData,
 } from './types'
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/** 带 HTTP 状态的错误：数据层要区分 401（会话没了）/409（版本不符）/400（超限或格式错）。 */
+export class ApiError extends Error {
+  readonly status: number
+  readonly code: string
+
+  constructor(status: number, message: string, code: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.code = code
+  }
+}
+
+/** 发请求并统一处理错误。拆成一层是因为 /api/data 还需要读响应头（ETag）。 */
+async function send(path: string, init?: RequestInit): Promise<Response> {
   const resp = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
     ...init,
+    // init.headers 合进来而不是覆盖
+    headers: { 'Content-Type': 'application/json', ...init?.headers },
   })
   if (!resp.ok) {
     let message = `${resp.status} ${resp.statusText}`
+    let code = ''
     try {
       const body = await resp.json()
       // 服务端对未预期异常只回 INTERNAL_ERROR（细节进服务端日志），
       // 所以这里必须保留状态码，否则用户报障时没有任何可定位信息
-      if (body?.error) message = `${resp.status} ${body.error}`
+      if (body?.error) {
+        code = String(body.error)
+        message = `${resp.status} ${body.error}`
+      }
     } catch {
       // 非 JSON 错误响应
     }
-    throw new Error(message)
+    // 会话在服务端过期（30 天不用 / 重启容器 / 点了注销）后，任何请求都会撞上 401。
+    // 这里广播一次，让外层把界面切回登录页，而不是让用户对着「点了没反应」发呆。
+    if (resp.status === 401 && path !== LOGIN_PATH) {
+      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+    }
+    throw new ApiError(resp.status, message, code)
   }
-  return (await resp.json()) as T
+  return resp
 }
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  return (await send(path, init)).json() as T
+}
+
+/** ETag 在 HTTP 上是带引号的字符串，比较前先脱引号（弱标记 W/ 也一起去掉）。 */
+function unquote(value: string | null): string {
+  if (!value) return ''
+  return value.replace(/^W\//, '').replace(/^"|"$/g, '').trim()
+}
+
+/** 错误码常量：数据层按它决定「重试」还是「重读再合并」。 */
+export const ERR_DATA_STALE = 'DATA_STALE'
+
+export function isApiError(e: unknown, status?: number, code?: string): boolean {
+  if (!(e instanceof ApiError)) return false
+  if (status !== undefined && e.status !== status) return false
+  if (code !== undefined && e.code !== code) return false
+  return true
+}
+
+export const UNAUTHORIZED_EVENT = 'animeko-unauthorized'
+const LOGIN_PATH = '/api/session/login'
 
 export const api = {
   health: () =>
-    request<{ status: string; version: string; danmakuConfigured: boolean; authEnabled: boolean }>(
+    request<{ status: string; version: string; authEnabled: boolean; authenticated: boolean }>(
       '/api/health',
     ),
+
+  // ---- 登录会话 ----
+  login: (username: string, password: string) =>
+    request<{ authenticated: boolean; user: string }>(LOGIN_PATH, {
+      method: 'POST',
+      body: JSON.stringify({ username, password }),
+    }),
+  logout: () => request<{ authenticated: boolean }>('/api/session/logout', { method: 'POST' }),
+
+  // ---- 个人数据（收藏 / 历史 / 进度，存服务端）----
+  /**
+   * 读文档并拿到版本指纹。
+   * 一定要 ETag：PUT 是整份覆盖，没有基准的话，另一个标签页/设备的改动会被静默吃掉。
+   */
+  loadDataWithEtag: async (): Promise<{ doc: UserData; etag: string }> => {
+    const resp = await send('/api/data')
+    const text = await resp.text()
+    let doc: UserData = {}
+    if (text.trim()) {
+      const parsed = JSON.parse(text) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) doc = parsed as UserData
+    }
+    return { doc, etag: unquote(resp.headers.get('ETag')) }
+  },
+  /** 条件写。返回服务端新版本；版本不符时服务端回 409 DATA_STALE。 */
+  saveData: async (doc: unknown, etag: string): Promise<string> => {
+    const resp = await send('/api/data', {
+      method: 'PUT',
+      body: JSON.stringify(doc),
+      headers: etag ? { 'If-Match': `"${etag}"` } : undefined,
+    })
+    return unquote(resp.headers.get('ETag'))
+  },
 
   // ---- Bangumi ----
   searchBangumi: (q: string) =>
@@ -68,14 +149,18 @@ export const api = {
       body: JSON.stringify({ playUrl }),
     }),
 
-  // ---- 弹幕 ----
-  danmakuSearch: (anime: string, episode?: string) =>
-    request<DdAnime[]>(
-      `/api/danmaku/search?anime=${encodeURIComponent(anime)}` +
-        (episode ? `&episode=${encodeURIComponent(episode)}` : ''),
-    ),
-  danmakuComments: (episodeId: number) =>
-    request<DdComment[]>(`/api/danmaku/comments?episodeId=${episodeId}`),
+  // ---- 聚合订阅：先预览、勾选后再导入 ----
+  previewSubscription: (input: { url?: string; text?: string }) =>
+    request<SubscriptionPreview>('/api/selector/subscriptions/preview', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  importSubscription: (input: { url?: string; text?: string; names: string[] }) =>
+    request<SubscriptionImport>('/api/selector/subscriptions/import', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
 }
 
 /** 统一错误消息提取（catch 的 e 为 unknown） */

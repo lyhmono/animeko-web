@@ -65,6 +65,29 @@ interface Fetcher {
         headers: Map<String, String> = emptyMap(),
         followRedirects: Boolean = false,
     ): StreamResult
+
+    /**
+     * 有体积上限、且不自动跟随重定向的 GET。
+     *
+     * 为什么单独开一个方法而不是给 fetch 加参数：`fetch` 用 ofByteArray()，
+     * 上限只能在「整个响应已经进堆」之后才检查 —— 对一个几百 MB 的 URL 等于没有上限。
+     * 真实实现边读边断；默认实现退回事后检查（测试桩够用，生产用 JdkFetcher 覆盖）。
+     *
+     * 不跟随重定向是刻意的：302 指向 169.254.169.254 时，
+     * 「先校验入口地址、再由 HTTP 客户端自己跳」等于把校验绕过去了。
+     * 调用方需要逐跳重新校验，见 SubscriptionService。
+     */
+    suspend fun fetchBounded(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        maxBytes: Long,
+    ): HttpResult {
+        val result = fetch(url, headers, followRedirects = false)
+        if (result.body.size > maxBytes) {
+            throw UpstreamException("响应体 ${result.body.size} 字节，超过 ${maxBytes / 1024 / 1024}MB 上限")
+        }
+        return result
+    }
 }
 
 class JdkFetcher(
@@ -138,6 +161,39 @@ class JdkFetcher(
             headers = resp.headers().map().mapValues { it.value.toList() },
             body = resp.body(),
         )
+    }
+
+    override suspend fun fetchBounded(
+        url: String,
+        headers: Map<String, String>,
+        maxBytes: Long,
+    ): HttpResult = withContext(Dispatchers.IO) {
+        val request = buildRequest(url, headers)
+        // ofInputStream + 逐块读：上限要能在「读到的那一刻」生效。
+        // ofByteArray 的话，上限只能在整份响应进堆之后检查，等于没有上限。
+        val resp = noRedirectClient.send(request, HttpResponse.BodyHandlers.ofInputStream())
+        val bytes = resp.body().use { readCapped(it, maxBytes) }
+        HttpResult(
+            status = resp.statusCode(),
+            headers = resp.headers().map().mapValues { it.value.toList() },
+            body = bytes,
+        )
+    }
+
+    private fun readCapped(input: InputStream, maxBytes: Long): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        val chunk = ByteArray(64 * 1024)
+        var total = 0L
+        while (true) {
+            val n = input.read(chunk)
+            if (n == -1) break
+            total += n
+            if (total > maxBytes) {
+                throw UpstreamException("响应体超过 ${maxBytes / 1024 / 1024}MB 上限（已读 $total 字节）")
+            }
+            out.write(chunk, 0, n)
+        }
+        return out.toByteArray()
     }
 
     private fun buildRequest(

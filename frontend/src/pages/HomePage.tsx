@@ -22,7 +22,7 @@ import {
 export default function HomePage() {
   const [keyword, setKeyword] = useState('')
   const [sources, setSources] = useState<StoredSource[]>([])
-  const [health, setHealth] = useState<{ danmakuConfigured: boolean; authEnabled: boolean } | null>(null)
+  const [health, setHealth] = useState<{ version: string; authEnabled: boolean } | null>(null)
   // 区分「检测中」与「连接失败」：null=检测中，true/false=健康检查结果
   const [apiReachable, setApiReachable] = useState<boolean | null>(null)
   const [history, setHistory] = useState<string[]>([])
@@ -59,10 +59,10 @@ export default function HomePage() {
       <section className="hero">
         <div className="hero-badge">
           <span className="badge-dot" />
-          Bangumi · Selector 数据源 · 弹弹play 弹幕 · 单容器自托管
+          Bangumi 元数据 · Selector 数据源 · 视频代理 · 单容器自托管
         </div>
-        <h1>自托管弹幕追番</h1>
-        <p>全部跑在你的容器里，浏览器负责播放与弹幕渲染</p>
+        <h1>自托管追番与播放</h1>
+        <p>搜索、追番、播放都跑在你自己的容器里，数据只留在服务器上</p>
         <div className="search-bar">
           <input
             type="search"
@@ -180,16 +180,8 @@ export default function HomePage() {
             </b>
           </span>
           <span>
-            弹幕服务：
-            <b style={{ color: health?.danmakuConfigured ? 'var(--success)' : 'var(--text-dim)' }}>
-              {apiReachable === false
-                ? '未知'
-                : health === null
-                ? '检测中'
-                : health.danmakuConfigured
-                  ? '已配置'
-                  : '未配置（设置 ANIMEKO_DANMAKU_APP_ID/SECRET）'}
-            </b>
+            服务版本：
+            <b>{apiReachable === false ? '未知' : (health?.version ?? '检测中')}</b>
           </span>
           <span>
             访问鉴权：

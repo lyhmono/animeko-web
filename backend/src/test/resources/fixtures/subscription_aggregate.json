@@ -1,0 +1,89 @@
+{
+  "exportedMediaSourceDataList": {
+    "mediaSources": [
+      {
+        "factoryId": "web-selector",
+        "version": 2,
+        "arguments": {
+          "name": "稀饭动漫",
+          "description": "来自聚合订阅",
+          "iconUrl": "",
+          "tier": 0,
+          "searchConfig": {
+            "searchUrl": "https://xfdm.test/api/search?wd={keyword}",
+            "rawBaseUrl": "https://xfdm.test",
+            "requestInterval": 0,
+            "subjectFormatId": "json-path-indexed",
+            "selectorSubjectFormatJsonPathIndexed": {
+              "selectNames": "$[*]['title']",
+              "selectLinks": "$[*]['url']"
+            },
+            "channelFormatId": "no-channel",
+            "selectorChannelFormatNoChannel": {
+              "selectEpisodes": "a.playlist-card-unit"
+            },
+            "matchVideo": {
+              "matchVideoUrl": "(\\.m3u8)"
+            }
+          }
+        }
+      },
+      {
+        "factoryId": "web-selector",
+        "version": 2,
+        "arguments": {
+          "name": "嘀嗒影视",
+          "description": "已存在于本机的同名源",
+          "iconUrl": "",
+          "tier": "1",
+          "channelTiers": {
+            "新番主线①": 2,
+            "备用①": 4
+          },
+          "searchConfig": {
+            "searchUrl": "https://dadi.test/search/xxxx.html",
+            "rawBaseUrl": "https://dadi.test",
+            "requestInterval": 0,
+            "subjectFormatId": "a",
+            "selectorSubjectFormatA": {
+              "selectLists": "ul.content li.clear"
+            },
+            "channelFormatId": "no-channel",
+            "selectorChannelFormatNoChannel": {
+              "selectEpisodes": "div.down-list a"
+            },
+            "matchVideo": {
+              "matchVideoUrl": "(\\.mp4)"
+            }
+          }
+        }
+      },
+      {
+        "factoryId": "web-selector",
+        "version": 2,
+        "arguments": {
+          "name": "缺配置的源"
+        }
+      },
+      {
+        "factoryId": "web-selector",
+        "version": 2,
+        "arguments": {
+          "name": "正则有害的源",
+          "searchConfig": {
+            "searchUrl": "https://bad-regex.test/?wd={keyword}",
+            "rawBaseUrl": "https://bad-regex.test",
+            "subjectFormatId": "a",
+            "selectorSubjectFormatA": {
+              "selectLists": "li"
+            },
+            "channelFormatId": "no-channel",
+            "matchVideo": {
+              "matchVideoUrl": "((a+)+b"
+            }
+          }
+        }
+      }
+    ]
+  }
+}

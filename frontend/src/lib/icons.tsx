@@ -197,15 +197,6 @@ export function IconSettings({ size, ...rest }: IconProps) {
   )
 }
 
-export function IconDanmaku({ size, ...rest }: IconProps) {
-  return (
-    <Svg size={size} {...rest}>
-      <path d="M21 11.5a8.4 8.4 0 0 1-8.5 8.4 8.6 8.6 0 0 1-3.9-.9L3 21l1.9-5.1a8.2 8.2 0 0 1-.9-3.8A8.4 8.4 0 0 1 12.5 3h0a8.4 8.4 0 0 1 8.5 8.5z" />
-      <path d="M8.5 11.5h7" />
-      <path d="M8.5 14.5h4" />
-    </Svg>
-  )
-}
 
 export function IconHistory({ size, ...rest }: IconProps) {
   return (
@@ -250,3 +241,22 @@ export function IconCheck({ size, ...rest }: IconProps) {
   )
 }
 
+
+export function IconLogout({ size, ...rest }: IconProps) {
+  return (
+    <Svg size={size} {...rest}>
+      <path d="M9 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h3" />
+      <path d="M16 15l3-3-3-3" />
+      <path d="M19 12H9" />
+    </Svg>
+  )
+}
+
+export function IconLink({ size, ...rest }: IconProps) {
+  return (
+    <Svg size={size} {...rest}>
+      <path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1" />
+      <path d="M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1" />
+    </Svg>
+  )
+}

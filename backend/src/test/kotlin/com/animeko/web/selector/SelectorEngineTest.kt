@@ -10,9 +10,18 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-/** 按 URL 前缀返回 fixture 的打桩 Fetcher */
-class StubFetcher(private val routes: Map<String, String>) : Fetcher {
+/**
+ * 按 URL 前缀返回 fixture 的打桩 Fetcher。
+ * redirects 用来模拟「源站 302 到内网」这类逐跳校验场景（值 = Location）。
+ */
+class StubFetcher(
+    private val routes: Map<String, String>,
+    private val redirects: Map<String, String> = emptyMap(),
+) : Fetcher {
     val requested = mutableListOf<String>()
+
+    private fun lookup(url: String): String? = routes[url]
+        ?: routes.entries.firstOrNull { (prefix, _) -> url.startsWith(prefix) }?.value
 
     override suspend fun fetch(
         url: String,
@@ -20,10 +29,22 @@ class StubFetcher(private val routes: Map<String, String>) : Fetcher {
         followRedirects: Boolean,
     ): HttpResult {
         requested.add(url)
-        val body = routes[url]
-            ?: routes.entries.firstOrNull { (prefix, _) -> url.startsWith(prefix) }?.value
-            ?: throw IllegalStateException("no fixture for $url")
+        redirects[url]?.let { loc ->
+            return HttpResult(302, mapOf("location" to listOf(loc)), ByteArray(0))
+        }
+        val body = lookup(url) ?: throw IllegalStateException("no fixture for $url")
         return HttpResult(200, mapOf("content-type" to listOf("text/html")), body.toByteArray())
+    }
+
+    /** 生产实现是「逐跳校验 + 边读边限」，桩要跟着走这条路径，否则新代码在测试里等于没被测到 */
+    override suspend fun fetchBounded(
+        url: String,
+        headers: Map<String, String>,
+        maxBytes: Long,
+    ): HttpResult {
+        val r = fetch(url, headers, followRedirects = false)
+        if (r.body.size > maxBytes) throw com.animeko.web.http.UpstreamException("超过 ${maxBytes} 字节上限")
+        return r
     }
 
     override suspend fun post(
@@ -214,6 +235,45 @@ class SelectorEngineTest {
         assertFailsWith<SelectorException> {
             SelectorEngine(fetcher).resolveVideo(config(), "$base/play/x.html")
         }
+    }
+
+@Test
+    fun `search redirect into the intranet is refused on the hop, not fetched`() = runTest {
+        // 数据源可以是社区导入的，它返回的 302 属于「别人决定我们要连谁」。
+        // 只校验入口 URL、然后让 HTTP 客户端自动跟随，等于把这决定权交了出去
+        val fetcher = StubFetcher(
+            routes = emptyMap(),
+            redirects = mapOf("$base/search?keyword=%E5%AD%A4%E7%8B%AC" to "http://127.0.0.1:8080/admin"),
+        )
+        val engine = SelectorEngine(fetcher, allowPrivateTargets = false)
+        // 必须是 403（UrlGuard.Blocked），而不是被包成 502 且带上「主机名 -> 内网 IP」的拒绝原因
+        val e = assertFailsWith<com.animeko.web.http.UrlGuard.Blocked> { engine.search(config(), "孤独") }
+        assertTrue(e.message!!.contains("127.0.0.1"), e.message!!)
+        assertTrue(
+            fetcher.requested.none { it.contains("127.0.0.1") },
+            "被拦下的一跳不该真的发出去：${fetcher.requested}",
+        )
+    }
+
+    @Test
+    fun `search redirect that stays public is followed`() = runTest {
+        val fetcher = StubFetcher(
+            routes = mapOf("https://mirror-site.test/search?keyword=%E5%AD%A4%E7%8B%AC" to fixture("search_page.html")),
+            redirects = mapOf("$base/search?keyword=%E5%AD%A4%E7%8B%AC" to "https://mirror-site.test/search?keyword=%E5%AD%A4%E7%8B%AC"),
+        )
+        val engine = SelectorEngine(fetcher, allowPrivateTargets = false)
+        val hits = engine.search(config(), "孤独")
+        assertTrue(hits.isNotEmpty(), "公网内的续跳应当照常工作")
+    }
+
+    @Test
+    fun `oversized upstream page is refused`() = runTest {
+        // 上限要在读取过程中生效：正则跑在几百 MB 文本上不是「慢」，是挂死线程
+        val huge = "<html><body>" + "x".repeat(9 * 1024 * 1024) + "</body></html>"
+        val fetcher = StubFetcher(routes = mapOf("$base/search?keyword=%E5%AD%A4%E7%8B%AC" to huge))
+        val engine = SelectorEngine(fetcher, allowPrivateTargets = false)
+        val e = assertFailsWith<com.animeko.web.http.UpstreamException> { engine.search(config(), "孤独") }
+        assertTrue(e.message!!.contains("上限"), e.message!!)
     }
 
     @Test

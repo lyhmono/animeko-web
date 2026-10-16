@@ -7,8 +7,10 @@ backend/build/
 backend/.gradle/
 backend/.kotlin/
 
-# 运行时数据
-data/
+# 运行时数据（锚到仓库根：写成裸 data/ 会把
+# backend/src/main/kotlin/com/animeko/web/data/ 这个源码包一起忽略掉 ——
+# 那样的后果是 UserDataStore.kt 永远进不了提交，别人克隆下来直接编译不过）
+/data/
 
 # IDE
 .idea/

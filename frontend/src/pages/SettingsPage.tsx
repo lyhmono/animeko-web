@@ -1,18 +1,28 @@
 import { useEffect, useState } from 'react'
 import { api, errMsg } from '../api'
-import { getTheme, setTheme, syncThemeColor, type Theme } from '../lib/storage'
+import {
+  flushUserData,
+  getSyncState,
+  getTheme,
+  onSyncChange,
+  setTheme,
+  syncThemeColor,
+  type SyncState,
+  type Theme,
+} from '../lib/storage'
+import { rememberedUser } from '../lib/auth'
 import { IconMoon, IconSun } from '../lib/icons'
 
 export default function SettingsPage() {
-  const [health, setHealth] = useState<{
-    version: string
-    danmakuConfigured: boolean
-    authEnabled: boolean
-  } | null>(null)
+  const [health, setHealth] = useState<{ version: string; authEnabled: boolean; authenticated: boolean } | null>(null)
   // 健康检查失败 ≠ 功能未开启：混在一起会给出与实际相反的配置建议
   const [healthError, setHealthError] = useState('')
   const [healthLoading, setHealthLoading] = useState(true)
   const [theme, setThemeState] = useState<Theme>(getTheme)
+  const [sync, setSync] = useState<SyncState>(getSyncState)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => onSyncChange(setSync), [])
 
   useEffect(() => {
     let cancelled = false
@@ -60,6 +70,46 @@ export default function SettingsPage() {
       <h2 className="section-title">设置</h2>
 
       <div className="settings-group card">
+        <h3>数据与登录</h3>
+        <div className="settings-row">
+          <div>
+            <div style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
+              收藏、观看进度、搜索历史与最近观看保存在服务器的 <code>data/userdata.json</code>，
+              换设备或清浏览器缓存都不会丢。
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 6 }}>
+              当前状态：
+              {sync.status === 'error' ? (
+                <span style={{ color: 'var(--danger)' }}>{sync.error || '保存失败'}</span>
+              ) : sync.status === 'ready' ? (
+                '已与服务器同步'
+              ) : (
+                '有改动待写入服务器'
+              )}
+              {rememberedUser() && `　·　已登录：${rememberedUser()}`}
+            </div>
+          </div>
+          <button
+            className="btn btn-secondary btn-sm"
+            disabled={saving}
+            onClick={() => {
+              setSaving(true)
+              void flushUserData().finally(() => setSaving(false))
+            }}
+          >
+            {saving ? '保存中…' : '立即保存'}
+          </button>
+        </div>
+        {!healthLoading && health && !health.authEnabled && (
+          <div className="error-box" style={{ marginTop: 10 }}>
+            登录未启用：任何能连到这台机器的人都能读取你的数据源与个人数据。
+            设置 <code>ANIMEKO_AUTH_USER</code> 与 <code>ANIMEKO_AUTH_PASSWORD</code>（或
+            <code>ANIMEKO_AUTH_TOKEN</code>）后重启即可启用登录页。
+          </div>
+        )}
+      </div>
+
+      <div className="settings-group card">
         <h3>外观</h3>
         <div className="settings-row">
           <span className="settings-label">主题模式（选择会保存在本地浏览器）</span>
@@ -88,18 +138,10 @@ export default function SettingsPage() {
           <div>版本：{healthLoading ? '检测中…' : (health?.version ?? '—')}</div>
           {healthError ? (
             <div>
-              后端不可用：{healthError}（无法确认弹幕服务与访问鉴权状态，请检查服务是否运行、鉴权配置是否正确）
+              后端不可用：{healthError}（无法确认访问鉴权状态，请检查服务是否在运行）
             </div>
           ) : (
             <>
-              <div>
-                弹幕服务：
-                {healthLoading
-                  ? '检测中…'
-                  : health?.danmakuConfigured
-                    ? '已配置'
-                    : '未配置（在容器环境变量中设置 ANIMEKO_DANMAKU_APP_ID / ANIMEKO_DANMAKU_APP_SECRET）'}
-              </div>
               <div>
                 访问鉴权：
                 {healthLoading
@@ -127,11 +169,13 @@ export default function SettingsPage() {
             <tbody>
               {[
                 ['ANIMEKO_PORT', '8080', '服务端口'],
-                ['ANIMEKO_DATA_DIR', './data', '数据目录（数据源配置等）'],
-                ['ANIMEKO_AUTH_ENABLED', 'false', '是否开启访问鉴权'],
-                ['ANIMEKO_AUTH_TOKEN', '—', 'Bearer Token（公网推荐）'],
-                ['ANIMEKO_DANMAKU_APP_ID', '—', '弹弹play AppId'],
-                ['ANIMEKO_DANMAKU_APP_SECRET', '—', '弹弹play AppSecret'],
+                ['ANIMEKO_DATA_DIR', './data', '数据目录（数据源配置 + userdata.json 个人数据）'],
+                ['ANIMEKO_AUTH_USER / PASSWORD', '—', '登录账号与口令；配了即自动开启登录'],
+                ['ANIMEKO_AUTH_TOKEN', '—', '也可以只配一个口令，登录页当密码用（公网推荐随机长串）'],
+                ['ANIMEKO_AUTH_ENABLED', '自动', '显式写 false 可关掉登录页（前面已有反代鉴权时才需要）'],
+                ['ANIMEKO_COOKIE_SECURE', 'false', '反代配好 HTTPS 后设为 true'],
+                ['ANIMEKO_ALLOW_PRIVATE_TARGETS', 'false', '允许代理/抓取访问内网地址（仅局域网 NAS 源需要）'],
+                ['ANIMEKO_ALLOW_CROSS_ORIGIN', 'false', '放开「写接口只允许同源」检查（反代改写 Host 时才需要）'],
                 [
                   'ANIMEKO_BANGUMI_BASE_URLS',
                   'api.bgm.tv,bgmapi.anibt.net',
@@ -158,8 +202,9 @@ export default function SettingsPage() {
           <a href="https://github.com/open-ani/animeko" style={{ color: 'var(--accent)' }}>
             animeko
           </a>
-          （AGPL-3.0）的服务端化实现：数据源采集、Bangumi 元数据、弹弹play 弹幕与视频代理运行在服务端容器中，浏览器负责播放与弹幕渲染。
-          本项目同样以 AGPL-3.0 授权。数据与缓存仅保存在本容器，请遵守所在地法律法规，仅用于个人学习与使用。
+          （AGPL-3.0）的服务端化实现：数据源采集、Bangumi 元数据与视频代理运行在服务端容器中，浏览器只负责界面与播放。
+          本项目同样以 AGPL-3.0 授权。收藏与进度等个人数据保存在服务器的数据目录里，不上传到任何第三方；
+          请遵守所在地法律法规，仅用于个人学习与使用。
         </p>
       </div>
     </div>

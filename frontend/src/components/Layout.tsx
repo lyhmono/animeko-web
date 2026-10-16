@@ -1,10 +1,47 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
-import { getTheme, setTheme, syncThemeColor, type Theme } from '../lib/storage'
-import { IconHeart, IconHome, IconLayers, IconMoon, IconSettings, IconSun } from '../lib/icons'
+import {
+  getSyncState,
+  onSyncChange,
+  getTheme,
+  setTheme,
+  syncThemeColor,
+  type SyncState,
+  type Theme,
+} from '../lib/storage'
+import { rememberedUser } from '../lib/auth'
+import {
+  IconHeart,
+  IconHome,
+  IconLayers,
+  IconLogout,
+  IconMoon,
+  IconSettings,
+  IconSun,
+} from '../lib/icons'
+
+const SYNC_TEXT: Record<SyncState['status'], string> = {
+  ready: '已保存',
+  pending: '有改动待保存',
+  saving: '保存中…',
+  error: '保存失败',
+}
+
+/** 读取失败与保存失败必须分开说：前者意味着写入已被禁止（防止空文档覆盖服务器数据），
+ *  喊「保存失败」会让人以为多点几次就能救回来 */
+function syncText(state: SyncState): string {
+  if (state.status === 'error' && state.kind === 'load') return '数据未同步'
+  return SYNC_TEXT[state.status]
+}
 
 export default function Layout() {
   const [theme, setThemeState] = useState<Theme>(getTheme)
+  const [sync, setSyncState] = useState<SyncState>(getSyncState)
+  const user = rememberedUser()
+
+  // 个人数据是「写内存 + 去抖回传服务端」的，界面必须能说出到底存上了没有，
+  // 否则用户只能靠「收藏还在不在」来猜网络状况
+  useEffect(() => onSyncChange(setSyncState), [])
 
   // 设置页切换主题后同步本组件状态
   useEffect(() => {
@@ -58,13 +95,30 @@ export default function Layout() {
           >
             {theme === 'dark' ? <IconSun size={17} /> : <IconMoon size={17} />}
           </button>
+          <button
+            className="theme-toggle"
+            onClick={() => window.dispatchEvent(new Event('animeko-sign-out'))}
+            aria-label="退出登录"
+            title="退出登录"
+          >
+            <IconLogout size={17} />
+          </button>
         </div>
       </nav>
       <main className="main">
         <Outlet />
       </main>
       <footer className="footer">
-        Animeko Web · 基于 animeko (AGPL-3.0) 架构的服务端化实现 · 数据与缓存仅存于本容器
+        <span className="footer-left">
+          Animeko Web · 基于 animeko (AGPL-3.0) 架构的服务端化实现 · 收藏与进度保存在服务器
+        </span>
+        <span className="footer-right">
+          {user && <span className="footer-user">{user}</span>}
+          {/* 保存失败要点得出原因，否则「收藏不见了」这种问题根本没法排查 */}
+          <span className={`sync-pill ${sync.status}`} title={sync.error || syncText(sync)}>
+            {syncText(sync)}
+          </span>
+        </span>
       </footer>
     </div>
   )

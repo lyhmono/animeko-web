@@ -1,7 +1,6 @@
 package com.animeko.web.api
 
 import com.animeko.web.config.AppConfig
-import com.animeko.web.danmaku.DdComment
 import com.animeko.web.module
 import com.animeko.web.selector.EpisodeHit
 import com.animeko.web.selector.EpisodesResult
@@ -202,15 +201,6 @@ class ApiRoutesTest {
     }
 
     @Test
-    fun `danmaku without credentials is 503 with the stable contract string`() = testApplication {
-        application { module(testConfig()) }
-        val resp = client.get("/api/danmaku/search?anime=x")
-        assertEquals(HttpStatusCode.ServiceUnavailable, resp.status)
-        // PlayerPage 用这个字符串区分「未配置」与真故障；改名会退化成红色报错
-        assertTrue(resp.bodyAsText().contains("DANMAKU_NOT_CONFIGURED"), resp.bodyAsText())
-    }
-
-    @Test
     fun `ssrf denial does not echo the internal address`() = testApplication {
         application { module(testConfig()) }
         val resp = client.get("/api/proxy") { parameter("url", "http://192.168.1.7/x.m3u8") }
@@ -266,6 +256,29 @@ class ApiRoutesTest {
 
         val spa = client.get("/subject/123")
         assertEquals("no-cache", spa.headers[HttpHeaders.CacheControl], "入口被缓存就会指向已删除的旧 chunk")
+
+        // 「/」走的是文件命中分支而不是回退分支，曾经漏掉 no-cache：
+        // 浏览器一启发式缓存住 index.html，重新部署后就永久白屏
+        for (entry in listOf("/", "/index.html")) {
+            val resp = client.get(entry)
+            assertEquals(HttpStatusCode.OK, resp.status, entry)
+            assertEquals("no-cache", resp.headers[HttpHeaders.CacheControl], "$entry 必须每次回源")
+        }
+    }
+
+@Test
+    fun `static handler cannot be walked out of the frontend directory`() = testApplication {
+        // 静态托管是「路径拼文件名」实现的，必须钉死它出不了那个目录：
+        // 前端目录旁边就是 data/userdata.json 与 selectors/，读出去等于把收藏和内网配置交给访客
+        val dir = java.nio.file.Files.createTempDirectory("animeko-traversal")
+        java.io.File(dir.toFile(), "index.html").writeText("<html>spa</html>")
+        val resp = client.get("/../../../../etc/passwd")
+        val body = resp.bodyAsText()
+        assertFalse(body.contains("root:"), body.take(120))
+        val dotdot = client.get("/%2e%2e/%2e%2e/%2e%2e/etc/passwd")
+        assertFalse(dotdot.bodyAsText().contains("root:"), dotdot.bodyAsText().take(120))
+        val raw = client.get("/../../../../../etc/hosts")
+        assertFalse(raw.bodyAsText().contains("127.0.0.1"), raw.bodyAsText().take(120))
     }
 
     @Test
@@ -302,11 +315,22 @@ class ApiRoutesTest {
         )
         assertTrue(video.contains("\"proxyPath\":\"/api/proxy?url="), video)
 
-        val comment = json.encodeToString(
-            DdComment.serializer(),
-            DdComment(cid = 1L, time = 12.5, text = "前方高能", color = 16777215, mode = 1),
+        val health = json.encodeToString(
+            HealthResponse.serializer(),
+            HealthResponse(status = "ok", version = "0.1.0", authEnabled = true, authenticated = false),
         )
-        assertTrue(comment.contains("\"text\":\"前方高能\""), comment)
-        assertTrue(comment.contains("\"time\":12.5"), comment)
+        // 弹幕功能已移除，健康检查不该再有 danmakuConfigured 字段
+        assertTrue(health.contains("\"authEnabled\":true"), health)
+        // 前端登录门控靠 authenticated 决定去留，缺了它就会「已登录却被踢回登录页」
+        assertTrue(health.contains("\"authenticated\":false"), health)
+        assertTrue(!health.contains("danmaku"), health)
+
+        // 登录成功响应：真实事故是写成 mapOf("authenticated" to true, "user" to name)，
+        // 推断出 Map<String, Any> → 运行期 Serializer not found → 登录永远 500。
+        val session = json.encodeToString(
+            SessionStateResponse.serializer(),
+            SessionStateResponse(authenticated = true, user = "me"),
+        )
+        assertTrue(session.contains("\"authenticated\":true"), session)
     }
 }

@@ -69,6 +69,20 @@ class SelectorRepositoryTest {
     }
 
     @Test
+    fun `non web-selector factory is rejected instead of stored as a dead source`() {
+        // 社区订阅里混着 bt-selector：以前丢掉 factoryId 后会被当 web 源存下，
+        // 列表里看着正常、搜索永远是 0 结果，用户完全无从下手
+        val r = repo()
+        val bt = """{"factoryId":"bt","version":1,"arguments":{"name":"BT源","searchConfig":{"searchUrl":"https://a.test/s"}}}"""
+        val e = assertFailsWith<IllegalArgumentException> { r.importJson(bt) }
+        assertTrue(e.message.orEmpty().contains("bt"), e.message.orEmpty())
+        assertTrue(e.message.orEmpty().contains("web-selector"), e.message.orEmpty())
+        // 裸 arguments（没有包装层）不受影响
+        assertEquals("裸配置", r.importJson("""{"name":"裸配置","searchConfig":{"searchUrl":"https://a.test/s"}}""").name)
+        assertEquals("示例", r.importJson("""{"factoryId":"web-selector","version":2,"arguments":{"name":"示例","searchConfig":{"searchUrl":"https://a.test/s"}}}""").name)
+    }
+
+    @Test
     fun `bare arguments json is accepted`() {
         val r = repo()
         val json = """{"name":"裸配置","searchConfig":{"searchUrl":"https://a.example.com/s?kw={keyword}"}}"""

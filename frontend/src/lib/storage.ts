@@ -1,55 +1,276 @@
 /**
- * 本地存储层：播放进度 / 追番收藏 / 搜索历史 / 最近观看。
- * 全部数据仅存浏览器 localStorage（key 前缀 animeko-web:），不上传服务端。
- * 所有读取均容错：JSON 损坏或字段缺失时回退默认值，绝不让坏数据阻断页面。
+ * 个人数据层：播放进度 / 追番收藏 / 搜索历史 / 最近观看。
+ *
+ * 数据存在服务端（{dataDir}/userdata.json），这样换设备、清缓存、开隐私模式都不会丢收藏。
+ * 对外仍是一套同步函数：页面代码不该为了「读一次收藏」到处 await。
+ * 实现是「启动时整份拉回内存 + 写入去抖回传」：
+ *  - 读：命中内存，永远是同步的；
+ *  - 写：立刻更新内存并记下改了哪些键，800ms 内多次写入合并成一次 PUT。
+ *
+ * 三条必须守住的底线（都是真实事故的形状）：
+ *  1. 没读到服务端文档就绝不回写。否则一次读取失败 + 一次收藏点击
+ *     就会把 `{favorites:[…]}` 整份覆盖上去，收藏与进度当场清空。
+ *  2. 回写是条件写（If-Match 带读到的版本）。两个标签页/两台设备各自整份覆盖时，
+ *     后写的会把先写的改动吃掉；版本不符就重读、把自己改过的键贴回去再写。
+ *  3. 写失败必须保留待写状态并重试，界面也不能说「已保存」。
  */
+import { api, ERR_DATA_STALE, errMsg, isApiError } from '../api'
+import type { UserData } from '../types'
 
-const PREFIX = 'animeko-web:'
+let doc: UserData = {}
+let loaded = false
+let baseEtag = ''
 
-function readRaw(key: string): string | null {
+// ---------- 同步状态（给界面一个「到底存上了没有」的说法）----------
+
+export type SyncStatus = 'ready' | 'pending' | 'saving' | 'error'
+
+export interface SyncState {
+  status: SyncStatus
+  /** 出错的是读取还是写入：读取失败时界面要停下写入，而不是喊「保存失败」 */
+  kind: 'load' | 'save' | null
+  error: string
+}
+
+let sync: SyncState = { status: 'ready', kind: null, error: '' }
+const syncListeners = new Set<(s: SyncState) => void>()
+
+function setSync(next: SyncState): void {
+  sync = next
+  syncListeners.forEach((l) => l(next))
+}
+
+export function getSyncState(): SyncState {
+  return sync
+}
+
+export function onSyncChange(listener: (s: SyncState) => void): () => void {
+  syncListeners.add(listener)
+  return () => syncListeners.delete(listener)
+}
+
+// ---------- 拉取 ----------
+
+/**
+ * 开机拉一次。失败时保持 loaded=false —— 这是「不许覆盖服务器数据」的唯一开关，
+ * 所以它同时也是「现在不能写」的状态，界面要显示可重试的读取错误。
+ */
+export async function loadUserData(): Promise<void> {
   try {
-    return localStorage.getItem(PREFIX + key)
+    const remote = await api.loadDataWithEtag()
+    doc = remote.doc
+    baseEtag = remote.etag
+    loaded = true
+    pendingKeys.clear()
+    pendingProgressKeys.clear()
+    setSync({ status: 'ready', kind: null, error: '' })
+  } catch (e) {
+    loaded = false
+    doc = {}
+    baseEtag = ''
+    setSync({
+      status: 'error',
+      kind: 'load',
+      error: `个人数据没读到，已暂停写入以免覆盖服务器上的收藏：${errMsg(e)}`,
+    })
+  }
+}
+
+// ---------- 回写 ----------
+
+const DEBOUNCE_MS = 800
+const RETRY_MS = 5000
+/** 单个剧集一条记录，看久了会无限增长直到撞上限，所以留最新的一部分即可 */
+const MAX_PROGRESS_ENTRIES = 400
+
+const pendingKeys = new Set<string>()
+/** progress 是一个大 map，整键覆盖会吃掉别的标签页刚写的其它剧集，所以细到条目级 */
+const pendingProgressKeys = new Set<string>()
+
+let timer: ReturnType<typeof setTimeout> | undefined
+let running: Promise<void> | null = null
+
+function scheduleFlush(key?: string, progressEntry?: string): void {
+  if (key) pendingKeys.add(key)
+  if (progressEntry) pendingProgressKeys.add(progressEntry)
+  if (!loaded) return // 见文件头第 1 条：没有服务端文档就没有可覆盖的基准
+  setSync({ status: 'pending', kind: null, error: '' })
+  if (timer) clearTimeout(timer)
+  timer = setTimeout(() => void flushUserData(), DEBOUNCE_MS)
+}
+
+/** 立即把内存里的改动推给服务端（去抖合并、版本比对、失败保留待写状态）。 */
+export async function flushUserData(): Promise<void> {
+  if (timer) {
+    clearTimeout(timer)
+    timer = undefined
+  }
+  if (!loaded) {
+    if (sync.status !== 'error') {
+      setSync({ status: 'error', kind: 'load', error: '还没读到服务器数据，写入已暂停' })
+    }
+    return
+  }
+  // 正在写的那一轮会看到 pendingKeys，不用并发发第二个 PUT（并发 PUT 的到达顺序没有保证）
+  if (running) {
+    await running
+    if (pendingKeys.size > 0) await flushUserData()
+    return
+  }
+  const round = pushOnce().finally(() => {
+    if (running === round) running = null
+  })
+  running = round
+  await round
+}
+
+async function pushOnce(): Promise<void> {
+  let attempt = 0
+  while (pendingKeys.size > 0 && attempt < 3) {
+    attempt++
+    const keys = [...pendingKeys]
+    const progressKeys = [...pendingProgressKeys]
+    setSync({ status: 'saving', kind: null, error: '' })
+    try {
+      baseEtag = await api.saveData(doc, baseEtag)
+      // 只清这一轮带出去的键：await 期间新产生的改动必须留给下一轮
+      keys.forEach((k) => pendingKeys.delete(k))
+      progressKeys.forEach((k) => pendingProgressKeys.delete(k))
+      setSync({ status: 'ready', kind: null, error: '' })
+    } catch (e) {
+      if (isApiError(e, 409, ERR_DATA_STALE)) {
+        const merged = await mergeWithServer(keys, progressKeys)
+        if (merged) continue // 换好基准，重试这一次写
+        setSync({ status: 'error', kind: 'save', error: '本机改动与服务端冲突且无法合并，请刷新页面重试' })
+        return
+      }
+      // 超上限、格式错这类不会自己变好，别把浏览器变成打服务端的循环
+      const fatal = isApiError(e, 400) || isApiError(e, 413)
+      setSync({ status: 'error', kind: 'save', error: `保存失败：${errMsg(e)}` })
+      if (!fatal) {
+        if (timer) clearTimeout(timer)
+        timer = setTimeout(() => void flushUserData(), RETRY_MS)
+      }
+      return
+    }
+  }
+}
+
+/**
+ * 版本冲突：重读服务端文档，只把「本标签页改过的键」贴上去。
+ * 这样另一台设备/另一个标签页的改动不会被整份覆盖，
+ * 而我们自己的改动也不会丢。progress 再细一层到条目，避免互相吃掉别的剧集。
+ */
+async function mergeWithServer(keys: string[], progressKeys: string[]): Promise<boolean> {
+  let fresh
+  try {
+    fresh = await api.loadDataWithEtag()
+  } catch (e) {
+    setSync({ status: 'error', kind: 'load', error: `冲突后重读失败：${errMsg(e)}` })
+    return false
+  }
+  const merged: UserData = { ...fresh.doc }
+  for (const key of keys) {
+    if (key === 'progress') {
+      const theirs = asMap(merged.progress)
+      const mine = asMap(doc.progress)
+      const out: Record<string, unknown> = { ...theirs }
+      for (const entry of progressKeys) {
+        if (entry in mine) out[entry] = mine[entry]
+        else delete out[entry]
+      }
+      merged.progress = out
+    } else if (Object.prototype.hasOwnProperty.call(doc, key)) {
+      merged[key] = doc[key]
+    } else {
+      delete merged[key]
+    }
+  }
+  doc = merged
+  baseEtag = fresh.etag
+  return true
+}
+
+// 关掉标签页 / 切后台时尽力把待写内容送出去（fetch 在页面卸载后可能被浏览器掐掉，
+// 所以这只是「尽力」，真正的兜底是每次改动都会即时去抖回写）。
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') void flushUserData()
+  })
+  window.addEventListener('pagehide', () => void flushUserData())
+}
+
+// ---------- 底层读写（键即文档字段）----------
+
+export function readJson<T>(key: string, fallback: T): T {
+  const value = doc[key]
+  return value === undefined ? fallback : (value as T)
+}
+
+export function writeJson(key: string, value: unknown): void {
+  doc[key] = value
+  scheduleFlush(key)
+}
+
+function removeKey(key: string): void {
+  if (!(key in doc)) return
+  delete doc[key]
+  scheduleFlush(key)
+}
+
+/** 服务端文档里没有 progress 时给一个空容器（返回的是活引用，调用方只读） */
+function progressMap(): Record<string, unknown> {
+  const raw = doc.progress
+  return raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {}
+}
+
+function asMap(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+}
+
+function writeProgressMap(map: Record<string, unknown>, entryKey: string): void {
+  // 剪掉最久没动的条目：一条都不删的话，看够了集数就会撞上服务端 512KB 上限，
+  // 之后每一次收藏/进度写入都会 400，等于整个数据层从此写不进去
+  const entries = Object.entries(map).filter(([, v]) => asMap(v).ts != null)
+  if (entries.length > MAX_PROGRESS_ENTRIES) {
+    entries.sort((a, b) => (asMap(b[1]).ts as number) - (asMap(a[1]).ts as number))
+    const kept: Record<string, unknown> = {}
+    entries.slice(0, MAX_PROGRESS_ENTRIES).forEach(([k, v]) => {
+      kept[k] = v
+    })
+    map = kept
+  }
+  doc.progress = map
+  scheduleFlush('progress', entryKey)
+}
+
+// ---------- 主题（设备偏好，不进服务端文档）----------
+
+export type Theme = 'dark' | 'light'
+
+const THEME_COLORS: Record<Theme, string> = { dark: '#0f1115', light: '#f5f6fa' }
+
+/**
+ * 主题只存本机：它是「这台设备看着舒服与否」的偏好，不是收藏。
+ * 放在 localStorage 还有一次必须在渲染前读到（否则首屏会闪一下错误配色）。
+ */
+const THEME_KEY = 'animeko-web:theme'
+
+function localRead(key: string): string | null {
+  try {
+    return localStorage.getItem(key)
   } catch {
     return null
   }
 }
 
-function writeRaw(key: string, value: string): void {
+function localWrite(key: string, value: string): void {
   try {
-    localStorage.setItem(PREFIX + key, value)
+    localStorage.setItem(key, value)
   } catch {
-    // 存储不可用（隐私模式/超额）时静默失败
+    // 隐私模式/超额时静默失败：主题丢了不影响功能
   }
 }
-
-function removeRaw(key: string): void {
-  try {
-    localStorage.removeItem(PREFIX + key)
-  } catch {
-    /* ignore */
-  }
-}
-
-export function readJson<T>(key: string, fallback: T): T {
-  const raw = readRaw(key)
-  if (raw == null) return fallback
-  try {
-    return JSON.parse(raw) as T
-  } catch {
-    return fallback
-  }
-}
-
-export function writeJson(key: string, value: unknown): void {
-  writeRaw(key, JSON.stringify(value))
-}
-
-// ---------- 主题 ----------
-
-export type Theme = 'dark' | 'light'
-
-/** 各主题对应的浏览器 UI 色（<meta name="theme-color">），与 styles.css 的 --bg 保持一致 */
-const THEME_COLORS: Record<Theme, string> = { dark: '#0f1115', light: '#f5f6fa' }
 
 /** 同步 address bar / PWA 主题色，避免亮色主题下浏览器 UI 仍是暗色 */
 export function syncThemeColor(theme: Theme): void {
@@ -57,11 +278,11 @@ export function syncThemeColor(theme: Theme): void {
 }
 
 export function getTheme(): Theme {
-  return readRaw('theme') === 'light' ? 'light' : 'dark'
+  return localRead(THEME_KEY) === 'light' ? 'light' : 'dark'
 }
 
 export function setTheme(theme: Theme): void {
-  writeRaw('theme', theme)
+  localWrite(THEME_KEY, theme)
 }
 
 // ---------- 播放进度 ----------
@@ -78,21 +299,29 @@ export interface ProgressEntry {
 }
 
 function progressKeyOf(source: string, playUrl: string): string {
-  return `progress:${source}:${playUrl}`
+  return `${source}:${playUrl}`
 }
 
 export function getProgress(source: string, playUrl: string): ProgressEntry | null {
-  const entry = readJson<ProgressEntry | null>(progressKeyOf(source, playUrl), null)
+  const entry = asMap(progressMap())[progressKeyOf(source, playUrl)] as ProgressEntry | undefined
   if (entry == null || typeof entry.time !== 'number' || !(entry.time > 5)) return null
-  return entry
+  // 返回副本：调用方拿到文档里的活对象一改就绕过 flush，改动永远到不了服务器
+  return { ...entry }
 }
 
 export function setProgress(entry: ProgressEntry): void {
-  writeJson(progressKeyOf(entry.source, entry.playUrl), entry)
+  const key = progressKeyOf(entry.source, entry.playUrl)
+  const map = { ...progressMap(), [key]: entry }
+  writeProgressMap(map, key)
 }
 
 export function clearProgress(source: string, playUrl: string): void {
-  removeRaw(progressKeyOf(source, playUrl))
+  const key = progressKeyOf(source, playUrl)
+  const map = progressMap()
+  if (!(key in map)) return
+  const next = { ...map }
+  delete next[key]
+  writeProgressMap(next, key)
 }
 
 // ---------- 追番收藏 ----------
@@ -108,11 +337,11 @@ export interface FavoriteSubject {
 }
 
 export function listFavorites(): FavoriteSubject[] {
-  const list = readJson<FavoriteSubject[]>(`favorites`, [])
+  const list = readJson<FavoriteSubject[]>('favorites', [])
   if (!Array.isArray(list)) return []
-  // 逐字段归一化：localStorage 是外部输入面（被人改过 / 写入中断 / 旧版本残留），
+  // 逐字段归一化：文档可能来自旧版本、别的客户端，或被手工改过。
   // 只校验 id 的话，score 是字符串就会让 FavoritesPage 抛 toFixed is not a function，
-  // 而唯一的边界在 <Routes> 之上，于是整站变成错误页。
+  // 而唯一的错误边界在 <Routes> 之上，于是整站变成错误页。
   return list
     .filter((f) => f && typeof f.id === 'number')
     .map((f) => ({
@@ -131,7 +360,7 @@ export function isFavorite(id: number): boolean {
   return listFavorites().some((f) => f.id === id)
 }
 
-/** 收藏 ID 集合：列表页批量判断用，避免每条卡片全量解析 localStorage（O(n²)） */
+/** 收藏 ID 集合：列表页批量判断用，避免每张卡片都重新解析一遍文档（O(n²)） */
 export function favoriteIdSet(): Set<number> {
   return new Set(listFavorites().map((f) => f.id))
 }
@@ -165,7 +394,7 @@ export function addSearchHistory(q: string): string[] {
 }
 
 export function clearSearchHistory(): void {
-  removeRaw('searchHistory')
+  removeKey('searchHistory')
 }
 
 // ---------- 最近观看 ----------
@@ -204,4 +433,22 @@ export function addRecent(item: RecentItem): RecentItem[] {
   const next = [item, ...list].slice(0, RECENT_LIMIT)
   writeJson('recent', next)
   return next
+}
+
+/**
+ * 丢掉本机文档副本（注销、或服务端说会话已失效）。
+ * 之后任何写入都只会改内存，直到 loadUserData 重新拉到属于新会话的文档为止 ——
+ * 否则「用旧会话的残档去覆盖新会话的数据」这种事真的会发生。
+ */
+export function markUserDataStale(): void {
+  if (timer) {
+    clearTimeout(timer)
+    timer = undefined
+  }
+  pendingKeys.clear()
+  pendingProgressKeys.clear()
+  loaded = false
+  doc = {}
+  baseEtag = ''
+  setSync({ status: 'ready', kind: null, error: '' })
 }

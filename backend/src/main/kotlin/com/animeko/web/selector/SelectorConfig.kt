@@ -1,6 +1,7 @@
 package com.animeko.web.selector
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
 
 /**
  * animeko (open-ani) Selector 数据源配置模型。
@@ -25,8 +26,14 @@ data class SelectorSourceArguments(
     val description: String = "",
     val iconUrl: String = "",
     val searchConfig: SelectorSearchConfig = SelectorSearchConfig(),
-    val tier: String = "Fallback",
-    val channelTiers: Map<String, String> = emptyMap(),
+    /**
+     * animeko 侧的源优先级：社区配置里是整数（t0..t4），内置示例里是字符串（"Fallback"），
+     * 两种都出现过。本服务不做源优先级仲裁，这里只保证「能解析」，因此用 JsonElement 兼容任意写法。
+     */
+    val tier: JsonElement? = null,
+
+    /** 线路 -> 优先级，值同样是整数或字符串，见 [tier] */
+    val channelTiers: JsonElement? = null,
 )
 
 @Serializable

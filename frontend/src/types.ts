@@ -141,8 +141,10 @@ export interface SelectorSourceArguments {
   description: string
   iconUrl: string
   searchConfig: SelectorSearchConfig
-  tier?: string
-  channelTiers?: Record<string, string>
+  /** animeko 侧源优先级：社区配置里是数字（0..4），内置示例里是字符串，服务端不使用 */
+  tier?: number | string | null
+  /** 线路名 -> 优先级，值同上 */
+  channelTiers?: Record<string, number | string> | null
 }
 
 export interface StoredSource {
@@ -152,34 +154,41 @@ export interface StoredSource {
   arguments: SelectorSourceArguments
 }
 
-export interface DdEpisode {
-  episodeId: number
-  episodeTitle: string
-}
-
-export interface DdAnime {
-  animeId: number
-  animeTitle: string
-  type: string
-  episodes: DdEpisode[]
-}
-
-export interface DdComment {
-  cid: number
-  /** 出现时间（秒） */
-  time: number
-  text: string
-  /** 十进制 RGB */
-  color: number
-  /** 1 滚动 / 5 顶部 / 4 底部 */
-  mode: number
-}
-
-export interface DanmakuOptions {
+/** 聚合订阅里的一条可导入源（后端只回展示需要的字段） */
+export interface SubscriptionCandidate {
+  name: string
+  description: string
+  /** 订阅里可能是数字分级，也可能是字符串，后端已统一成文本 */
+  tier: string
+  /** 站点主机名，便于一眼看出来源 */
+  site: string
+  /** 本机已有同名源，导入会覆盖它 */
+  exists: boolean
   enabled: boolean
-  fontSize: number
-  opacity: number
-  speed: number
-  density: number
-  blockWords: string
+}
+
+export interface SubscriptionPreview {
+  subscription: string
+  candidates: SubscriptionCandidate[]
+  /** 结构不完整、导入后会变成死源的条目及原因 */
+  rejected: string[]
+}
+
+export interface SubscriptionImport {
+  added: string[]
+  updated: string[]
+  failed: string[]
+  rejected: string[]
+}
+
+/**
+ * 服务端个人数据文档。字段由前端定义、后端原样存取，
+ * 因此这里全部可选：老文档缺字段、新字段先上线都不能让页面崩。
+ */
+export interface UserData {
+  favorites?: unknown
+  recent?: unknown
+  searchHistory?: unknown
+  progress?: Record<string, unknown>
+  [key: string]: unknown
 }

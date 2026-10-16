@@ -14,13 +14,26 @@ data class AppConfig(
     /** 前端构建产物目录（Docker 镜像内为 /app/frontend） */
     val frontendDir: String = env("ANIMEKO_FRONTEND_DIR", "frontend/dist"),
 
-    // ---- 访问鉴权（默认关闭；公网暴露时建议开启）----
-    val authEnabled: Boolean = env("ANIMEKO_AUTH_ENABLED", "false").toBooleanStrictOrNull() ?: false,
-    /** Bearer Token 鉴权 */
+    // ---- 访问鉴权 ----
+    /** Bearer Token 鉴权（也可以只把它当登录页的口令用） */
     val authToken: String? = envOrNull("ANIMEKO_AUTH_TOKEN"),
-    /** Basic 鉴权 */
+    /** Basic 鉴权 / 登录页账号 */
     val authUser: String? = envOrNull("ANIMEKO_AUTH_USER"),
     val authPassword: String? = envOrNull("ANIMEKO_AUTH_PASSWORD"),
+    /**
+     * 是否启用鉴权。默认跟随凭据：配了 ANIMEKO_AUTH_TOKEN 或账号口令就自动开启，
+     * 这样「登录后才能用」是开箱行为，而不是要额外记一个开关。
+     * 显式写 ANIMEKO_AUTH_ENABLED=false 可以关掉（例如已有前置反代鉴权）。
+     */
+    val authEnabled: Boolean = env("ANIMEKO_AUTH_ENABLED", "").toBooleanStrictOrNull()
+        ?: (authToken != null || (authUser != null && authPassword != null)),
+    /**
+     * 会话 Cookie 是否加 Secure。默认 false：本机 8080 或 SSH 隧道都是 http，
+     * 加了 Secure 浏览器会直接丢弃 Set-Cookie，表现为「登录页反复回弹」。
+     * 反代配好 HTTPS 之后请设为 true。
+     */
+    val cookieSecure: Boolean =
+        env("ANIMEKO_COOKIE_SECURE", "false").toBooleanStrictOrNull() ?: false,
 
     // ---- 第三方服务 ----
     /**
@@ -36,10 +49,6 @@ data class AppConfig(
                     ?.let { listOf(it.trim().removeSuffix("/")) }
                     ?: listOf("https://api.bgm.tv", "https://bgmapi.anibt.net")
             },
-    /** 弹弹play 开放平台凭证，在 https://dev.dandanplay.com 申请 */
-    val danmakuAppId: String = env("ANIMEKO_DANMAKU_APP_ID", ""),
-    val danmakuAppSecret: String = env("ANIMEKO_DANMAKU_APP_SECRET", ""),
-
     val requestTimeoutMs: Long = env("ANIMEKO_REQUEST_TIMEOUT_MS", "20000").toLongOrNull() ?: 20_000,
     val proxyTimeoutMs: Long = env("ANIMEKO_PROXY_TIMEOUT_MS", "120000").toLongOrNull() ?: 120_000,
 
@@ -60,7 +69,9 @@ data class AppConfig(
         env("ANIMEKO_ALLOW_CROSS_ORIGIN", "false").toBooleanStrictOrNull() ?: false,
 ) {
     val selectorsDir: Path get() = dataDir.resolve("selectors")
-    val danmakuConfigured: Boolean get() = danmakuAppId.isNotBlank() && danmakuAppSecret.isNotBlank()
+
+    /** 个人数据（收藏/历史/进度）在服务端的落点 */
+    val userDataFile: Path get() = dataDir.resolve("userdata.json")
 
     companion object {
         fun env(key: String, default: String): String =
