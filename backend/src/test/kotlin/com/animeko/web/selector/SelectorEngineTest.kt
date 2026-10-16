@@ -93,6 +93,51 @@ class SelectorEngineTest {
     }
 
     @Test
+    fun `indexed format keeps names and links aligned when one entry has no title`() = runTest {
+        // 图片卡 / 广告位 / 「更多」链接常常只有链接没有文字。
+        // 旧实现先把两条列表各自 filter 掉空值再按位置 zip，少掉一个名字会让
+        // 后面所有条目整体错位一位：列表显示「番剧B」，点进去播的是 /ad.html。
+        val html = """
+            <html><body><div class="search-box">
+              <div class="thumb-content">
+                <div class="thumb-txt">番剧A</div>
+                <div class="thumb-txt"></div>
+                <div class="thumb-txt">番剧B</div>
+              </div>
+              <div class="thumb-menu">
+                <a href="/a/1.html">x</a>
+                <a href="/ad.html">x</a>
+                <a href="/a/2.html">x</a>
+              </div>
+            </div></body></html>
+        """.trimIndent()
+        val fetcher = StubFetcher(mapOf("$base/search" to html))
+        val hits = SelectorEngine(fetcher).search(
+            config(subjectFormatId = SubjectFormatIndexed.ID), "番剧",
+        )
+        assertEquals(
+            listOf("番剧A" to "$base/a/1.html", "番剧B" to "$base/a/2.html"),
+            hits.map { it.name to it.url },
+        )
+    }
+
+    @Test
+    fun `json path indexed drops null titles without shifting the remaining urls`() = runTest {
+        val body = """
+            [{"title":"JSON甲","url":"/j/1.html"},{"title":null,"url":"/ad.html"},{"title":"JSON乙","url":"/j/2.html"}]
+        """.trimIndent()
+        val fetcher = StubFetcher(mapOf("$base/search" to body))
+        val hits = SelectorEngine(fetcher).search(
+            config(subjectFormatId = SubjectFormatJsonPathIndexed.ID), "JSON",
+        )
+        // title 为 JSON null 时不能变成字面串 "null"，也不能让后面的地址前移一位
+        assertEquals(
+            listOf("JSON甲" to "$base/j/1.html", "JSON乙" to "$base/j/2.html"),
+            hits.map { it.name to it.url },
+        )
+    }
+
+    @Test
     fun `episodes with no-channel format`() = runTest {
         val fetcher = StubFetcher(mapOf("$base/anime/1.html" to fixture("detail_nochannel.html")))
         val cfg = config().copy(

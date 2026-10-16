@@ -31,7 +31,8 @@ interface Props {
   onNextEpisode?: () => void
   onProgress?: (time: number, duration: number) => void
   onEnded?: () => void
-  onError?: (message: string) => void
+  /** status 为清单请求的 HTTP 状态码（410=会话过期、403=目标不被允许），供上层决定重新解析 */
+  onError?: (message: string, status?: number) => void
 }
 
 function formatTime(seconds: number): string {
@@ -110,14 +111,16 @@ export default function VideoPlayer({
       hls.loadSource(src)
       hls.attachMedia(video)
       hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (data.fatal) {
-          const msg =
-            data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR
-              ? '视频清单加载失败（源站可能拒绝服务端代理，可尝试手动地址播放）'
-              : `播放错误: ${data.details}`
-          setError(msg)
-          onErrorRef.current?.(msg)
-        }
+        if (!data.fatal) return
+        // 清单加载失败时把 HTTP 状态码一起抛出：410 是「播放会话过期」，
+        // 与「源站拒绝代理」是两回事，上层据此自动重新解析一次
+        const status = (data.response as { code?: number } | undefined)?.code
+        const msg =
+          data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR
+            ? `视频清单加载失败（HTTP ${status ?? '未知'}，源站可能拒绝了服务端代理）`
+            : `播放错误: ${data.details}`
+        setError(msg)
+        onErrorRef.current?.(msg, status)
       })
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = src

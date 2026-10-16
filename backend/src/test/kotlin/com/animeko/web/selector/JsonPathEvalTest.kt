@@ -60,4 +60,12 @@ class JsonPathEvalTest {
         val v = JsonPathEval.evaluate("$[*]['missing']", root)!!
         assertTrue(v.isEmpty())
     }
+
+    @Test
+    fun `json null does not become the literal string null`() {
+        val root = Json.parseToJsonElement("""[{"title":null,"url":"/x"}]""")
+        val names = JsonPathEval.evaluate("\$[*]['title','name']", root)!!
+            .map { JsonPathEval.singleString(it) }
+        assertEquals(listOf<String?>(null), names)
+    }
 }

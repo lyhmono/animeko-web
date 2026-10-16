@@ -1,5 +1,6 @@
 package com.animeko.web.selector
 
+import com.animeko.web.appLog
 import com.animeko.web.http.Fetcher
 import com.animeko.web.http.HttpResult
 import com.animeko.web.http.UrlGuard
@@ -185,11 +186,36 @@ class SelectorEngine(
 
     private fun selectIndexed(doc: Document, cfg: SelectorSearchConfig, base: String): List<SubjectHit> {
         val c = cfg.selectorSubjectFormatIndexed
-        val names = queryAll(doc, c.selectNames)?.map { it.text().trim() }?.filter { it.isNotBlank() }
-            ?: return emptyList()
-        val links = queryAll(doc, c.selectLinks)?.map { it.attr("href") }?.filter { it.isNotBlank() }
-            ?: return emptyList()
-        return names.zip(links) { name, href -> SubjectHit(name, applyLink(c.linkTemplate, href, base)) }
+        val names = queryAll(doc, c.selectNames)?.map { it.text().trim() } ?: return emptyList()
+        val links = queryAll(doc, c.selectLinks)?.map { it.attr("href") } ?: return emptyList()
+        return pairIndexed(names, links, c.linkTemplate, base)
+    }
+
+    /**
+     * 两条列表按下标配对，且**先配对再丢空**。
+     * 之前是各自先 filter 再 zip：图片卡、广告位、「更多」链接常常只有链接没有文字，
+     * 少掉一个名字会让后面所有条目整体错位一位 —— 列表显示 A 番，点进去播的是 B，
+     * 而且全程不报错，是比失败更糟的静默错误结果。
+     */
+    private fun pairIndexed(
+        names: List<String>,
+        links: List<String>,
+        linkTemplate: String?,
+        base: String,
+    ): List<SubjectHit> {
+        // 两条列表长度不一致说明有一侧的选择器没匹配到全部条目。zip 会静默截断，
+        // 用户只会看到「结果比页面上少几个」且无从下手，这里至少留一条日志。
+        if (names.size != links.size) {
+            appLog.warn(
+                "indexed 条目格式两条列表长度不一致（names={} links={}），多余条目已被丢弃，请检查两条选择器",
+                names.size,
+                links.size,
+            )
+        }
+        return names.zip(links) { name, href ->
+            if (name.isBlank() || href.isBlank()) null
+            else SubjectHit(name, applyLink(linkTemplate, href, base))
+        }.filterNotNull()
     }
 
     private fun selectJsonPathIndexed(body: String, cfg: SelectorSearchConfig, base: String): List<SubjectHit> {
@@ -199,15 +225,14 @@ class SelectorEngine(
         } catch (e: Exception) {
             return emptyList()
         }
+        // 保留位置（取不到字符串就置空串）再配对，理由同 pairIndexed
         val urls = JsonPathEval.evaluate(c.selectLinks, root)
-            ?.mapNotNull { JsonPathEval.singleString(it) }
-            ?.filter { it.isNotBlank() }
+            ?.map { JsonPathEval.singleString(it).orEmpty() }
             ?: return emptyList()
         val names = JsonPathEval.evaluate(c.selectNames, root)
-            ?.mapNotNull { JsonPathEval.singleString(it) }
-            ?.filter { it.isNotBlank() }
+            ?.map { JsonPathEval.singleString(it).orEmpty() }
             ?: return emptyList()
-        return names.zip(urls) { name, href -> SubjectHit(name, applyLink(c.linkTemplate, href, base)) }
+        return pairIndexed(names, urls, c.linkTemplate, base)
     }
 
     // ---------- 线路/剧集格式实现 ----------

@@ -116,6 +116,13 @@ export default function PlayerPage() {
   const lastWriteRef = useRef<number | null>(null)
   const stageRef = useRef<HTMLDivElement | null>(null)
   const resolveSeqRef = useRef(0)
+  // 播放会话过期后自动重新解析一次（暂停超过 TTL 会让所有分片 410），
+  // 再失败就只报错，避免无界重试
+  const [resolveNonce, setResolveNonce] = useState(0)
+  const retriedKeyRef = useRef<string | null>(null)
+  // 只在「换了一部剧/一集」时清空重试标记：effect 也依赖 resolveNonce，
+  // 无条件清空会让每次自动重解析都重置额度，变成无界重试
+  const resetForRef = useRef<string | null>(null)
 
   useEffect(() => {
     writeJson(DANMAKU_PREFS_KEY, prefs)
@@ -126,6 +133,11 @@ export default function PlayerPage() {
     if (!source || !playUrl) return
     setError('')
     lastWriteRef.current = null
+    const playKey = `${source}|${playUrl}`
+    if (resetForRef.current !== playKey) {
+      resetForRef.current = playKey
+      retriedKeyRef.current = null
+    }
     // source=manual：playUrl 即媒体直链，跳过数据源解析直接经 /api/proxy 播放。
     // 手动地址播放写入的最近观看条目以此为 source，点击卡片可立即重放。
     // 注意：manual 是保留源名，若用户把数据源命名为 manual 会走错分支（概率极低，
@@ -161,7 +173,7 @@ export default function PlayerPage() {
       .finally(() => {
         if (seq === resolveSeqRef.current) setResolving(false)
       })
-  }, [source, playUrl, title, animeName, ep])
+  }, [source, playUrl, title, animeName, ep, resolveNonce])
 
   // 断点续播：读取历史进度
   useEffect(() => {
@@ -289,7 +301,17 @@ export default function PlayerPage() {
             onNextEpisode={nextInfo ? gotoNext : undefined}
             onProgress={handleProgress}
             onEnded={handleEnded}
-            onError={(msg) => setError(msg)}
+            onError={(msg, status) => {
+              const key = `${source}|${playUrl}`
+              // 410=会话过期、403=sid 与目标主机不匹配：重新解析即可拿到新会话
+              if ((status === 410 || status === 403) && retriedKeyRef.current !== key) {
+                retriedKeyRef.current = key
+                setError('播放会话已过期，正在重新解析地址…')
+                setResolveNonce((n) => n + 1)
+                return
+              }
+              setError(msg)
+            }}
           />
         )}
         {!src && (

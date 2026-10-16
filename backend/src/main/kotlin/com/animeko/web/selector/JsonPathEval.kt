@@ -3,6 +3,7 @@ package com.animeko.web.selector
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.JsonPrimitive
 
 /**
@@ -136,7 +137,9 @@ object JsonPathEval {
     fun singleString(e: JsonElement?): String? = when (e) {
         is JsonArray -> e.firstOrNull()?.let { singleString(it) }
         is JsonObject -> e.values.firstOrNull()?.let { singleString(it) }
-        is JsonPrimitive -> e.content
+        // JSON 的 null 也是 JsonPrimitive，content 会给出字面串 "null"，
+        // 于是空字段能被当成有效标题/链接；contentOrNull 才对 null 返回 null
+        is JsonPrimitive -> e.contentOrNull
         else -> null
     }
 }

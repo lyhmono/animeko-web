@@ -227,7 +227,12 @@ fun Application.configureApiRoutes(
                 } else {
                     val target = engine.resolveVideo(source.arguments.searchConfig, playUrl)
                     // 凭据换成服务端会话号后再交给前端：浏览器只需要一个能用的代理地址
-                    val sid = sessions.put(target.userAgent, target.referer, target.cookie)
+                    val sid = sessions.put(
+                        mediaUrl = target.url,
+                        userAgent = target.userAgent,
+                        referer = target.referer,
+                        cookie = target.cookie,
+                    )
                     call.respond(
                         VideoSourceResponse(
                             url = target.url,
@@ -392,13 +397,24 @@ private suspend fun proxyVideo(
     val sid = call.request.queryParameters["sid"]?.trim().orEmpty()
     val headers = LinkedHashMap<String, String>()
     if (sid.isNotEmpty()) {
-        val stored = sessions.headers(sid)
-        if (stored == null) {
+        // sid 是能力令牌，必须绑定目标主机：否则拿到一个 sid 就能用受害者的
+        // Cookie 去请求攻击者指定的任意地址。
+        val grant = sessions.grant(sid, url)
+        when (grant.kind) {
             // 会话过期与「源站拒绝」必须可区分，否则排查播放故障只能猜
-            call.respond(HttpStatusCode.Gone, mapOf("error" to "PROXY_SESSION_EXPIRED"))
-            return
+            ProxySessionStore.Kind.EXPIRED -> {
+                call.respond(HttpStatusCode.Gone, mapOf("error" to "PROXY_SESSION_EXPIRED"))
+                return
+            }
+            ProxySessionStore.Kind.HOST_NOT_ALLOWED -> {
+                call.respond(
+                    HttpStatusCode.Forbidden,
+                    mapOf("error" to "PROXY_SESSION_TARGET_MISMATCH"),
+                )
+                return
+            }
+            ProxySessionStore.Kind.GRANTED -> headers.putAll(grant.headers)
         }
-        headers.putAll(stored)
     }
     call.request.headers["Range"]?.let { if (it.isNotBlank()) headers["Range"] = it }
 
@@ -431,6 +447,9 @@ private suspend fun proxyVideo(
     if (isHls) {
         val text = readCapped(result.body, MAX_PLAYLIST_BYTES)
         val rewritten = HlsRewriter.rewrite(text, url, sid = sid)
+        // 分片与密钥常在另一个主机（清单域 vs CDN 域）：由服务端从清单内容里登记，
+        // 客户端无法自行扩大允许范围
+        sessions.allowPlaylistHosts(sid, rewritten)
         call.respondText(rewritten, ContentType.parse("application/vnd.apple.mpegurl"))
         return
     }

@@ -27,6 +27,7 @@ import io.ktor.server.plugins.compression.gzip
 import io.ktor.server.plugins.compression.matchContentType
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.statuspages.StatusPages
+import io.ktor.server.request.path
 import io.ktor.server.response.respond
 import io.ktor.server.routing.routing
 import kotlinx.serialization.json.Json
@@ -63,6 +64,8 @@ fun Application.module(
         }
     }
     install(StatusPages) {
+        // 日志里只记路径、不记完整查询串：/api/proxy 的查询串含 sid（能力令牌）
+        // 与媒体地址，落进日志文件就等于一份可重放的代理 URL
         exception<SelectorException> { call, cause ->
             call.respond(HttpStatusCode.BadGateway, mapOf("error" to (cause.message ?: "selector error")))
         }
@@ -74,11 +77,11 @@ fun Application.module(
         // 拒绝原因里带着「主机名 -> 内网 IP」的映射，对任何能连到这台机器的人都是网络拓扑泄露，
         // 所以细节只进日志。目标被 SSRF 规则拦下：明确 403，而不是混进 500
         exception<UrlGuard.Blocked> { call, cause ->
-            appLog.warn("拒绝访问受限目标: {} <- {}", cause.message, call.request.local.uri)
+            appLog.warn("拒绝访问受限目标: {} <- {}", cause.message, call.request.path())
             call.respond(HttpStatusCode.Forbidden, mapOf("error" to "目标地址不被允许（仅允许公网 http/https）"))
         }
         exception<UpstreamException> { call, cause ->
-            appLog.warn("上游失败: {} <- {}", cause.message, call.request.local.uri)
+            appLog.warn("上游失败: {} <- {}", cause.message, call.request.path())
             call.respond(HttpStatusCode.BadGateway, mapOf("error" to (cause.message ?: "upstream error")))
         }
         // 弹幕未配置属于服务端缺配置，返回 503 而不是被兜底当成内部错误。
@@ -93,7 +96,7 @@ fun Application.module(
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to (cause.message ?: "bad request")))
         }
         exception<Throwable> { call, cause ->
-            appLog.error("未处理异常: {}", call.request.local.uri, cause)
+            appLog.error("未处理异常: {}", call.request.path(), cause)
             // 兜底不回显 cause.message：里面常带路径/上游地址等内部信息，日志里已有完整堆栈
             call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "INTERNAL_ERROR"))
         }
