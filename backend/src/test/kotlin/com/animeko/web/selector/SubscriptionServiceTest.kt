@@ -271,4 +271,45 @@ class SubscriptionServiceTest {
             )
         }
     }
+
+    @Test
+    fun `auto import keeps a source the user switched off`() = runTest {
+        // 界面上关掉一个源，一定是试过之后判定它不可用；
+        // 自动导入若每次重启都把它打开，等于替用户重做他拒绝过的决定
+        val (svc, repo) = service(aggregate, existing("嘀嗒影视"))
+        assertTrue(repo.setEnabled("嘀嗒影视", false))
+
+        // 「正则有害的源」结构合法但正则编译不过，save 会拒——只记日志，不影响其余
+        val report = svc.autoImport(listOf("https://sub.example.test/css.json"), emptySet())
+
+        assertTrue(report.single().endsWith("→ 2/3 个"), report.toString())
+        assertFalse(repo.find("嘀嗒影视")!!.enabled, "已关掉的源必须保持关闭")
+        assertTrue(repo.find("稀饭动漫")!!.enabled, "新导入的源默认启用")
+    }
+
+    @Test
+    fun `auto import honours the tier whitelist`() = runTest {
+        val (svc, repo) = service(aggregate)
+        svc.autoImport(listOf("https://sub.example.test/css.json"), setOf("0"))
+
+        val names = repo.list().map { it.arguments.name }
+        assertTrue("稀饭动漫" in names, names.toString())
+        assertFalse("嘀嗒影视" in names, "tier 1 不在白名单里，不该导进来")
+    }
+
+    @Test
+    fun `a dead subscription url does not sink the other urls`() = runTest {
+        // 一个订阅站挂了，只会少一批源，不能连带第二个订阅也不导入
+        val repo = SelectorRepository(Files.createTempDirectory("animeko-sub"))
+        val fetcher = StubFetcher(mapOf("https://sub.example.test/css.json" to aggregate))
+        val svc = SubscriptionService(fetcher, repo, allowPrivateTargets = false)
+
+        val report = svc.autoImport(
+            listOf("https://gone.example.test/a.json", "https://sub.example.test/css.json"),
+            emptySet(),
+        )
+        assertTrue(report[0].endsWith("→ 失败 个"), report.toString())
+        assertTrue(report[1].endsWith("→ 2/3 个"), report.toString())
+        assertEquals(2, repo.list().size)
+    }
 }

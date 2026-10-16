@@ -11,17 +11,29 @@
 | 模块 | 说明 |
 |---|---|
 | Bangumi 元数据 | 搜索 / 条目详情 / 剧集列表（开放 API，无需密钥） |
-| Selector 数据源 | 可直接导入 animeko 社区配置（`factoryId: web-selector`，version 2，含 tier 为数字的社区格式）；支持 CSS / XPath / JsonPath 条目格式、线路分组、剧集集号正则。`factoryId` 只接受 `web-selector`：社区订阅里混装的 BT / PikPak 源会被明确拒绝，而不是被当成网页源存下来、搜索永远 0 结果。**注意**：与采集相关的字段全部生效，而 `tier`、`channelTiers`、`defaultResolution`、`defaultSubtitleLanguage`、`onlySupportsPlayers`、`selectMedia`、`searchCacheTtl` 这些属于 App 侧选择策略的字段会被接受但**忽略**（服务端不做画质/字幕/源优先级仲裁） |
+| Selector 数据源 | 可直接导入 animeko 社区配置（`factoryId: web-selector`，version 2，含 tier 为数字的社区格式）；支持 CSS / XPath / JsonPath 条目格式、线路分组、剧集集号正则，并从条目的 `<img>`（含 `data-src` 懒加载属性）与 JsonPath 字段里提取**封面图**。`factoryId` 只接受 `web-selector`：社区订阅里混装的 BT / PikPak 源会被明确拒绝，而不是被当成网页源存下来、搜索永远 0 结果。**注意**：与采集相关的字段全部生效，而 `tier`、`channelTiers`、`defaultResolution`、`defaultSubtitleLanguage`、`onlySupportsPlayers`、`selectMedia`、`searchCacheTtl` 这些属于 App 侧选择策略的字段会被接受但**忽略**（服务端不做画质/字幕/源优先级仲裁） |
 | 登录门控 | 打开站点先进登录页，会话是服务端签发的 HttpOnly + SameSite=Strict Cookie（`<video>`、封面、hls.js 分片都能自动带上）；口令错误按 IP 限速 |
 | 服务端个人数据 | 收藏 / 观看进度 / 最近观看 / 搜索历史存在 `ANIMEKO_DATA_DIR/userdata.json`，换设备或清浏览器缓存都不丢 |
-| 聚合订阅导入 | 填一条订阅 URL（`{exportedMediaSourceDataList:{mediaSources:[…]}}`）先预览，再勾选要导入的几个源；也可粘贴订阅正文 |
+| 聚合订阅导入 | 填一条订阅 URL（`{exportedMediaSourceDataList:{mediaSources:[…]}}`）先预览，再勾选要导入的几个源；也可粘贴订阅正文。想彻底免去手动勾选，用 `ANIMEKO_SUBSCRIPTION_AUTO_IMPORT` 开机自动导入（见环境变量） |
 | 视频代理 | Range 透传、服务端会话化的 UA/Referer/Cookie 注入、HLS(m3u8) 清单与分片重写（分片同样带防盗链凭据）、逐跳校验的重定向跟随、内网地址拦截 |
 | 播放器 | hls.js（m3u8）+ 原生 mp4/webm；倍速、进度、音量、全屏；**手动地址播放**兜底 |
 | 播放体验 | 键盘快捷键（空格/`K` 播放暂停、`←`/`→` ±5 秒、`J`/`L` ±10 秒、`↑`/`↓` 音量、`M` 静音、`F` 全屏）、**断点续播**、**自动连播**（下一集倒计时） |
-| 个人数据 | 追番收藏、最近观看、搜索历史、每集观看进度 —— 全部存服务器的 `userdata.json`，**不写浏览器 localStorage**（只有主题这一个设备偏好留在本地，因为它必须在首屏渲染前读到） |
-| 界面 | 登录页 + 暗色 / 亮色双主题、响应式布局，桌面与手机浏览器均可；页脚常驻「已保存 / 待保存 / 未同步」状态点 |
+| 个人数据 | 追番收藏、**数据源收藏**（没有 Bangumi 条目的源站作品也能收）、最近观看、搜索历史、每集观看进度 —— 全部存服务器的 `userdata.json`，**不写浏览器 localStorage**（只有主题这一个设备偏好留在本地，因为它必须在首屏渲染前读到） |
+| 界面 | 登录页 + 暗色 / 亮色双主题、响应式布局，桌面与手机浏览器均可；**顶栏常驻搜索框**（在任何页面都能改关键词，不必回首页）；搜索结果按**海报卡片**排布（源站结果同样带封面），**结果逐个回填**（不被最慢的死源拖着，见下方说明）；页脚常驻「已保存 / 待保存 / 未同步」状态点。封面直连失败时自动改走 `/api/proxy` 回退，避免源站防盗链导致一片灰图；两条路都不通时落到统一的占位块而不是留个空洞 |
 
-与 animeko App 的差异：App 用 WebView 拦截网络请求提取视频地址，服务端版改为抓播放页 HTML 后用 `matchVideo` 正则匹配（覆盖绝大多数源）；强依赖 JS 执行的源可用播放页「手动地址播放」兜底。
+与 animeko App 的差异：App 用 WebView 拦截网络请求提取视频地址，服务端版改为抓播放页 HTML，
+先用数据源自带的 `matchVideo` 正则匹配，**配置没命中时再按通用视频后缀**（`.m3u8`/`.mp4`/`.mkv`/`.flv`）
+兜底认一次。加上这一步是因为社区配置里的 `matchVideoUrl` 往往是一份 **CDN 域名白名单**，
+而源站换 CDN 比改配置勤得多 —— 只按配置匹配就会出现「页面里明明写着 `index.m3u8`，
+却报 NO_VIDEO_URL_FOUND」（实测订阅里就有这种源，加兜底后立刻可播）。走兜底会记一条 INFO 日志，
+方便你回头更新那份配置。
+
+仍有一类源服务端拿不到地址，报错同样是 NO_VIDEO_URL_FOUND，但**不是本项目的问题**：
+`player_aaaa.encrypt` 为 `2/3` 的源，地址是站点 JS 用密钥解出来的密文
+（实测 `encrypt=3` 那串 hex→base64 之后是 AES 密文，整个页面里没有一处明文 m3u8/mp4）；
+以及地址要前端调 JSON 接口才拿到的站。这两类只有浏览器执行 JS 后才看得到地址，
+服务端无法还原（逐个逆向等于和站点对抗）。用播放页的「手动地址播放」兜底：
+浏览器 F12 → Network → 过滤 `m3u8`，把那条地址粘进去即可。
 
 ## 快速开始（Docker）
 
@@ -96,6 +108,8 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 | `ANIMEKO_BANGUMI_BASE_URLS` | `https://api.bgm.tv,https://bgmapi.anibt.net` | Bangumi API 地址列表（逗号分隔，按顺序故障转移；官方域名在部分地区被墙，可改用社区镜像） |
 | `ANIMEKO_REQUEST_TIMEOUT_MS` | `20000` | 元数据/抓取类出站请求超时 |
 | `ANIMEKO_PROXY_TIMEOUT_MS` | `120000` | 视频代理的连接与**响应头**超时（body 阶段刻意不设时限，见下方安全说明） |
+| `ANIMEKO_SUBSCRIPTION_AUTO_IMPORT` | 空 | 开机自动导入的聚合订阅地址（逗号分隔可多个），免去每次去界面里勾选。**只覆盖同名源、只增不删**，且沿用本机已有的启用/关闭状态——你在界面上关掉的源，重启后仍然是关掉的。订阅站挂了只写日志，不影响服务启动 |
+| `ANIMEKO_SUBSCRIPTION_AUTO_TIERS` | 空 | 自动导入时的 tier 白名单（逗号分隔，如 `0,1`；tier 越低质量越好）。空=全导。**只作用于自动导入**，界面里的勾选导入不受限制 |
 
 ### 接口一览
 
@@ -186,6 +200,11 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 - 前端数据层在**没读到服务器文档时禁止回写**（读取失败保持「未同步」状态并可重试）。
   这不是保守，是必须的：否则「读失败 → 文档视作空 → 一次收藏点击」就会把
   `{favorites:[…]}` 整份覆盖上去，收藏、进度、历史当场清零。
+- 搜索页**逐个回填结果**，且对数据源搜索**限制并发为 3**。两条都是浏览器里实测出来的：
+  攒齐再渲染时，几个死源各自要等 20 秒超时，这期间所有源都显示「0 个结果」，看起来像功能坏了；
+  而全部源一起发请求会占满浏览器对同一来源的 6 条连接，连 `/api/health`、`/api/data`
+  都要排在超时后面 —— 真实症状是**重开标签页时整个应用卡在「正在连接服务器…」**。
+  换关键词或离开页面时还会 `abort()` 在飞请求，光靠「不采用结果」不够，连接仍然被占着。
 - 所有出站目标（`/api/proxy`、数据源页面、订阅地址）统一过 `UrlGuard`：拒绝
   127.0.0.0/8、10/192.168/172.16 私有段、169.254.169.254 元数据地址、`*.localhost`/`*.internal`
   等，并且**重定向的每一跳都重新校验**（只校验入口地址时，一条 302 就能把服务变成内网跳板）。
@@ -232,7 +251,9 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
    - Bangumi 条目页 → 剧集「播放」→ 选择数据源「自动匹配」（或「手动」）→ 自动在数据源中匹配番剧与集数；
    - 或数据源搜索结果 →「剧集」→ 选线路播放；
    - 解析失败时在播放页底部「手动地址播放」粘贴 m3u8/mp4 地址。
+   - **解析失败的三种原因**，报错文案里都区分得出来：① 播放页里根本没有可提取的地址（`NO_VIDEO_URL_FOUND`，多是强依赖 JS 执行的源，服务端拿不到地址，只能手动播放）；② 地址提到了但上游拒绝本机（`403/401` 或连不上，常见于只对国内 IP 开放的 CDN，境外 VPS 无解，换国内线路的源即可）；③ 源站超时（`ANIMEKO_REQUEST_TIMEOUT_MS` 可调，但别指望调大能救死站）。
 4. **聚合订阅**：数据源页填一条社区订阅地址（如 `https://sub.creamycake.org/v1/css1.json`）→「拉取订阅」→ 列表里能看到每个源的名字、分级、站点主机名与是否已存在 → 勾选后导入。整包导入的坏处是每次搜索都要把打不开的站点各试一遍，所以默认只勾选「本机还没有」的那些。订阅站挂了可以展开「贴订阅正文」直接粘 JSON。预览时会记录内容指纹，导入时若订阅已被更新过会提示重新预览，避免按一份和刚看到的不一样的清单导入。
+   **不想每次都手动勾**：设 `ANIMEKO_SUBSCRIPTION_AUTO_IMPORT=https://sub.creamycake.org/v1/css1.json`（compose 里已默认写好），服务每次启动自动导入，再配 `ANIMEKO_SUBSCRIPTION_AUTO_TIERS=0,1` 只留高质量分级。自动导入只覆盖同名源、不删你手工加的源，也不会重启你关掉的源。
 5. **登录**：首次打开是登录页，输入账号口令后由服务端签发会话 Cookie；退出登录会让会话在服务端立即作废。
 6. **追番与连播**：条目页点「收藏」加入追番列表（导航栏「收藏」查看）；从剧集列表进入播放时会自动带上下一集，当前集播放结束后倒计时自动连播。
 7. **播放快捷键**：`空格`/`K` 播放暂停、`←`/`→` ±5 秒、`J`/`L` ±10 秒、`↑`/`↓` 音量、`M` 静音、`F` 全屏。播放进度自动记忆（写在服务器），下次进入同一剧集时可「继续播放」。
@@ -338,14 +359,17 @@ cd frontend && NODE_ENV=development npm install && npm run dev   # http://localh
   而 `npm install` 本身是成功退出 0 的。
 - **起服务要带 UTF-8 locale**（原因见上面「社区数据源哪里找」）。
 
-单元测试：`cd backend && ./gradlew test` —— 150+ 个用例，覆盖 JsonPath / Selector 引擎与数据源仓库 /
-聚合订阅（含逐跳重定向、订阅内重名、坏条目单独失败、预览指纹防内容漂移）/ HLS 重写 /
+单元测试：`cd backend && ./gradlew test` —— 169 个用例，覆盖 JsonPath / Selector 引擎与数据源仓库 /
+聚合订阅（含逐跳重定向、订阅内重名、坏条目单独失败、预览指纹防内容漂移、自动导入沿用已关闭的源、
+一个订阅挂了不连带其它订阅）/ HLS 重写 /
 代理会话绑定与过期 / 登录会话与限速（含 XFF 伪造与可信代理层数）/ 凭据预言机 /
 路径写法绕过 / 个人数据落盘与条件写 / SSRF 拦截不回显内网地址 / 候选 URL 尾缀净化 /
+条目封面三种形态（自身属性、子树 img、同容器平级缩略图，含「不许拿邻居的图」）/
+配置正则过期时的通用后缀兜底（且配置命中优先）/
 停用源服务端拒绝 / API 路由与静态托管缓存策略 / Bangumi 客户端。要求 0 编译警告。
 GitHub Actions（`.github/workflows/ci.yml`）在 push/PR 上自动跑后端测试与前端 `tsc + vite build`。
 
-端到端冒烟（对**真实二进制**跑，不是测试桩）：`bash scripts/live-smoke.sh` —— 12 节 71 项，
+端到端冒烟（对**真实二进制**跑，不是测试桩）：`bash scripts/live-smoke.sh` —— 13 节 78 项，
 含登录门控、服务端个人数据往返与 ETag/409、真实订阅站预览导入、静态缓存策略、
 注销后会话不可复用、限速、`--path-as-is` 的绕过探针、以及 LANG 缺失时的自检结论。
 它需要 `./gradlew installDist` 与 `cd frontend && npm run build` 的产物；
@@ -386,7 +410,8 @@ animeko-web/
 
 - [x] Bangumi 元数据 / Selector 引擎 / HLS 代理 / 手动地址播放
 - [x] 登录门控 + 服务端会话 + 个人数据上服务器
-- [x] 聚合订阅预览与挑源导入
+- [x] 聚合订阅预览与挑源导入，以及 `ANIMEKO_SUBSCRIPTION_AUTO_IMPORT` 开机自动导入
+- [x] 搜索结果海报（含懒加载属性与 stui/myui 的「标题与缩略图平级」形态）+ 数据源收藏
 - [ ] BT / PikPak 数据源（animeko 的 bt 模块）
 - [ ] RSS 数据源（animeko 的 RssMediaSource）
 - [x] 断点续播与播放记忆

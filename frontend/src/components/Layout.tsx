@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { NavLink, Outlet } from 'react-router-dom'
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import {
   getSyncState,
   onSyncChange,
@@ -38,6 +38,14 @@ export default function Layout() {
   const [theme, setThemeState] = useState<Theme>(getTheme)
   const [sync, setSyncState] = useState<SyncState>(getSyncState)
   const user = rememberedUser()
+  const navigate = useNavigate()
+  const location = useLocation()
+  // 顶栏搜索框：之前搜索框只在首页，进到 /search 之后想换个关键词必须回首页，
+  // 而浏览器地址栏里就是搜索结果 —— 实测用户会以为「不能改搜索词」。
+  const [term, setTerm] = useState(() => new URLSearchParams(location.search).get('q') ?? '')
+  useEffect(() => {
+    setTerm(new URLSearchParams(location.search).get('q') ?? '')
+  }, [location.search])
 
   // 个人数据是「写内存 + 去抖回传服务端」的，界面必须能说出到底存上了没有，
   // 否则用户只能靠「收藏还在不在」来猜网络状况
@@ -70,6 +78,23 @@ export default function Layout() {
           <span className="dot" />
           Animeko Web
         </NavLink>
+        <form
+          className="nav-search"
+          role="search"
+          onSubmit={(e) => {
+            e.preventDefault()
+            const q = term.trim()
+            if (q) navigate(`/search?q=${encodeURIComponent(q)}`)
+          }}
+        >
+          <input
+            type="search"
+            aria-label="搜索番剧名称"
+            placeholder="搜索番剧"
+            value={term}
+            onChange={(e) => setTerm(e.target.value)}
+          />
+        </form>
         <div className="nav-links">
           <NavLink to="/" end title="首页">
             <IconHome size={16} className="nav-icon" />

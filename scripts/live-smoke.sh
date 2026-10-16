@@ -11,14 +11,18 @@ bad()  { echo "  FAIL $1: $2"; fail=$((fail+1)); }
 check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expect [$2] got [$3]"; fi; }
 contains() { case "$3" in *"$2"*) ok "$1";; *) bad "$1" "输出里没有 [$2]：$(printf '%s' "$3" | head -c 220)";; esac; }
 
-start() { # dataDir port [nolang]
+start() { # dataDir port [nolang] [extraEnv...]
   local d=$1 p=$2 nolang=${3:-}
+  local extra=""
+  [ $# -gt 3 ] && extra="${*:4}"
   local pre="env"
   # 故意不带 LANG 起第二个实例：模拟裸 java -jar 部署（Docker 镜像里已经设了 C.UTF-8）
   [ -n "$nolang" ] && pre="env -u LANG -u LC_ALL"
+  # 额外变量放在 `env` 之后而不是和前面那些赋值并列：shell 只认命令字之前
+  # 字面写出来的赋值，变量展开出来的 A=b 会被当成命令名（No such file or directory）
   ( ANIMEKO_DATA_DIR=$d ANIMEKO_AUTH_USER=me ANIMEKO_AUTH_PASSWORD='s3cret-pass' \
     ANIMEKO_PORT=$p ANIMEKO_HOST=127.0.0.1 ANIMEKO_FRONTEND_DIR=$DIST \
-    $pre $BIN ) > "$d/server.log" 2>&1 &
+    $pre $extra $BIN ) > "$d/server.log" 2>&1 &
   echo $! > "$d/pid"
   for _ in $(seq 1 80); do
     curl -fsS -m 2 "http://127.0.0.1:$p/api/health" >/dev/null 2>&1 && return 0
@@ -174,6 +178,51 @@ check "拿着旧版本覆盖会被拒" "409" "$(curl -sS -b "$C/j.txt" -o /dev/n
 contains "冲突有可识别的错误码" 'DATA_STALE' "$(curl -sS -b "$C/j.txt" -m5 -X PUT "$CB/api/data" -H "If-Match: \"$ET\"" -d '{"favorites":[]}')"
 check "带着当前版本可以写" "200" "$(curl -sS -b "$C/j.txt" -o /dev/null -w '%{http_code}' -m5 -X PUT "$CB/api/data" -H "If-Match: \"$ET2\"" -d '{"favorites":[{"id":2}]}')"
 stop $C
+
+echo "== 13. 开机自动导入订阅（compose 里默认打开的那条路径）"
+# 数据目录直接用一个全新子目录，重启时**不删**，这样才等价于「容器重启、卷还在」
+E=/tmp/animeko-live-e
+rm -rf $E; mkdir -p $E
+SUBENV="ANIMEKO_SUBSCRIPTION_AUTO_IMPORT=$SUB ANIMEKO_SUBSCRIPTION_AUTO_TIERS=0"
+start $E 18094 "" "$SUBENV" || exit 1
+EB=http://127.0.0.1:18094
+curl -sS -m 5 -c $E/j.txt -X POST $EB/api/session/login -d '{"username":"me","password":"s3cret-pass"}' > /dev/null
+# 自动导入跑在后台协程里，起来到导完之间有几秒空档，等到源真的出现为止
+wait_import() { # base jar
+  local n=0
+  while [ "$n" -lt 40 ]; do
+    curl -sS -b "$2" -m 8 "$1/api/selector/sources" | grep -q '稀饭动漫' && return 0
+    n=$((n+1)); sleep 1
+  done
+  return 1
+}
+wait_import $EB $E/j.txt
+check "启动日志记了导入结果" "1" "$(grep -c '订阅自动导入完成' "$E/server.log")"
+S1=$(curl -sS -b $E/j.txt -m 8 "$EB/api/selector/sources")
+check "t0 白名单里的源导进来了" "1" "$(echo "$S1" | grep -c 稀饭动漫)"
+check "tier 0 之外的源没被塞进来" "0" "$(echo "$S1" | grep -c 影视森林)"
+# 关掉的源不能因为重启被偷偷打开：那是替用户重做他明确拒绝过的决定
+curl -sS -b $E/j.txt -m 8 -X POST "$EB/api/selector/sources/%E7%A8%80%E9%A5%AD%E5%8A%A8%E6%BC%AB/enable" \
+  -d '{"enabled":false}' > /dev/null
+check "手工关掉稀饭动漫" '"enabled":false' "$(curl -sS -b $E/j.txt -m 8 "$EB/api/selector/sources" | grep -o '"enabled":false' | head -1)"
+stop $E
+start $E 18093 "" "$SUBENV" || exit 1
+EB=http://127.0.0.1:18093
+curl -sS -m 5 -c $E/j2.txt -X POST $EB/api/session/login -d '{"username":"me","password":"s3cret-pass"}' > /dev/null
+n=0
+while [ "$n" -lt 40 ]; do
+  S2=$(curl -sS -b $E/j2.txt -m 8 "$EB/api/selector/sources")
+  echo "$S2" | grep -q '稀饭动漫' && break
+  n=$((n+1)); sleep 1
+done
+contains "重启后源还在（卷没白留）" '稀饭动漫' "$S2"
+check "重启没有把关掉的源偷偷打开" "0" "$(echo "$S2" | python3 -c "
+import json,sys
+print(1 if any(s['arguments']['name'] == '稀饭动漫' and s['enabled'] for s in json.load(sys.stdin)) else 0)")"
+check "其它源照常是启用的（不是「全部变 false」这种假通过）" "1" "$(echo "$S2" | python3 -c "
+import json,sys
+print(1 if any(s['enabled'] for s in json.load(sys.stdin)) else 0)")"
+stop $E
 
 echo
 echo "通过 $pass，失败 $fail"

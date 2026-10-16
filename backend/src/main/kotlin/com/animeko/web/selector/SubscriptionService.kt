@@ -1,5 +1,6 @@
 package com.animeko.web.selector
 
+import com.animeko.web.appLog
 import com.animeko.web.http.Fetcher
 import com.animeko.web.http.HttpResult
 import com.animeko.web.http.UrlGuard
@@ -112,6 +113,37 @@ class SubscriptionService(
     private fun requireSuccess(target: String, result: HttpResult): String {
         if (result.status !in 200..299) throw UpstreamException("订阅返回 ${result.status}（$target）")
         return String(result.body, Charsets.UTF_8)
+    }
+
+    /**
+     * 开机自动导入（ANIMEKO_SUBSCRIPTION_AUTO_IMPORT）。
+     * 任何失败都只记日志：订阅站挂了不能把整个服务带走，更不能让容器起不来。
+     *
+     * 已存在的源沿用它的 enabled —— 界面里关掉的源一定是用户试过、判定不可用的，
+     * 每次重启都把它重新打开，等于替用户做一次他明确拒绝过的决定（而且会让
+     * 每次搜索重新多打一遍那个打不开的站点）。
+     */
+    suspend fun autoImport(urls: List<String>, tiers: Set<String>): List<String> = urls.map { url ->
+        val label = try {
+            val body = loadBody(url, null)
+            val (items, _) = parse(body)
+            val wanted = items.filter { tiers.isEmpty() || displayTier(it.tier) in tiers }
+            if (wanted.isEmpty()) {
+                appLog.warn("订阅 {} 没有匹配 tier={} 的数据源，跳过", url, tiers)
+            }
+            var ok = 0
+            val known = repo.list().associate { it.arguments.name to it.enabled }
+            wanted.forEach { args ->
+                runCatching { repo.save(args, known[args.name] ?: true) }
+                    .onSuccess { ok++ }
+                    .onFailure { appLog.warn("自动导入 {} 的「{}」失败：{}", url, args.name, it.message) }
+            }
+            "$ok/${wanted.size}"
+        } catch (e: Exception) {
+            appLog.warn("自动导入订阅 {} 失败：{}", url, e.message ?: e::class.simpleName)
+            "失败"
+        }
+        "$url → $label 个"
     }
 
     suspend fun preview(url: String?, text: String?, label: String = ""): PreviewResponse {

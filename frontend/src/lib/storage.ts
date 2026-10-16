@@ -374,6 +374,56 @@ export function toggleFavorite(subject: FavoriteSubject): boolean {
   return !exists
 }
 
+// ---------- 数据源收藏 ----------
+
+/**
+ * 从「数据源搜索结果」进来的条目没有 Bangumi id，只能用 (源, 地址) 当键。
+ * 单独存一个键而不是混进 favorites：两种形状的归一化规则不同，
+ * 混在一起时 listFavorites 的 `typeof id === 'number'` 过滤会静默吃掉整批数据源收藏。
+ */
+export interface SourceFavorite {
+  source: string
+  url: string
+  name: string
+  cover: string
+  ts: number
+}
+
+const SOURCE_FAV_KEY = 'favoritesSource'
+
+function sourceFavKeyOf(source: string, url: string): string {
+  return `${source}|${url}`
+}
+
+export function listSourceFavorites(): SourceFavorite[] {
+  const list = readJson<SourceFavorite[]>(SOURCE_FAV_KEY, [])
+  if (!Array.isArray(list)) return []
+  return list
+    .filter((f) => f && typeof f.url === 'string' && typeof f.source === 'string')
+    .map((f) => ({
+      source: f.source,
+      url: f.url,
+      name: String(f.name ?? ''),
+      cover: String(f.cover ?? ''),
+      ts: typeof f.ts === 'number' ? f.ts : 0,
+    }))
+    .sort((a, b) => b.ts - a.ts)
+}
+
+export function isSourceFavorite(source: string, url: string): boolean {
+  return listSourceFavorites().some((f) => sourceFavKeyOf(f.source, f.url) === sourceFavKeyOf(source, url))
+}
+
+/** 切换数据源收藏，返回操作后是否处于「已收藏」 */
+export function toggleSourceFavorite(item: SourceFavorite): boolean {
+  const key = sourceFavKeyOf(item.source, item.url)
+  const list = listSourceFavorites()
+  const exists = list.some((f) => sourceFavKeyOf(f.source, f.url) === key)
+  const next = exists ? list.filter((f) => sourceFavKeyOf(f.source, f.url) !== key) : [item, ...list]
+  writeJson(SOURCE_FAV_KEY, next)
+  return !exists
+}
+
 // ---------- 搜索历史 ----------
 
 const HISTORY_LIMIT = 10

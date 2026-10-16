@@ -2,12 +2,16 @@ import { useEffect, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { api, errMsg } from '../api'
 import type { EpisodeHit, EpisodesResult } from '../types'
+import { isSourceFavorite, toggleSourceFavorite, type SourceFavorite } from '../lib/storage'
+import { IconHeart, IconHeartFilled } from '../lib/icons'
 
 export default function SourceDetailPage() {
   const { name } = useParams<{ name: string }>()
   const [params] = useSearchParams()
   const subjectUrl = params.get('url') ?? ''
   const title = params.get('title') ?? ''
+  const cover = params.get('cover') ?? ''
+  const [faved, setFaved] = useState(() => isSourceFavorite(name ?? '', subjectUrl))
   const [result, setResult] = useState<EpisodesResult | null>(null)
   const [error, setError] = useState('')
   const [channel, setChannel] = useState<string | null>(null)
@@ -18,6 +22,9 @@ export default function SourceDetailPage() {
     setResult(null)
     setError('')
     setChannel(null)
+    // 同一源内换条目时组件不重新挂载，收藏态必须跟着地址走，
+    // 否则小红心会停在上一个条目的状态上
+    setFaved(!!name && isSourceFavorite(name, subjectUrl))
     if (!name || !subjectUrl) {
       // 参数缺失时必须给出明确提示，否则页面会停在「正在解析剧集列表…」
       setError(!name ? '缺少数据源参数' : '缺少条目地址（url 参数），无法解析剧集列表')
@@ -82,10 +89,30 @@ export default function SourceDetailPage() {
 
   return (
     <div>
-      <h2 className="section-title">
-        {title || '剧集列表'}
-        <span className="count">{name ?? ''}</span>
-      </h2>
+      <div className="page-head">
+        <h2 className="section-title">
+          {title || '剧集列表'}
+          <span className="count">{name ?? ''}</span>
+        </h2>
+        {/* 从数据源结果进来的条目没有 Bangumi id，收藏按（源, 地址）记 */}
+        <button
+          className={`btn btn-sm ${faved ? 'btn-secondary' : ''}`}
+          onClick={() => {
+            const item: SourceFavorite = {
+              source: name ?? '',
+              url: subjectUrl,
+              name: title || '未命名条目',
+              cover,
+              ts: Date.now(),
+            }
+            setFaved(toggleSourceFavorite(item))
+          }}
+          disabled={!name || !subjectUrl}
+        >
+          {faved ? <IconHeartFilled size={14} /> : <IconHeart size={14} />}
+          {faved ? '已收藏' : '收藏'}
+        </button>
+      </div>
 
       {groups && groups.length > 1 && (
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 14 }}>

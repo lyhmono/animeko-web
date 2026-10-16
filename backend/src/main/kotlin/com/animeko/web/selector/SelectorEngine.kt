@@ -138,9 +138,13 @@ class SelectorEngine(
         val nestedRegex = runCatching { Regex(mv.matchNestedUrl) }.getOrNull()
 
         val html = fetchPage(cfg, target, headers, "播放页")
+        // 源自己的 matchVideoUrl 始终优先；兜底要等所有页面都试完才采用，
+        // 否则一个通用扩展名会把配置里更精确的线路抢掉
+        var fallback: String? = null
         findVideoUrl(html, target, videoRegex)?.let {
             return ResolvedTarget(it, referer, ua, cookies)
         }
+        genericVideoUrl(html, target)?.let { fallback = it }
         if (mv.enableNestedUrl && nestedRegex != null) {
             // 嵌套候选：DOM 中的 iframe/a/video/source 绝对地址 + 原文中的绝对 URL
             val doc = Jsoup.parse(html, target)
@@ -169,7 +173,14 @@ class SelectorEngine(
                 findVideoUrl(sub, n, videoRegex)?.let {
                     return ResolvedTarget(it, referer, ua, cookies)
                 }
+                if (fallback == null) fallback = genericVideoUrl(sub, n)
             }
+        }
+        fallback?.let {
+            // 说清楚走了兜底：这等于「配置里的 CDN 白名单过期了」，
+            // 不记下来的话下次源站换域名时只能看到一堆莫名的失败
+            appLog.info("matchVideoUrl 没有命中，改用通用扩展名兜底：{}", it)
+            return ResolvedTarget(it, referer, ua, cookies)
         }
         throw SelectorException("未能从播放页提取视频地址（NO_VIDEO_URL_FOUND）")
     }
@@ -183,15 +194,21 @@ class SelectorEngine(
             val name = e.attr("title").ifBlank { e.text().trim() }
             val href = e.attr("href")
             if (name.isBlank() || href.isBlank()) null
-            else SubjectHit(name, applyLink(c.linkTemplate, href, base))
+            else SubjectHit(name, applyLink(c.linkTemplate, href, base), coverOf(e, base, elements))
         }
     }
 
     private fun selectIndexed(doc: Document, cfg: SelectorSearchConfig, base: String): List<SubjectHit> {
         val c = cfg.selectorSubjectFormatIndexed
         val names = queryAll(doc, c.selectNames)?.map { it.text().trim() } ?: return emptyList()
-        val links = queryAll(doc, c.selectLinks)?.map { it.attr("href") } ?: return emptyList()
-        return pairIndexed(names, links, c.linkTemplate, base)
+        val linkEls = queryAll(doc, c.selectLinks) ?: return emptyList()
+        return pairIndexed(
+            names,
+            linkEls.map { it.attr("href") },
+            linkEls.map { coverOf(it, base, linkEls) },
+            c.linkTemplate,
+            base,
+        )
     }
 
     /**
@@ -203,6 +220,7 @@ class SelectorEngine(
     private fun pairIndexed(
         names: List<String>,
         links: List<String>,
+        covers: List<String?> = emptyList(),
         linkTemplate: String?,
         base: String,
     ): List<SubjectHit> {
@@ -215,10 +233,11 @@ class SelectorEngine(
                 links.size,
             )
         }
-        return names.zip(links) { name, href ->
+        return names.mapIndexedNotNull { i, name ->
+            val href = links.getOrNull(i) ?: return@mapIndexedNotNull null
             if (name.isBlank() || href.isBlank()) null
-            else SubjectHit(name, applyLink(linkTemplate, href, base))
-        }.filterNotNull()
+            else SubjectHit(name, applyLink(linkTemplate, href, base), covers.getOrNull(i))
+        }
     }
 
     private fun selectJsonPathIndexed(body: String, cfg: SelectorSearchConfig, base: String): List<SubjectHit> {
@@ -235,7 +254,66 @@ class SelectorEngine(
         val names = JsonPathEval.evaluate(c.selectNames, root)
             ?.map { JsonPathEval.singleString(it).orEmpty() }
             ?: return emptyList()
-        return pairIndexed(names, urls, c.linkTemplate, base)
+        val covers = COVER_KEYS
+            .asSequence()
+            .mapNotNull { key -> JsonPathEval.evaluate("$[*].$key", root)?.map { JsonPathEval.singleString(it).orEmpty() } }
+            .firstOrNull { it.any { v -> v.isNotBlank() } }
+            ?: emptyList()
+        return pairIndexed(names, urls, covers, c.linkTemplate, base)
+    }
+
+    /**
+     * 条目封面。三种形态都要覆盖（都是真实社区源里的写法）：
+     *  1. 海报地址挂在条目链接自己身上：stui 模板的
+     *     `<a class=stui-vodlist__thumb data-original=/upload/x.jpg>`，里面没有 <img>；
+     *  2. 图在条目子树里的 `<img>`，且常是懒加载（src 是占位 gif，真图在 data-src）；
+     *  3. 「缩略图」和「标题」是同一个 <li> 里两个平级 `<a>`（myui / AppleCMS）。
+     *
+     * 为 3 往上找容器时，必须确认这个容器**只包住当前这一条结果**：列表项的公共父节点
+     * 是整个列表，在那里面取第一张图会把邻居甚至第一行的海报发给每一条 ——
+     * 错图比没图更糟，用户会以为点进去能播另一部番。
+     * 取不到就返回 null，界面走占位图：封面是锦上添花，绝不能因为取图失败丢掉整条结果。
+     */
+    private fun coverOf(
+        el: org.jsoup.nodes.Element,
+        base: String,
+        siblings: List<org.jsoup.nodes.Element> = emptyList(),
+    ): String? {
+        coverUrl(el, base)?.let { return it }
+        coverIn(el, base)?.let { return it }
+        if (siblings.isEmpty()) return null
+        val all = java.util.Collections.newSetFromMap(
+            java.util.IdentityHashMap<org.jsoup.nodes.Element, Boolean>(),
+        )
+        all += siblings
+        var node = el.parent()
+        var hops = 0
+        while (node != null && hops < MAX_COVER_HOPS) {
+            // 这一层已经罩住了别的条目 → 再往上只会更共享，不必也不能继续找
+            if (node.getAllElements().count { it in all } > 1) break
+            coverIn(node, base)?.let { return it }
+            node = node.parent()
+            hops++
+        }
+        return null
+    }
+
+    private fun coverIn(
+        scope: org.jsoup.nodes.Element,
+        base: String,
+    ): String? = scope.select(COVER_QUERY).firstNotNullOfOrNull { coverUrl(it, base) }
+
+    private fun coverUrl(
+        el: org.jsoup.nodes.Element,
+        base: String,
+    ): String? {
+        for (attr in COVER_ATTRS) {
+            val raw = el.attr(attr)
+            if (raw.isBlank()) continue
+            val abs = absUrl(base, raw)
+            if (abs.startsWith("http")) return abs
+        }
+        return null
     }
 
     // ---------- 线路/剧集格式实现 ----------
@@ -309,14 +387,31 @@ class SelectorEngine(
 
     // ---------- 视频地址提取 ----------
 
-    private fun findVideoUrl(html: String, pageUrl: String, videoRegex: Regex): String? {
+    private fun findVideoUrl(html: String, pageUrl: String, videoRegex: Regex): String? =
+        videoCandidates(html, pageUrl).firstOrNull { videoRegex.containsMatchIn(it) }
+
+    /**
+     * 通用兜底：源配置里的 matchVideoUrl 是一份 **CDN 域名白名单**，而源站换 CDN 比
+     * 改配置勤得多（实测社区订阅里就有「页面明写着 index.m3u8、正则只认三个旧域名」
+     * 的源，表现是一律 NO_VIDEO_URL_FOUND）。所以在配置彻底没命中时，
+     * 按扩展名再认一次 —— 只认 m3u8/mp4/mkv/flv 这几个明确是视频后缀的，
+     * 并且永远排在配置正则之后，不抢配置已经选好的线路。
+     */
+    private fun genericVideoUrl(html: String, pageUrl: String): String? {
+        val candidates = videoCandidates(html, pageUrl)
+        // m3u8 优先：同页常同时挂着一条 mp4 预览小样和真正的分片清单
+        return candidates.firstOrNull { GENERIC_M3U8.containsMatchIn(it) }
+            ?: candidates.firstOrNull { GENERIC_VIDEO.containsMatchIn(it) }
+    }
+
+    private fun videoCandidates(html: String, pageUrl: String): List<String> {
         val doc = Jsoup.parse(html, pageUrl)
         val candidates = LinkedHashSet<String>()
         doc.select("iframe[src]").forEach { candidates.add(it.absUrl("src")) }
         doc.select("a[href]").forEach { candidates.add(it.absUrl("href")) }
         doc.select("video[src], source[src]").forEach { candidates.add(it.absUrl("src")) }
         candidateUrls(html).forEach { candidates.add(it) }
-        return candidates.firstOrNull { it.startsWith("http") && videoRegex.containsMatchIn(it) }
+        return candidates.filter { it.startsWith("http") }
     }
 
     private fun candidateUrls(html: String): List<String> {
@@ -324,12 +419,29 @@ class SelectorEngine(
         // `}` 紧随对象字面量。漏一个都会让带垃圾尾缀的 URL 命中 containsMatchIn
         // 并被整串返回（表现为「解析成功但播放 404」）。
         val regex = Regex("""https?://[^\s"'<>`{}\\)\]]+""")
-        return regex.findAll(html)
+        // 必须再扫一遍「解过转义」的副本：AppleCMS 的 player_aaaa 把地址写成
+        //   {"url":"https:\/\/v6.xx.com\/a\/index.m3u8"}
+        // 而上面那个正则把 \ 当作 URL 的终止符 —— 于是「页面里明明就写着 m3u8，
+        // 却报 NO_VIDEO_URL_FOUND」。实测这类源占社区订阅的一大半，
+        // 是「视频播放不了」的头号成因，不是源站真的藏了地址。
+        return listOf(html, unescapeJsStrings(html))
+            .flatMap { regex.findAll(it) }
             .map { it.value.trim().trimEnd('`', '}', '{', '(', ')', '.', ',', ';', '!') }
             .filter { it.length > 10 }
             .distinct()
             .toList()
     }
+
+    /**
+     * 只解 URL 抽取用得到的三种转义（\uXXXX、\xNN、\/）。
+     * 不去动原始 HTML —— 那是 Jsoup 要解析的东西，这里只服务于一份候选副本。
+     */
+    private fun unescapeJsStrings(text: String): String =
+        text.replace(Regex("""\\u([0-9a-fA-F]{4})""")) { m ->
+            m.groupValues[1].toIntOrNull(16)?.toChar()?.toString() ?: m.value
+        }.replace(Regex("""\\x([0-9a-fA-F]{2})""")) { m ->
+            m.groupValues[1].toIntOrNull(16)?.toChar()?.toString() ?: m.value
+        }.replace("\\/", "/")
 
     // ---------- 工具 ----------
 
@@ -433,6 +545,22 @@ class SelectorEngine(
         /** 抓取页面体积上限：同时约束「用户自定义正则」的输入规模（JVM 正则没有超时） */
         const val MAX_PAGE_BYTES: Long = 8L * 1024 * 1024
         private const val MAX_PAGE_REDIRECTS = 5
+
+        /** 找条目封面时最多向上找几层容器。再往上就已经是整个列表了 */
+        private const val MAX_COVER_HOPS = 4
+
+        /** 兜底识别视频地址用：后缀后面必须真的是结尾（或 query），不能是 `x.m3u8.png` 这种 */
+        private val GENERIC_M3U8 = Regex("""\.m3u8(?:[?#]|$)""")
+        private val GENERIC_VIDEO = Regex("""\.(?:m3u8|mp4|mkv|flv)(?:[?#]|$)""")
+
+        /** 懒加载站点的真实图常在这些属性里，src 反而是占位图 */
+        private val COVER_ATTRS = listOf("data-src", "data-original", "data-lazy-src", "src")
+
+        /** stui 模板把海报挂在 <a> 自己的 data-original 上（里面根本没有 <img>），所以两种都要查 */
+        private val COVER_QUERY = (listOf("img") + COVER_ATTRS.map { "[$it]" }).joinToString(", ")
+
+        /** 社区 JSON 接口里封面字段名不统一，按常见写法依次探测 */
+        private val COVER_KEYS = listOf("pic", "cover", "img", "image", "vod_pic", "listthumb_20")
 
         private const val MAX_NESTED_PAGES = 5
         private const val NESTED_BUDGET_MS = 30_000L

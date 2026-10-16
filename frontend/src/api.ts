@@ -116,8 +116,8 @@ export const api = {
   },
 
   // ---- Bangumi ----
-  searchBangumi: (q: string) =>
-    request<BgmSubject[]>(`/api/bangumi/search?q=${encodeURIComponent(q)}`),
+  searchBangumi: (q: string, signal?: AbortSignal) =>
+    request<BgmSubject[]>(`/api/bangumi/search?q=${encodeURIComponent(q)}`, { signal }),
   bangumiSubject: (id: number) => request<BgmSubject>(`/api/bangumi/subjects/${id}`),
 
   // ---- 数据源 ----
@@ -133,10 +133,11 @@ export const api = {
       `/api/selector/sources/${encodeURIComponent(name)}/enable`,
       { method: 'POST', body: JSON.stringify({ enabled }) },
     ),
-  sourceSearch: (name: string, keyword: string) =>
+  sourceSearch: (name: string, keyword: string, signal?: AbortSignal) =>
     request<SubjectHit[]>(`/api/selector/sources/${encodeURIComponent(name)}/search`, {
       method: 'POST',
       body: JSON.stringify({ keyword }),
+      signal,
     }),
   sourceEpisodes: (name: string, subjectUrl: string) =>
     request<EpisodesResult>(`/api/selector/sources/${encodeURIComponent(name)}/episodes`, {

@@ -61,6 +61,23 @@ data class AppConfig(
         env("ANIMEKO_ALLOW_PRIVATE_TARGETS", "false").toBooleanStrictOrNull() ?: false,
 
     /**
+     * 开机自动导入的聚合订阅地址（逗号分隔可写多条），例如
+     * ANIMEKO_SUBSCRIPTION_AUTO_IMPORT=https://sub.creamycake.org/v1/css1.json
+     * 空则不自动导入（仍是手动在界面里挑）。自动导入只影响「同名源被覆盖」，
+     * 所以改过配置的自建源不要和订阅重名。
+     */
+    val subscriptionAutoImport: List<String> =
+        env("ANIMEKO_SUBSCRIPTION_AUTO_IMPORT", "").split(',').map { it.trim() }.filter { it.isNotBlank() },
+
+    /**
+     * 自动导入时的分级白名单（逗号分隔，如 `0,1`）。订阅里 tier 越低质量越好，
+     * 而境外 VPS 上高 tier 常常是 JS 加密或只对国内 IP 开放的 CDN，导进来只会拖慢搜索。
+     * 留空 = 全导。界面里的勾选导入不受此项限制。
+     */
+    val subscriptionAutoTiers: Set<String> =
+        env("ANIMEKO_SUBSCRIPTION_AUTO_TIERS", "").split(',').map { it.trim() }.filter { it.isNotBlank() }.toSet(),
+
+    /**
      * 是否放开「写接口只允许同源」的 CSRF 检查。默认 false。
      * 只有在反向代理改写了 Host、导致同源判定误报时才需要设为 true，
      * 那种情况下应当自己确保服务不对不可信网络开放。

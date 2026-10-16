@@ -32,6 +32,7 @@ import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.request.path
 import io.ktor.server.response.respond
 import io.ktor.server.routing.routing
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 
 fun main() {
@@ -109,6 +110,20 @@ fun Application.module(
     val sessions = proxySessions
     val userData = UserDataStore(cfg.userDataFile)
     val subscriptions = SubscriptionService(fetcher, repo, cfg.allowPrivateTargets)
+
+    // 开机自动导入订阅：放到协程里，绝不在模块初始化里做网络 I/O
+    // （订阅站慢或挂了会把启动卡住，而且失败根本不该影响服务可用性）
+    if (cfg.subscriptionAutoImport.isNotEmpty()) {
+        launch {
+            val summaries = runCatching {
+                subscriptions.autoImport(cfg.subscriptionAutoImport, cfg.subscriptionAutoTiers)
+            }.getOrElse { e ->
+                appLog.warn("自动导入订阅异常：{}", e.message ?: e::class.simpleName)
+                emptyList()
+            }
+            appLog.info("订阅自动导入完成：{}", summaries.joinToString(" ; "))
+        }
+    }
 
     configureApiRoutes(
         cfg, bangumi, repo, engine, fetcher, sessions,

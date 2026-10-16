@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
+import Poster from '../components/Poster'
 import { api, errMsg } from '../api'
 import type { BgmEpisode, BgmSubject, EpisodesResult, StoredSource } from '../types'
 import { isFavorite, toggleFavorite } from '../lib/storage'
@@ -187,12 +188,12 @@ export default function SubjectPage() {
     <div>
       <div className="subject-header">
         {cover && (
-          <img
+          <Poster
             className="cover"
             src={cover}
             srcSet={coverSrcSet}
-            sizes="(max-width: 720px) 40vw, 220px"
-            alt={subject.name_cn}
+            sizes="(max-width: 720px) 45vw, 200px"
+            alt={subject.name_cn || subject.name}
           />
         )}
         <div className="meta">

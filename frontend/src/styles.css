@@ -1986,3 +1986,113 @@ select:hover:not(:focus) {
 .banner.error-box {
   text-align: left;
 }
+
+/* 页面标题行：标题 + 右侧操作（如收藏键），窄屏自动换行 */
+.page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.page-head .section-title {
+  margin-bottom: 0;
+}
+
+/* 封面取不到时的占位：保持卡片高度不跳动，避免出现一排塌陷的格子 */
+.cover-empty {
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+}
+
+/* 页脚左侧说明在窄屏要能收缩，否则和右侧状态点挤成两行还溢出 */
+.footer-left {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .footer-left {
+    white-space: normal;
+    font-size: 11px;
+  }
+}
+
+/* 播放器还没拿到地址时的舞台占位：舞台是绝对定位容器，占位要居中浮在黑底上 */
+.stage-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  font-size: 14px;
+  pointer-events: none;
+}
+
+.card-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* 顶栏搜索框：搜索页也要能改关键词，所以入口放在常驻导航里。
+   flex 而不是固定宽度 —— 窄屏下它必须能收缩，否则整条导航横向溢出。 */
+.nav-search {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 320px;
+  display: flex;
+}
+
+.nav-search input {
+  width: 100%;
+  min-width: 0;
+  padding: 7px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.nav-search input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+/* 搜索框自带 type=search，浏览器会画一个清除按钮，和我们的圆角框不搭 */
+.nav-search input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+}
+
+@media (max-width: 720px) {
+  .nav {
+    gap: 10px;
+    padding: 0 12px;
+  }
+
+  .nav-search {
+    max-width: none;
+    order: 3;
+    flex-basis: 100%;
+  }
+
+  /* 手机上一条 56px 的导航塞不下「logo + 搜索 + 4 个入口 + 2 个按钮」，
+     搜索框换到第二行，logo 占满剩余宽度 */
+  .nav {
+    flex-wrap: wrap;
+    height: auto;
+    padding-top: 8px;
+    padding-bottom: 8px;
+    row-gap: 8px;
+  }
+
+  .nav-logo {
+    flex: 1 1 auto;
+  }
+}
