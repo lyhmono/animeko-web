@@ -289,4 +289,19 @@ class SelectorEngineTest {
         assertEquals(false, resolved.searchUseOnlyFirstWord)
         assertEquals(false, resolved.searchRemoveSpecial)
     }
+
+    @Test
+    fun `resolve video strips template literal backticks from candidates`() = runTest {
+        // 反引号模板串是现在最主流的 JS 写法。候选 URL 的正则漏掉反引号时，
+        // 匹配上的候选会带着尾部的 ` 被整串返回：解析「成功」、播放 404，
+        // 且完全看不出是候选串被污染了。
+        val page = """
+            <html><body><script>
+            var u = `https://cdn.example.net/hls/movie.m3u8?sig=1`;
+            </script></body></html>
+        """.trimIndent()
+        val fetcher = StubFetcher(mapOf("$base/play/backtick.html" to page))
+        val video = SelectorEngine(fetcher).resolveVideo(config(), "$base/play/backtick.html")
+        assertEquals("https://cdn.example.net/hls/movie.m3u8?sig=1", video.url)
+    }
 }

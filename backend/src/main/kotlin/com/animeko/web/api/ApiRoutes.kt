@@ -6,6 +6,7 @@ import com.animeko.web.bangumi.BangumiClient
 import com.animeko.web.config.AppConfig
 import com.animeko.web.appLog
 import com.animeko.web.data.UserDataStore
+import com.animeko.web.http.DeadlineInputStream
 import com.animeko.web.http.Fetcher
 import com.animeko.web.http.StreamResult
 import com.animeko.web.http.UrlGuard
@@ -187,76 +188,7 @@ fun Application.configureApiRoutes(
         // ---- 登录 / 注销 ----
         post(LOGIN_PATH) {
             // CSRF 检查在根 intercept 里，登录接口也在它的覆盖范围内（只豁免鉴权，不豁免 CSRF）
-            val clientKey = call.request.local.remoteHost
-            if (limiter.blocked(clientKey)) {
-                call.response.header(HttpHeaders.RetryAfter, (limiter.windowSeconds()).toString())
-                call.respond(
-                    HttpStatusCode.TooManyRequests,
-                    mapOf("error" to "失败次数过多，请稍后再试"),
-                )
-                return@post
-            }
-            // 请求体只能读一次：分两次 bodyField(...) 会让第二个字段永远为空，
-            // 表现是「口令明明对了却提示请填写口令」。
-            val form = bodyObject(call)
-            val username = form?.stringField("username").orEmpty()
-            val password = form?.stringField("password").orEmpty()
-            when {
-                !cfg.authEnabled -> call.respond(
-                    HttpStatusCode.Conflict,
-                    mapOf("error" to "服务端未配置登录凭据，无需登录"),
-                )
-                form == null || password.isEmpty() -> call.respond(
-                    HttpStatusCode.BadRequest,
-                    mapOf("error" to "请填写口令"),
-                )
-                !credentialsMatch(cfg, username, password) -> {
-                    limiter.onFailure(clientKey)
-                    appLog.warn(
-                        "登录失败: user={} ip={} 累计={}",
-                        username.take(40), clientKey, limiter.attempts(clientKey),
-                    )
-                    call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "账号或口令不正确"))
-                }
-                else -> {
-                    limiter.onSuccess(clientKey)
-                    val token = site.create()
-                    call.response.setSessionCookie(cfg, token, site.ttlSeconds())
-                    call.respond(
-                        SessionStateResponse(
-                            authenticated = true,
-                            // 只回显账号名，绝不含口令或 token
-                            user = cfg.authUser ?: "token",
-                        ),
-                    )
-                }
-            }
-        }
-
-        // ---- 免鉴权的两个入口：容器 HEALTHCHECK 与登录页 ----
-        // 门控挂在路由子树上，绝不判断 URI 前缀：Ktor 的路由是按「段」匹配的，
-        // 每段单独 URL 解码、空段被忽略，所以 `//api/selector/sources`、
-        // `/%61pi/selector/sources` 都会命中真接口，
-        // 而 request.local.uri 与 call.request.path() 拿到的原串都不以 "/api/" 开头
-        // （实测：用前缀判断时，这两个写法能无凭据读到数据源列表与个人数据）。
-        get(HEALTH_PATH) {
-            call.respond(
-                HealthResponse(
-                    status = "ok",
-                    version = "0.1.0",
-                    authEnabled = cfg.authEnabled,
-                    // 只承认会话 Cookie。这个接口免鉴权、也不该有副作用，
-                    // 若它连 Authorization 头一起判定，就等于给「口令猜对了没有」
-                    // 开了一个免限流的免费预言机。
-                    authenticated = !cfg.authEnabled || call.hasValidSession(site),
-                ),
-            )
-        }
-
-        // ---- 登录 / 注销 ----
-        post(LOGIN_PATH) {
-            // CSRF 检查在根 intercept 里，登录接口也在它的覆盖范围内（只豁免鉴权，不豁免 CSRF）
-            val clientKey = call.request.local.remoteHost
+            val clientKey = call.rateLimitKey(cfg)
             if (limiter.blocked(clientKey)) {
                 call.response.header(HttpHeaders.RetryAfter, (limiter.windowSeconds()).toString())
                 call.respond(
@@ -392,6 +324,9 @@ fun Application.configureApiRoutes(
             val names = form?.get("names")?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }.orEmpty()
             val url = form?.stringField("url").orEmpty()
             val text = form?.stringField("text").orEmpty()
+            // 预览时下发的内容指纹：对不上说明订阅在两步之间被更新过，
+            // 此时按「当前内容」导入会得到一份和用户刚看过的清单不同的结果
+            val fingerprint = form?.stringField("fingerprint")
             if (names.isEmpty()) {
                 call.respond(HttpStatusCode.BadRequest, mapOf("error" to "没有选择要导入的数据源"))
             } else if (url.isBlank() && text.isBlank()) {
@@ -401,6 +336,7 @@ fun Application.configureApiRoutes(
                     url = url.ifBlank { null },
                     text = text.ifBlank { null },
                     names = names,
+                    fingerprint = fingerprint,
                 )
                 // 导入完立刻把最新列表回给前端，省一次「导入后再拉列表」的时序问题
                 call.respond(result)
@@ -435,7 +371,7 @@ fun Application.configureApiRoutes(
 
         // ---- 数据源采集 ----
         post("/api/selector/sources/{name}/search") {
-            val source = repo.find(call.parameters["name"] ?: "")
+            val source = repo.find(call.parameters["name"] ?: "", enabledOnly = true)
             if (source == null) {
                 call.respond(HttpStatusCode.NotFound, mapOf("error" to "source not found"))
             } else {
@@ -449,7 +385,7 @@ fun Application.configureApiRoutes(
         }
 
         post("/api/selector/sources/{name}/episodes") {
-            val source = repo.find(call.parameters["name"] ?: "")
+            val source = repo.find(call.parameters["name"] ?: "", enabledOnly = true)
             if (source == null) {
                 call.respond(HttpStatusCode.NotFound, mapOf("error" to "source not found"))
             } else {
@@ -463,7 +399,7 @@ fun Application.configureApiRoutes(
         }
 
         post("/api/selector/sources/{name}/video") {
-            val source = repo.find(call.parameters["name"] ?: "")
+            val source = repo.find(call.parameters["name"] ?: "", enabledOnly = true)
             if (source == null) {
                 call.respond(HttpStatusCode.NotFound, mapOf("error" to "source not found"))
             } else {
@@ -552,6 +488,32 @@ private fun looksLikeAsset(rel: String): Boolean =
 // ---- 鉴权 ----
 
 /**
+ * 限速记账用的客户端标识。
+ *
+ * 默认（trustedProxyHops=0，直连部署）用 remoteHost：X-Forwarded-For 完全由
+ * 客户端提供，信它就能用一个伪造头无限重置计数器。
+ *
+ * 反代部署如实填了层数后，取 XFF 从右数第 N 个：每经过一跳可信代理，XFF 右端
+ * 就被追加一个「这一跳看到的地址」，所以真实客户端在第 size-N 位。
+ * 取值只接受 IP 形态且链长必须够——短于层数说明有人伪造/裁剪过，退回
+ * remoteHost，别让垃圾值进键空间。
+ */
+private fun ApplicationCall.rateLimitKey(cfg: AppConfig): String {
+    val remote = request.local.remoteHost
+    if (cfg.trustedProxyHops <= 0) return remote
+    val chain = request.headers[HttpHeaders.XForwardedFor]
+        ?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }
+        ?: return remote
+    val candidate = chain.getOrNull(chain.size - cfg.trustedProxyHops) ?: return remote
+    // 只接受 IP 字面量：XFF 是自由文本，塞进来的可能是域名、端口后缀或垃圾值，
+    // 拿它们当键既不稳定也能被构造。判据是纯字面（不解析 DNS），快且确定。
+    return if (looksLikeIpLiteral(candidate)) candidate else remote
+}
+
+private fun looksLikeIpLiteral(value: String): Boolean =
+    value.contains(':') || value.matches(Regex("""\d{1,3}(\.\d{1,3}){3}"""))
+
+/**
  * 浏览器总会带上 Origin（同源的 fetch/表单也是），所以拿它与「这个请求被送到哪个主机」
  * 对比就能识别跨站写请求。
  *
@@ -571,7 +533,15 @@ private fun ApplicationCall.isCrossSiteWrite(cfg: AppConfig): Boolean {
     val originHost = runCatching { URI(origin).host }
         .getOrNull()?.lowercase()?.trim('[', ']')?.takeIf { it.isNotBlank() }
         ?: return true // Origin 为 "null"（沙箱 iframe / file:// 页面）按跨站处理
-    val hostHeader = (request.headers[HttpHeaders.Host] ?: request.local.serverHost).lowercase().trim()
+    val hostHeader = if (cfg.trustedProxyHops >= 1) {
+        // 反代后浏览器看到的原始主机在 X-Forwarded-Host；Host 头已被代理改写成内部目标，
+        // 拿它对比会把同源请求误判成跨站（默认 hops=0 时不看 XFH：客户端可任意伪造）。
+        request.headers[HttpHeaders.XForwardedHost]
+            ?: request.headers[HttpHeaders.Host]
+            ?: request.local.serverHost
+    } else {
+        request.headers[HttpHeaders.Host] ?: request.local.serverHost
+    }.lowercase().trim()
     val hostName = if (hostHeader.startsWith('[')) {
         hostHeader.substringAfter('[').substringBefore(']')
     } else {
@@ -653,7 +623,7 @@ private fun ApplicationCall.authenticate(
 ): AuthResult {
     if (hasValidSession(site)) return AuthResult.Authorized
     val header = request.headers["Authorization"] ?: return AuthResult.Failed
-    val key = request.local.remoteHost
+    val key = rateLimitKey(cfg)
     if (limiter.blocked(key)) return AuthResult.Throttled
     val ok = headerAuthorized(cfg, site, header)
     if (ok) limiter.onSuccess(key) else limiter.onFailure(key)
@@ -814,10 +784,22 @@ private suspend fun proxyVideo(
     val status = runCatching { HttpStatusCode.fromValue(result.status) }.getOrDefault(HttpStatusCode.BadGateway)
     result.header("content-range")?.let { call.response.header("Content-Range", it) }
     result.header("accept-ranges")?.let { call.response.header("Accept-Ranges", it) }
-    val contentLength = result.header("content-length")?.toLongOrNull()
     val ct = contentType?.let { runCatching { ContentType.parse(it) }.getOrNull() }
+    // content-length 只在「正常内容响应」上透传：3xx/错误体的声明长度与实际
+    // 转发内容经常对不上（上游断流、gzip 压缩前后长度差），浏览器会对着一个
+    // 永远等不到结尾的长度干转。那种情况交给 chunked，宁可没有长度也不错报。
+    val contentLength = if (result.status == 200 || result.status == 206) {
+        result.header("content-length")?.toLongOrNull()
+    } else {
+        null
+    }
+    // body 阶段的兜底超时：HttpClient 的 timeout 只到响应头，之后就是裸 copyTo，
+    // 上游一个每 30 秒吐 1 字节的连接能把会话挂住几分钟。
+    val deadlineNanos = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(cfg.proxyTimeoutMs)
     call.respondOutputStream(ct, status, contentLength) {
-        result.body.use { input -> input.copyTo(this) }
+        result.body.use { input ->
+            DeadlineInputStream(input, deadlineNanos).copyTo(this)
+        }
     }
 }
 

@@ -333,4 +333,28 @@ class ApiRoutesTest {
         )
         assertTrue(session.contains("\"authenticated\":true"), session)
     }
+
+    @Test
+    fun `disabled source is rejected by the collection api`() = testApplication {
+        application { module(testConfig()) }
+        val configJson = javaClass.getResourceAsStream("/selectors/example-css-site.json")!!
+            .bufferedReader().use { it.readText() }
+        client.post("/api/selector/sources") {
+            contentType(ContentType.Application.Json)
+            setBody(configJson)
+        }
+        val name = java.net.URLEncoder.encode("示例站点-CSS", "UTF-8")
+        val off = client.post("/api/selector/sources/$name/enable") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"enabled":false}""")
+        }
+        assertEquals(HttpStatusCode.OK, off.status)
+        // 停用是服务端语义：直接调采集接口也必须 404，
+        // 只靠前端 filter 的话，任何绕过 UI 的调用都能抓取「已停用」的源
+        val resp = client.post("/api/selector/sources/$name/search") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"keyword":"test"}""")
+        }
+        assertEquals(HttpStatusCode.NotFound, resp.status)
+    }
 }

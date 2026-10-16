@@ -70,7 +70,8 @@ export default function SourcesPage() {
     [preview, picked],
   )
 
-  /** 拉订阅：只做「看清楚有哪些源」，写不写进仓库由下一步的勾选决定 */  const fetchPreview = async () => {
+  /** 拉订阅：只做「看清楚有哪些源」，写不写进仓库由下一步的勾选决定 */
+  const fetchPreview = async () => {
     const source = subSource(subUrl, subText)
     if (!source) {
       setError('填一个聚合订阅地址，或展开「贴订阅正文」直接粘 JSON')
@@ -106,7 +107,9 @@ export default function SourcesPage() {
     setError('')
     setNotice('')
     try {
-      const result = await api.importSubscription({ ...source, names })
+      // 带上预览时的内容指纹：订阅若在「拉取预览」和「导入」之间被更新过，
+      // 服务端会拒绝并提示重新预览，而不是按一份和用户看到的不一样的清单导入
+      const result = await api.importSubscription({ ...source, names, fingerprint: preview?.fingerprint })
       const parts = [
         result.added.length ? `新增 ${result.added.length} 个` : '',
         result.updated.length ? `覆盖 ${result.updated.length} 个` : '',
@@ -131,7 +134,8 @@ export default function SourcesPage() {
     setPicked(Object.fromEntries(preview.candidates.map((c) => [c.name, value])))
   }
 
-  const testSearch = async (name: string) => {    const keyword = (testKeyword[name] ?? '').trim()
+  const testSearch = async (name: string) => {
+    const keyword = (testKeyword[name] ?? '').trim()
     if (!keyword) return
     setTestResult((r) => ({ ...r, [name]: '搜索中…' }))
     try {

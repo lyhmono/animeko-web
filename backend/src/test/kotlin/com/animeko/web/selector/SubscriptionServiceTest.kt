@@ -232,4 +232,43 @@ class SubscriptionServiceTest {
         assertEquals(1, preview.candidates.size)
         assertTrue(preview.rejected.any { it.contains("重名") }, preview.rejected.toString())
     }
+
+    @Test
+    fun `import with the preview fingerprint goes through`() = runTest {
+        val (svc, _) = service(aggregate)
+        val preview = svc.preview(url = "https://sub.example.test/css.json", text = null)
+        val result = svc.importSelected(
+            url = "https://sub.example.test/css.json",
+            text = null,
+            names = listOf("稀饭动漫"),
+            fingerprint = preview.fingerprint,
+        )
+        assertEquals(listOf("稀饭动漫"), result.added)
+    }
+
+    @Test
+    fun `import refuses when the subscription changed after the preview`() = runTest {
+        // 浏览器里用户按预览勾了名，服务端导入时订阅已被站点更新：
+        // 拿着旧指纹必须拒绝，而不是按一份刚拉到的、和用户看过的不一样的清单导入
+        val (svc, _) = service(aggregate)
+        val preview = svc.preview(url = "https://sub.example.test/css.json", text = null)
+
+        // 同一地址，内容已经变了（站点更新了订阅）
+        val mutated = aggregate.replace("稀饭动漫", "改过名的动漫")
+        val (svcNow, _) = service(mutated)
+        val fresh = svcNow.preview(url = "https://sub.example.test/css.json", text = null)
+        assertTrue(
+            preview.fingerprint != fresh.fingerprint,
+            "两次内容不同指纹必须不同，否则这个校验没有意义",
+        )
+
+        assertFailsWith<IllegalArgumentException> {
+            svcNow.importSelected(
+                url = "https://sub.example.test/css.json",
+                text = null,
+                names = listOf("改过名的动漫"),
+                fingerprint = preview.fingerprint,
+            )
+        }
+    }
 }

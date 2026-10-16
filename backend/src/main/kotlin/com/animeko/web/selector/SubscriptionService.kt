@@ -46,6 +46,11 @@ class SubscriptionService(
         val subscription: String,
         val candidates: List<Candidate>,
         val rejected: List<String>,
+        /**
+         * 正文内容指纹。预览与导入之间订阅内容可能变化（站点更新），
+         * 导入时带上它：对不上就要求重新预览，而不是按一份看不见的清单导入。
+         */
+        val fingerprint: String,
     )
 
     @kotlinx.serialization.Serializable
@@ -127,16 +132,28 @@ class SubscriptionService(
                 )
             },
             rejected = rejected,
+            fingerprint = sha256Hex(body),
         )
     }
 
     /**
      * 只导入勾选的条目。
      * 逐条 save：某一条坏了（正则非法、名字消毒后撞车）不该让前面已经成功的白做。
+     *
+     * @param fingerprint 预览时拿到的正文指纹；非空且与当前正文不符时拒绝导入
+     *   （订阅在预览后被更新过，用户看到的清单已经不是当前内容）。
      */
-    suspend fun importSelected(url: String?, text: String?, names: List<String>): ImportResponse {
+    suspend fun importSelected(
+        url: String?,
+        text: String?,
+        names: List<String>,
+        fingerprint: String? = null,
+    ): ImportResponse {
         require(names.isNotEmpty()) { "没有选择要导入的数据源" }
         val body = loadBody(url, text)
+        if (!fingerprint.isNullOrBlank() && fingerprint != sha256Hex(body)) {
+            throw IllegalArgumentException("订阅内容已变化，请重新拉取预览后再导入")
+        }
         val (items, rejected) = parse(body)
         val byName = items.associateBy { it.name }
         val added = mutableListOf<String>()
@@ -241,3 +258,10 @@ class SubscriptionService(
         private const val MAX_REDIRECTS = 5
     }
 }
+
+/** 内容指纹：etag 风格的短哈希，仅用于「预览与导入看到的是不是同一份内容」 */
+private fun sha256Hex(text: String): String =
+    java.security.MessageDigest.getInstance("SHA-256")
+        .digest(text.toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it) }
+        .take(32)

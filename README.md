@@ -35,6 +35,9 @@ open http://localhost:8080
 
 数据（数据源配置、收藏与观看进度）持久化在 `./data`，删除容器不丢失。
 
+> 容器进程以非 root 用户 `app`（uid 10001）运行：入口脚本负责把挂载的 `./data` 属主改给它。
+> 如果你在 compose/k8s 里显式指定了 `user:`/`runAsUser`，那段会跳过，卷权限由编排层负责。
+
 ### 别把 8080 直接裸露在公网
 
 服务默认监听 `0.0.0.0`，而「能不能读到你的收藏和内网拓扑」取决于网络边界，不取决于代码。
@@ -89,6 +92,7 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 | `ANIMEKO_COOKIE_SECURE` | `false` | 会话 Cookie 是否加 `Secure`。反代配好 HTTPS 后设为 `true`；在纯 HTTP 下设 `true` 会让浏览器丢弃 Cookie、登录页反复回弹 |
 | `ANIMEKO_ALLOW_PRIVATE_TARGETS` | `false` | 是否允许代理/抓取内网地址（见下方安全说明） |
 | `ANIMEKO_ALLOW_CROSS_ORIGIN` | `false` | 是否放开「写接口仅限同源」的 CSRF 检查（见下方安全说明） |
+| `ANIMEKO_TRUSTED_PROXY_HOPS` | `0` | 服务前面有几层**你控制**的反代。0=直连（X-Forwarded-* 一律不信）；填 N 后限速按 XFF 从右数第 N 个真实客户端记账、同源判定改看 `X-Forwarded-Host`。层数要如实填：少了把代理 IP 当客户端（限速全员共享），多了把客户端伪造的 XFF 当真值 |
 | `ANIMEKO_BANGUMI_BASE_URLS` | `https://api.bgm.tv,https://bgmapi.anibt.net` | Bangumi API 地址列表（逗号分隔，按顺序故障转移；官方域名在部分地区被墙，可改用社区镜像） |
 | `ANIMEKO_REQUEST_TIMEOUT_MS` | `20000` | 元数据/抓取类出站请求超时 |
 | `ANIMEKO_PROXY_TIMEOUT_MS` | `120000` | 视频代理（分片下载）超时 |
@@ -134,6 +138,11 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
   `curl -u 账号:口令`，或只配了 token 时**用户名任意、密码填 token**；
   API 客户端也可以用 `Authorization: Bearer <ANIMEKO_AUTH_TOKEN>`。
 - 凭据校验失败按客户端 IP 限速：**5 分钟内 8 次**，超过后连输对口令也返回 `429`（带 `Retry-After`）。
+  **直连部署（默认）按 `remoteHost` 记账**：X-Forwarded-For 完全由客户端提供，信它就能靠
+  轮换假 IP 无限重置计数器（有回归用例）。**反代部署必须设 `ANIMEKO_TRUSTED_PROXY_HOPS=<层数>`**：
+  否则所有请求的 `remoteHost` 都是代理自己，一个客户端输错到限额，其他所有人跟着被锁 5 分钟。
+  填了层数后取 XFF 从右数第 N 个地址（每跳可信代理在右端追加一个「这一跳看到的地址」）；
+  链长短于层数、或取到的值不是 IP 形态时退回 `remoteHost`，不让伪造值进键空间。
   限速覆盖**所有**能验证凭据的路径，不只是登录接口 —— 只要还剩一个免限流的接口能回答
   「这组 Basic/Bearer 对不对」，它就是一台在线口令字典的 yes/no 预言机（实测确实被这样绕过过）。
   会话 Cookie 不参与计数：那是 64 位十六进制随机数，猜不中没有意义，而人是会输错口令的。
@@ -188,8 +197,10 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
   浏览器对 Basic 凭据是按域缓存、会自动附带的，而 `SameSite` 只约束 Cookie。
   用户在质询弹窗里输过一次口令之后，恶意页面的跨站 POST 就会带着那份凭据打进来，
   此时唯一还能识别「这是跨站」的信号是 `Origin`（`text/plain` 属简单请求，不会触发预检）。
-  被拦时返回 `403 CROSS_SITE_REQUEST`。反向代理若改写了 `Host` 造成误判，用
-  `ANIMEKO_ALLOW_CROSS_ORIGIN=true` 关闭该检查（此时请自行保证服务不被不可信网络访问）。
+  被拦时返回 `403 CROSS_SITE_REQUEST`。反向代理若改写了 `Host` 造成误判：
+  设 `ANIMEKO_TRUSTED_PROXY_HOPS=<层数>` 后判定改看 `X-Forwarded-Host`（浏览器看到的原始主机），
+  或者确认反代保持 `proxy_set_header Host $host`；`ANIMEKO_ALLOW_CROSS_ORIGIN=true` 是最后手段
+  （此时请自行保证服务不被不可信网络访问）。
   命令行/API 客户端不带 `Origin`，不受影响。
 - 鉴权豁免判定走**归一化后的路径段精确匹配**（丢空段、逐段 URL 解码），不是 URI 字符串前缀。
   原因：Ktor 的路由按段匹配，`//api/data`、`/%61pi/data` 都会打到真接口，
@@ -212,7 +223,7 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
    - Bangumi 条目页 → 剧集「播放」→ 选择数据源「自动匹配」（或「手动」）→ 自动在数据源中匹配番剧与集数；
    - 或数据源搜索结果 →「剧集」→ 选线路播放；
    - 解析失败时在播放页底部「手动地址播放」粘贴 m3u8/mp4 地址。
-4. **聚合订阅**：数据源页填一条社区订阅地址（如 `https://sub.creamycake.org/v1/css1.json`）→「拉取订阅」→ 列表里能看到每个源的名字、分级、站点主机名与是否已存在 → 勾选后导入。整包导入的坏处是每次搜索都要把打不开的站点各试一遍，所以默认只勾选「本机还没有」的那些。订阅站挂了可以展开「贴订阅正文」直接粘 JSON。
+4. **聚合订阅**：数据源页填一条社区订阅地址（如 `https://sub.creamycake.org/v1/css1.json`）→「拉取订阅」→ 列表里能看到每个源的名字、分级、站点主机名与是否已存在 → 勾选后导入。整包导入的坏处是每次搜索都要把打不开的站点各试一遍，所以默认只勾选「本机还没有」的那些。订阅站挂了可以展开「贴订阅正文」直接粘 JSON。预览时会记录内容指纹，导入时若订阅已被更新过会提示重新预览，避免按一份和刚看到的不一样的清单导入。
 5. **登录**：首次打开是登录页，输入账号口令后由服务端签发会话 Cookie；退出登录会让会话在服务端立即作废。
 6. **追番与连播**：条目页点「收藏」加入追番列表（导航栏「收藏」查看）；从剧集列表进入播放时会自动带上下一集，当前集播放结束后倒计时自动连播。
 7. **播放快捷键**：`空格`/`K` 播放暂停、`←`/`→` ±5 秒、`J`/`L` ±10 秒、`↑`/`↓` 音量、`M` 静音、`F` 全屏。播放进度自动记忆（写在服务器），下次进入同一剧集时可「继续播放」。
@@ -318,10 +329,12 @@ cd frontend && NODE_ENV=development npm install && npm run dev   # http://localh
   而 `npm install` 本身是成功退出 0 的。
 - **起服务要带 UTF-8 locale**（原因见上面「社区数据源哪里找」）。
 
-单元测试：`cd backend && ./gradlew test` —— 148 个用例，覆盖 JsonPath / Selector 引擎与数据源仓库 /
-聚合订阅（含逐跳重定向、订阅内重名、坏条目单独失败）/ HLS 重写 / 代理会话绑定与过期 /
-登录会话与限速 / 凭据预言机 / 路径写法绕过 / 个人数据落盘与条件写 / SSRF 拦截不回显内网地址 /
-API 路由与静态托管缓存策略 / Bangumi 客户端。要求 0 编译警告。
+单元测试：`cd backend && ./gradlew test` —— 150+ 个用例，覆盖 JsonPath / Selector 引擎与数据源仓库 /
+聚合订阅（含逐跳重定向、订阅内重名、坏条目单独失败、预览指纹防内容漂移）/ HLS 重写 /
+代理会话绑定与过期 / 登录会话与限速（含 XFF 伪造与可信代理层数）/ 凭据预言机 /
+路径写法绕过 / 个人数据落盘与条件写 / SSRF 拦截不回显内网地址 / 候选 URL 尾缀净化 /
+停用源服务端拒绝 / API 路由与静态托管缓存策略 / Bangumi 客户端。要求 0 编译警告。
+GitHub Actions（`.github/workflows/ci.yml`）在 push/PR 上自动跑后端测试与前端 `tsc + vite build`。
 
 端到端冒烟（对**真实二进制**跑，不是测试桩）：`bash scripts/live-smoke.sh` —— 12 节 71 项，
 含登录门控、服务端个人数据往返与 ETag/409、真实订阅站预览导入、静态缓存策略、
@@ -335,7 +348,10 @@ API 路由与静态托管缓存策略 / Bangumi 客户端。要求 0 编译警�
 ```
 animeko-web/
 ├── Dockerfile              # 三阶段：node 前端 → gradle 后端 → JRE 运行（单镜像，含 ENV LANG=C.UTF-8）
+├── docker-entrypoint.sh     # 入口：root 起来只为给 /data 改属主，随后 gosu 降权到 app 用户
 ├── docker-compose.yml      # 凭据与两个安全开关都有注释
+├── .gitattributes           # 锁 LF：*.sh / Dockerfile / *.yml（否则 autocrlf 会把它们转成 CRLF，容器与 build 全挂）
+├── .github/workflows/ci.yml # push/PR 自动跑后端测试 + 前端 tsc/build
 ├── scripts/live-smoke.sh   # 端到端冒烟（真实进程 + 真实订阅站 + 攻击探针）
 ├── backend/                # Kotlin + Ktor
 │   └── src/main/kotlin/com/animeko/web/

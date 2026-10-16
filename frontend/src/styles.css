@@ -154,7 +154,9 @@ textarea::placeholder {
    ============================================================ */
 
 .app {
+  /* dvh 跟随移动端浏览器地址栏收放；不支持的旧浏览器回退 vh */
   min-height: 100vh;
+  min-height: 100dvh;
   display: flex;
   flex-direction: column;
 }
@@ -1577,6 +1579,7 @@ input[type='range']::-moz-range-thumb {
 
 .login-shell {
   min-height: 100vh;
+  min-height: 100dvh;
   display: grid;
   place-items: center;
   padding: 24px;
@@ -1664,6 +1667,7 @@ input[type='range']::-moz-range-thumb {
 
 .boot-screen {
   min-height: 100vh;
+  min-height: 100dvh;
   display: grid;
   place-items: center;
   padding: 24px;

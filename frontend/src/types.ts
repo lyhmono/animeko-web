@@ -172,6 +172,8 @@ export interface SubscriptionPreview {
   candidates: SubscriptionCandidate[]
   /** 结构不完整、导入后会变成死源的条目及原因 */
   rejected: string[]
+  /** 正文内容指纹：导入时回传，防止预览之后订阅被更新、按旧清单导入 */
+  fingerprint: string
 }
 
 export interface SubscriptionImport {

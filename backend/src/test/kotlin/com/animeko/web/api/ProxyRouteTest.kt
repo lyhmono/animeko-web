@@ -460,4 +460,27 @@ class ProxyRouteTest {
         }
         assertEquals(HttpStatusCode.Unauthorized, wrong.status)
     }
+
+    @Test
+    fun `error status does not forward a lying content-length`() = testApplication {
+        // 上游 404 却声明 9999 字节：转发这个长度，客户端会对着一个
+        // 永远等不到结尾的长度干转（转圈而不是报错）。错误体一律走 chunked。
+        val h = Harness(
+            listOf(
+                StreamStubFetcher.Spec(
+                    status = 404,
+                    contentType = "text/plain",
+                    body = "gone",
+                    headers = mapOf("content-length" to listOf("9999")),
+                ),
+            ),
+        )
+        application { module(h.cfg, h.stub, h.sessions) }
+        val resp = client.get("/api/proxy") {
+            parameter("url", "https://cdn.example.com/video.mp4")
+        }
+        assertEquals(HttpStatusCode.NotFound, resp.status)
+        assertNull(resp.headers["Content-Length"])
+        assertEquals("gone", resp.bodyAsText())
+    }
 }

@@ -67,6 +67,19 @@ data class AppConfig(
      */
     val allowCrossOrigin: Boolean =
         env("ANIMEKO_ALLOW_CROSS_ORIGIN", "false").toBooleanStrictOrNull() ?: false,
+
+    /**
+     * 服务前面有几层「由你控制」的反代（nginx / Caddy / CDN）。默认 0 = 直连部署：
+     * X-Forwarded-For / X-Forwarded-Host 一律不信任（客户端可任意伪造），
+     * 限速按 remoteHost 记账、同源判定比对 Host 头。
+     *
+     * 设为 N 之后：限速取 XFF 从右数第 N 个地址（真实客户端），同源判定改看
+     * X-Forwarded-Host（浏览器看到的原始主机）。**必须如实填写层数**：填少了
+     * 会把代理自己的 IP 当成客户端（限速全员共享），填多了会把客户端伪造的
+     * XFF 值当成真实地址（限速可被绕）。
+     */
+    val trustedProxyHops: Int =
+        env("ANIMEKO_TRUSTED_PROXY_HOPS", "0").toIntOrNull()?.coerceIn(0, 8) ?: 0,
 ) {
     val selectorsDir: Path get() = dataDir.resolve("selectors")
 

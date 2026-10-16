@@ -1,6 +1,7 @@
 # 构建产物
 backend/build/
 backend/.gradle/
+backend/.kotlin/
 backend/out/
 frontend/dist/
 frontend/node_modules/

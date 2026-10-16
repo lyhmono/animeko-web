@@ -35,6 +35,11 @@ class SelectorRepository(private val dir: Path) {
         encodeDefaults = true
     }
 
+    /** 解析缓存：数据源目录不常变，而 list()/find() 在每条采集请求的热路径上 */
+    private class Cached(val mtime: Long, val source: StoredSource)
+
+    private val cache = java.util.concurrent.ConcurrentHashMap<String, Cached>()
+
     init {
         if (!dir.exists()) dir.createDirectories()
     }
@@ -43,18 +48,37 @@ class SelectorRepository(private val dir: Path) {
         if (!dir.exists()) return emptyList()
         return Files.list(dir).use { stream ->
             stream.filter { it.extension == "json" }
-                .map { path ->
-                    runCatching {
-                        json.decodeFromString<StoredSource>(path.readText())
-                    }.getOrNull()
-                }
+                .map { path -> loadCached(path) }
                 .toList()
                 .filterNotNull()
                 .sortedBy { it.arguments.name }
         }
     }
 
-    fun find(name: String): StoredSource? = list().firstOrNull { it.arguments.name == name }
+    /**
+     * 按 mtime 缓存解析结果。save/delete 会显式失效缓存条目 —— 不能只靠 mtime：
+     * getLastModifiedTime 截到毫秒，同一毫秒内的两次写入会被误判成「没变」。
+     */
+    private fun loadCached(path: Path): StoredSource? {
+        val key = path.fileName.toString()
+        val mtime = runCatching { Files.getLastModifiedTime(path).toMillis() }.getOrNull() ?: 0L
+        cache[key]?.let { if (it.mtime == mtime) return it.source }
+        val parsed = runCatching { json.decodeFromString<StoredSource>(path.readText()) }.getOrNull()
+            ?: return null
+        cache[key] = Cached(mtime, parsed)
+        return parsed
+    }
+
+    private fun invalidate(file: Path) {
+        cache.remove(file.fileName.toString())
+    }
+
+    /**
+     * 按名字找源。enabledOnly=true 时停用的源视为不存在 ——
+     * 「停用」必须在服务端生效，只靠前端过滤等于任何直接调 API 的人都能用。
+     */
+    fun find(name: String, enabledOnly: Boolean = false): StoredSource? =
+        list().firstOrNull { it.arguments.name == name && (!enabledOnly || it.enabled) }
 
     fun save(arguments: SelectorSourceArguments, enabled: Boolean = true): StoredSource {
         require(arguments.name.isNotBlank()) { "数据源名称不能为空" }
@@ -74,6 +98,7 @@ class SelectorRepository(private val dir: Path) {
         } catch (e: IOException) {
             throw IllegalArgumentException("写入数据源文件失败：${e.message}", e)
         }
+        invalidate(target)
         return stored
     }
 
@@ -88,7 +113,9 @@ class SelectorRepository(private val dir: Path) {
         val stored = runCatching { json.decodeFromString<StoredSource>(target.readText()) }.getOrNull()
             ?: return false
         // 只有内容里的名字确实是目标名字才删，否则会删掉同名消毒后落到同一文件的另一条源
-        return stored.arguments.name == name && target.deleteIfExists()
+        val removed = stored.arguments.name == name && target.deleteIfExists()
+        invalidate(target)
+        return removed
     }
 
     /** 从 animeko 数据源 JSON 导入 */

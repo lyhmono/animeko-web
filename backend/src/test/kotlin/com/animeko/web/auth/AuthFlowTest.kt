@@ -27,11 +27,13 @@ class AuthFlowTest {
         password: String? = "correct horse",
         token: String? = null,
         authEnabled: Boolean = true,
+        trustedProxyHops: Int = 0,
     ) = AppConfig(
         authEnabled = authEnabled,
         authUser = user,
         authPassword = password,
         authToken = token,
+        trustedProxyHops = trustedProxyHops,
         dataDir = Files.createTempDirectory("animeko-auth-test"),
         frontendDir = "definitely-not-exist",
     )
@@ -251,5 +253,61 @@ class AuthFlowTest {
         limiter.onSuccess("ip")
         assertFalse(limiter.blocked("ip"))
         assertEquals(0, limiter.attempts("ip"))
+    }
+
+    @Test
+    fun `forged x-forwarded-for cannot reset the counter without a trusted proxy`() = testApplication {
+        application { module(config()) }
+        // hops=0（直连部署）：XFF 完全由客户端提供。若拿它当限速键，
+        // 攻击者每输错一次就轮换一个假 IP，计数器永远攒不满 —— 在线口令字典复活。
+        // 这里连换 10 个假地址输错口令，第 9 次起必须 429
+        var last = HttpStatusCode.OK
+        repeat(10) { i ->
+            last = client.post("/api/session/login") {
+                header(HttpHeaders.XForwardedFor, "10.0.0.$i")
+                setBody("""{"username":"me","password":"nope"}""")
+            }.status
+        }
+        assertEquals(HttpStatusCode.TooManyRequests, last)
+    }
+
+    @Test
+    fun `trusted proxy hops make the limiter per real client`() = testApplication {
+        application { module(config(trustedProxyHops = 1)) }
+        // 反代之后所有请求的 remoteHost 都是代理自己：不认 XFF 的话，
+        // 一个客户端输错到限额，其他所有人跟着被锁 5 分钟。
+        // hops=1 时取 XFF 最后一个地址当真实客户端，各记各的账。
+        repeat(8) {
+            client.post("/api/session/login") {
+                header(HttpHeaders.XForwardedFor, "203.0.113.7")
+                setBody("""{"username":"me","password":"nope"}""")
+            }
+        }
+        val stillBlocked = client.post("/api/session/login") {
+            header(HttpHeaders.XForwardedFor, "203.0.113.7")
+            setBody("""{"username":"me","password":"correct horse"}""")
+        }
+        assertEquals(HttpStatusCode.TooManyRequests, stillBlocked.status)
+
+        val other = client.post("/api/session/login") {
+            header(HttpHeaders.XForwardedFor, "203.0.113.8")
+            setBody("""{"username":"me","password":"correct horse"}""")
+        }
+        assertEquals(HttpStatusCode.OK, other.status, other.bodyAsText())
+    }
+
+    @Test
+    fun `forwarded chain shorter than the hop count falls back to remote host`() = testApplication {
+        application { module(config(trustedProxyHops = 3)) }
+        // 声称 3 层代理但 XFF 只有一个地址：链路被人裁剪/伪造过，
+        // 不许把那个孤值当真实客户端，退回 remoteHost 记账（行为与直连一致）
+        var last = HttpStatusCode.OK
+        repeat(10) { i ->
+            last = client.post("/api/session/login") {
+                header(HttpHeaders.XForwardedFor, "10.0.0.$i")
+                setBody("""{"username":"me","password":"nope"}""")
+            }.status
+        }
+        assertEquals(HttpStatusCode.TooManyRequests, last)
     }
 }

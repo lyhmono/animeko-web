@@ -155,7 +155,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(input),
     }),
-  importSubscription: (input: { url?: string; text?: string; names: string[] }) =>
+  importSubscription: (input: { url?: string; text?: string; names: string[]; fingerprint?: string }) =>
     request<SubscriptionImport>('/api/selector/subscriptions/import', {
       method: 'POST',
       body: JSON.stringify(input),

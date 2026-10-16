@@ -11,7 +11,9 @@ services:
       #   ssh -N -L 8080:127.0.0.1:8080 user@your-vps
       # - "127.0.0.1:8080:8080"
     volumes:
-      # 数据源配置 + 个人数据（收藏/进度）持久化（删除容器不丢）
+      # 数据源配置 + 个人数据（收藏/进度）持久化（删除容器不丢）。
+      # 容器进程以 app 用户（uid 10001）运行，入口脚本会把卷属主改给它；
+      # 若你在别处显式指定 user:，请自行保证该 uid 对这个目录可写。
       - ./data:/data
     environment:
       - TZ=Asia/Shanghai
@@ -30,5 +32,10 @@ services:
       # - ANIMEKO_ALLOW_PRIVATE_TARGETS=true
       # ---- 反代改写了 Host 导致同源判定误报时才需要放开 ----
       # - ANIMEKO_ALLOW_CROSS_ORIGIN=true
+      # ---- 服务前面有几层你控制的反代（nginx/Caddy/CDN）。默认 0=直连 ----
+      # 填 N 后：限速按 XFF 从右数第 N 个真实客户端记账（不会全员共享一个计数器），
+      # 同源判定改看 X-Forwarded-Host。层数要如实填：少了把代理 IP 当客户端，
+      # 多了把客户端伪造的 XFF 当真实地址。直连部署不要设。
+      # - ANIMEKO_TRUSTED_PROXY_HOPS=1
       # ---- Bangumi API（默认官方+社区镜像故障转移，可自定义）----
       # - ANIMEKO_BANGUMI_BASE_URLS=https://api.bgm.tv,https://bgmapi.anibt.net

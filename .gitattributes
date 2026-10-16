@@ -1,0 +1,9 @@
+# 构建期被逐字节消费的文件必须保持 LF。core.autocrlf 在 Windows 上
+# 默认 true，checkout 时会把它们转成 CRLF，后果分别是：
+#   *.sh       → 容器内核执行报 "bad interpreter: /bin/sh^M"，服务起不来
+#   Dockerfile → RUN 的 "\" 续行尾部带上 \r，docker build 解析失败
+#   *.yml      → CI/编排文件，统一 LF 避免跨平台 diff 噪音
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

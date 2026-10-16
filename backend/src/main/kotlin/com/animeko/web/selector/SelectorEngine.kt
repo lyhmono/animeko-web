@@ -88,7 +88,7 @@ class SelectorEngine(
         require(cfg.searchUrl.isNotBlank()) { "searchUrl 未配置" }
         val kw = cfg.resolvedAutoMatch().processKeyword(keyword)
         val url = cfg.searchUrl.replace("{keyword}", URLEncoder.encode(kw, "UTF-8"))
-        val body = throttledPage(cfg, url)
+        val body = fetchPage(cfg, url, mapOf("User-Agent" to cfg.userAgentOrDefault()), "数据源搜索页")
         val base = baseOf(cfg, url)
         val hits = when (cfg.subjectFormatId) {
             SubjectFormatJsonPathIndexed.ID -> selectJsonPathIndexed(body, cfg, base)
@@ -107,7 +107,7 @@ class SelectorEngine(
     suspend fun episodes(cfg: SelectorSearchConfig, subjectUrl: String): EpisodesResult {
         require(subjectUrl.startsWith("http")) { "subjectUrl 必须是绝对地址" }
         val target = UrlGuard.requireNotLiteralInternal(subjectUrl, allowPrivateTargets)
-        val body = fetchPage(target, mapOf("User-Agent" to cfg.userAgentOrDefault()), "数据源详情页")
+        val body = fetchPage(cfg, target, mapOf("User-Agent" to cfg.userAgentOrDefault()), "数据源详情页")
         val base = baseOf(cfg, target)
         val doc = Jsoup.parse(body, base)
         return when (cfg.channelFormatId) {
@@ -137,7 +137,7 @@ class SelectorEngine(
             ?: throw SelectorException("matchVideoUrl 正则无效")
         val nestedRegex = runCatching { Regex(mv.matchNestedUrl) }.getOrNull()
 
-        val html = fetchPage(target, headers, "播放页")
+        val html = fetchPage(cfg, target, headers, "播放页")
         findVideoUrl(html, target, videoRegex)?.let {
             return ResolvedTarget(it, referer, ua, cookies)
         }
@@ -160,6 +160,7 @@ class SelectorEngine(
                     // iframe="http://127.0.0.1:..." 就能借服务端去敲内网。非法候选直接跳过，
                     // 不让它把整次解析打断。
                     fetchPage(
+                        cfg,
                         UrlGuard.requireNotLiteralInternal(n, allowPrivateTargets),
                         headers,
                         "嵌套播放页",
@@ -319,9 +320,12 @@ class SelectorEngine(
     }
 
     private fun candidateUrls(html: String): List<String> {
-        val regex = Regex("""https?://[^\s"'<>\\)\]]+""")
+        // 排除集要覆盖 JS 模板串与对象字面量：反引号字符串是现在最主流的写法，
+        // `}` 紧随对象字面量。漏一个都会让带垃圾尾缀的 URL 命中 containsMatchIn
+        // 并被整串返回（表现为「解析成功但播放 404」）。
+        val regex = Regex("""https?://[^\s"'<>`{}\\)\]]+""")
         return regex.findAll(html)
-            .map { it.value.trimEnd('.', ',', ';', '!') }
+            .map { it.value.trim().trimEnd('`', '}', '{', '(', ')', '.', ',', ';', '!') }
             .filter { it.length > 10 }
             .distinct()
             .toList()
@@ -329,23 +333,24 @@ class SelectorEngine(
 
     // ---------- 工具 ----------
 
-    private suspend fun throttledPage(cfg: SelectorSearchConfig, url: String): String {
-        UrlGuard.requireNotLiteralInternal(url, allowPrivateTargets)
+    /**
+     * 源级限速：三个采集 phase（搜索/详情/播放页）都过这里。
+     * 锁内只推进「下一次允许请求的时间戳」，等待用 delay 放到锁外。
+     * 之前是持锁 Thread.sleep：既阻塞协程所在的 IO 线程，
+     * 又让所有数据源的搜索互相排队（A 源的 3 秒间隔会拖住 B 源）。
+     * 更早的版本只在搜索 phase 限速，连点播放仍然能瞬间打满详情页与播放页。
+     */
+    private suspend fun throttle(cfg: SelectorSearchConfig) {
         val interval = cfg.requestInterval.coerceAtLeast(0)
-        if (interval > 0) {
-            // 锁内只推进「下一次允许请求的时间戳」，等待用 delay 放到锁外。
-            // 之前是持锁 Thread.sleep：既阻塞协程所在的 IO 线程，
-            // 又让所有数据源的搜索互相排队（A 源的 3 秒间隔会拖住 B 源）。
-            val wait = synchronized(lastRequestAt) {
-                val now = System.currentTimeMillis()
-                val last = lastRequestAt[cfg.searchUrl] ?: 0L
-                val planned = maxOf(now, last + interval)
-                lastRequestAt[cfg.searchUrl] = planned
-                planned - now
-            }
-            if (wait > 0) delay(wait)
+        if (interval <= 0) return
+        val wait = synchronized(lastRequestAt) {
+            val now = System.currentTimeMillis()
+            val last = lastRequestAt[cfg.searchUrl] ?: 0L
+            val planned = maxOf(now, last + interval)
+            lastRequestAt[cfg.searchUrl] = planned
+            planned - now
         }
-        return fetchPage(url, mapOf("User-Agent" to cfg.userAgentOrDefault()), "数据源搜索页")
+        if (wait > 0) delay(wait)
     }
 
     /**
@@ -360,8 +365,14 @@ class SelectorEngine(
      * 连接超时/拒绝这类异常也要包住：否则一路掉进兜底 handler，
      * 前端只看到一个没有上下文的 500，而不是「上游不可用」的 502。
      */
-    private suspend fun fetchPage(url: String, headers: Map<String, String>, source: String): String {
+    private suspend fun fetchPage(
+        cfg: SelectorSearchConfig?,
+        url: String,
+        headers: Map<String, String>,
+        source: String,
+    ): String {
         var target = guard(url)
+        cfg?.let { throttle(it) }
         var hops = 0
         while (true) {
             val result = try {
