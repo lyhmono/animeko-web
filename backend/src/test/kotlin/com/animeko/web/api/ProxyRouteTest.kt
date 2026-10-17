@@ -530,9 +530,8 @@ class ProxyRouteTest {
     }
 
     @Test
-    fun `proxied images are cacheable but playlists are not`() = testApplication {
-        // 封面经 /api/proxy 中转后必须让浏览器缓存（否则每次刷新都穿透服务器拉图床），
-        // 但 m3u8 清单绝不能缓存 —— 源站换源后浏览器还拿旧清单，播放的是过期地址
+    fun `proxied images are cacheable by the browser`() = testApplication {
+        // 封面经 /api/proxy 中转后必须让浏览器缓存，否则每次刷新都穿透服务器拉图床
         val img = Harness(
             listOf(
                 StreamStubFetcher.Spec(status = 200, contentType = "image/jpeg", body = "JPEGDATA"),
@@ -541,13 +540,17 @@ class ProxyRouteTest {
         application { module(img.cfg, img.stub, img.sessions) }
         val r1 = client.get("/api/proxy") { parameter("url", "https://lain.bgm.tv/pic/cover/l/e2/e7/328609_2EHLJ.jpg") }
         assertEquals("public, max-age=86400", r1.headers["Cache-Control"])
+    }
 
+    @Test
+    fun `playlists are never given a browser cache`() = testApplication {
+        // m3u8 清单缓存一天等于源站换源不生效：浏览器拿着旧清单，播放的是过期地址
         val m3u8 = Harness(listOf(hlsPlaylist("seg1.ts")))
         application { module(m3u8.cfg, m3u8.stub, m3u8.sessions) }
         val r2 = client.get("/api/proxy") {
             parameter("url", "https://cdn.example.com/hls/index.m3u8")
             parameter("sid", m3u8.sid)
         }
-        assertEquals(null, r2.headers["Cache-Control"], "清单缓存一天等于源站换源不生效")
+        assertEquals(null, r2.headers["Cache-Control"])
     }
 }
