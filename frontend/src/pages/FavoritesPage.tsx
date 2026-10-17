@@ -1,5 +1,6 @@
 import { useCallback, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { proxiedImage, onCoverError } from '../api'
 import { listFavorites, toggleFavorite, type FavoriteSubject } from '../lib/storage'
 import { IconHeart, IconSearch, IconTrash } from '../lib/icons'
 
@@ -35,7 +36,13 @@ export default function FavoritesPage() {
             <div className="fav-card" key={f.id}>
               <Link to={`/subject/${f.id}`} aria-label={f.name_cn || f.name}>
                 {f.cover ? (
-                  <img className="cover" src={f.cover} alt={f.name_cn || f.name} loading="lazy" />
+                  <img
+                    className="cover"
+                    src={proxiedImage(f.cover)}
+                    alt={f.name_cn || f.name}
+                    loading="lazy"
+                    onError={onCoverError}
+                  />
                 ) : (
                   <div className="cover" />
                 )}

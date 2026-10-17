@@ -37,5 +37,9 @@ services:
       # 同源判定改看 X-Forwarded-Host。层数要如实填：少了把代理 IP 当客户端，
       # 多了把客户端伪造的 XFF 当真实地址。直连部署不要设。
       # - ANIMEKO_TRUSTED_PROXY_HOPS=1
+      # ---- 首次启动自动拉取的聚合订阅（空仓库时生效，开箱即用）----
+      # 首次启动会多花几秒拉订阅；站点挂了/网络不通都不阻塞启动，
+      # 仓库仍为空时回退到内置示例源
+      - ANIMEKO_SEED_SUBSCRIPTION_URL=https://sub.creamycake.org/v1/css1.json
       # ---- Bangumi API（默认官方+社区镜像故障转移，可自定义）----
       # - ANIMEKO_BANGUMI_BASE_URLS=https://api.bgm.tv,https://bgmapi.anibt.net

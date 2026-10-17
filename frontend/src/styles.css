@@ -851,6 +851,42 @@ textarea::placeholder {
   white-space: nowrap;
 }
 
+/* 搜索页失败的源：默认折叠成一行，不把成功结果挤下去 */
+.source-fail {
+  margin-top: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  font-size: 13px;
+}
+
+.source-fail summary {
+  padding: 10px 14px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.source-fail summary:hover {
+  color: var(--text);
+}
+
+.source-fail ul {
+  margin: 0;
+  padding: 4px 14px 12px 32px;
+  color: var(--text-secondary);
+}
+
+.source-fail li {
+  margin-bottom: 6px;
+}
+
+.source-fail-msg {
+  margin-left: 8px;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+
 /* ============================================================
    番剧详情
    ============================================================ */
@@ -866,6 +902,13 @@ textarea::placeholder {
   border-radius: var(--radius);
   flex-shrink: 0;
   box-shadow: var(--shadow-hover);
+  background: var(--bg-hover);
+}
+
+/* 封面加载失败（图床 404/被墙）：img 被隐藏后露出上面的底色占位，
+  比浏览器默认的破图图标安静，也不塌布局 */
+.cover.broken {
+  visibility: hidden;
 }
 
 .subject-header .meta {

@@ -32,6 +32,7 @@ import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.request.path
 import io.ktor.server.response.respond
 import io.ktor.server.routing.routing
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 
 fun main() {
@@ -104,11 +105,26 @@ fun Application.module(
     )
     val bangumi = BangumiClient(fetcher, cfg.bangumiBaseUrls)
     val repo = SelectorRepository(cfg.selectorsDir)
-    repo.seedIfEmpty()
     val engine = SelectorEngine(fetcher, cfg.allowPrivateTargets)
     val sessions = proxySessions
     val userData = UserDataStore(cfg.userDataFile)
     val subscriptions = SubscriptionService(fetcher, repo, cfg.allowPrivateTargets)
+
+    // 数据源初始化：配了默认订阅就先拉它（开箱即用），失败或结果仍为空时
+    // 回退到内置示例源；回退也重要——订阅站挂了时至少列表不是空的。
+    // 注意顺序：订阅拉取在 seedIfEmpty 之前，否则示例源一落地 list() 就非空，
+    // 默认订阅永远没有触发机会。
+    if (cfg.seedSubscriptionUrl.isNullOrBlank()) {
+        repo.seedIfEmpty()
+    } else {
+        // module() 不在协程里，而订阅拉取是 suspend 的：启动阶段阻塞这一次即可
+        // （只在仓库为空时发生，Docker HEALTHCHECK 的 start-period 已兜底）
+        try {
+            runBlocking { seedFromSubscription(cfg.seedSubscriptionUrl, subscriptions, repo) }
+        } finally {
+            if (repo.list().isEmpty()) repo.seedIfEmpty()
+        }
+    }
 
     configureApiRoutes(
         cfg, bangumi, repo, engine, fetcher, sessions,
@@ -126,6 +142,40 @@ fun Application.module(
         )
     }
     checkFileNameEncoding()
+}
+
+/**
+ * 首次启动时为仓库种上默认订阅里的数据源。
+ * 拉取/解析/导入每一步都可能失败（订阅站挂了、格式变了、条目非法），
+ * 全部只记日志不抛出——启动流程不能被一个第三方订阅绑架；
+ * 调用方负责在仓库仍然为空时回退到内置示例源。
+ */
+private suspend fun seedFromSubscription(
+    url: String,
+    subscriptions: SubscriptionService,
+    repo: SelectorRepository,
+) {
+    appLog.info("首次启动：正在拉取默认订阅 {}", url)
+    val preview = try {
+        subscriptions.preview(url = url, text = null)
+    } catch (e: Exception) {
+        appLog.warn("默认订阅拉取失败（不影响启动）：{}", e.message ?: e::class.simpleName)
+        return
+    }
+    if (preview.candidates.isEmpty()) {
+        appLog.warn("默认订阅里没有可导入的数据源（rejected={} 条）", preview.rejected.size)
+        return
+    }
+    val result = try {
+        subscriptions.importSelected(url = url, text = null, names = preview.candidates.map { it.name })
+    } catch (e: Exception) {
+        appLog.warn("默认订阅导入失败（不影响启动）：{}", e.message ?: e::class.simpleName)
+        return
+    }
+    appLog.info(
+        "默认订阅导入完成：新增 {} 个，覆盖 {} 个，失败 {} 个，跳过 {} 条",
+        result.added.size, result.updated.size, result.failed.size, result.rejected.size,
+    )
 }
 
 /**

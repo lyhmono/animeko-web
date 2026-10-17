@@ -8,6 +8,7 @@ import type {
   SubscriptionImport,
   UserData,
 } from './types'
+import type { SyntheticEvent } from 'react'
 
 /** 带 HTTP 状态的错误：数据层要区分 401（会话没了）/409（版本不符）/400（超限或格式错）。 */
 export class ApiError extends Error {
@@ -168,11 +169,32 @@ export function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
+/**
+ * 封面加载失败（图床 404 / 被墙 / 源站删图）时的兜底：
+ * 隐藏破图露出底层 cover 的底色占位，比浏览器默认破图图标安静，也不塌布局。
+ */
+export function onCoverError(e: SyntheticEvent<HTMLImageElement>): void {
+  e.currentTarget.classList.add('broken')
+}
+
+/**
+ * 远端图片改走服务端代理。封面图床（lain.bgm.tv）与源站图标在部分网络下
+ * 直连超时或被防盗链挡，而 /api/proxy 就在容器里转发任意 URL ——
+ * 服务部署在国外时它拉图床是通的，浏览器只需要连自己的服务器。
+ * 会话 Cookie 会自动带到这些请求上，无需额外鉴权。
+ * 非 http(s) 的地址（data:、blob:、相对路径）原样返回。
+ */
+export function proxiedImage(url: string | null | undefined): string {
+  if (!url) return ''
+  if (!/^https?:\/\//i.test(url)) return url
+  return `/api/proxy?url=${encodeURIComponent(url)}`
+}
+
 export function isDirectPlayable(url: string): boolean {
-  // 注意：播放地址通常是 /api/proxy?url=<encoded>&ua=...&referer=... 形式，
-  // url 参数后面还带有 ua/referer/cookie，媒体后缀不在字符串末尾。
-  // 必须先取出 url 参数的值再判断后缀，否则直链视频会被误判为 HLS
-  // （hls.js 把 WebM 字节流当 m3u8 解析 → manifestParsingError → 播放失败）
+  // 播放地址是 /api/proxy?url=<encoded>（凭据在服务端会话里，URL 只带 sid），
+  // 内层真实地址不在字符串末尾。必须先取出 url 参数的值再判断后缀，
+  // 否则直链视频会被误判为 HLS（hls.js 把 WebM 字节流当 m3u8 解析 →
+  // manifestParsingError → 播放失败）
   let target = url
   if (url.includes('/api/proxy?')) {
     try {

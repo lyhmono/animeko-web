@@ -80,6 +80,14 @@ data class AppConfig(
      */
     val trustedProxyHops: Int =
         env("ANIMEKO_TRUSTED_PROXY_HOPS", "0").toIntOrNull()?.coerceIn(0, 8) ?: 0,
+
+    /**
+     * 首次启动（数据源仓库为空）时自动拉取并导入的聚合订阅地址。
+     * 默认空 = 只种内置示例源。配上之后「开箱即用」：不用手动去数据源页
+     * 粘贴订阅。拉取失败（站点挂了/网络不通）不阻塞启动，仓库仍有空时
+     * 回退到内置示例源。
+     */
+    val seedSubscriptionUrl: String? = envOrNull("ANIMEKO_SEED_SUBSCRIPTION_URL"),
 ) {
     val selectorsDir: Path get() = dataDir.resolve("selectors")
 

@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { api, errMsg } from '../api'
+import { api, errMsg, onCoverError, proxiedImage } from '../api'
 import type { BgmSubject, StoredSource, SubjectHit } from '../types'
 import { addSearchHistory, favoriteIdSet } from '../lib/storage'
 import { IconHeartFilled } from '../lib/icons'
@@ -85,6 +85,20 @@ export default function SearchPage() {
     }
   }, [q])
 
+  // 搜索源的展示顺序：有结果的按命中数降序（最好的源排最前），
+  // 零命中的沉底但保留「确实搜过」的信息，失败的折叠成一行摘要 ——
+  // 19 个源里挂掉三五个时，平铺 error-box 会把整页结果推到屏幕外。
+  const ranked = useMemo(() => {
+    const ok = sources.filter((s) => !sourceErrors[s.arguments.name])
+    const failed = sources
+      .filter((s) => sourceErrors[s.arguments.name] !== undefined)
+      .map((s) => ({ name: s.arguments.name, error: sourceErrors[s.arguments.name] as string }))
+    const sorted = [...ok].sort(
+      (a, b) => (sourceHits[b.arguments.name]?.length ?? 0) - (sourceHits[a.arguments.name]?.length ?? 0),
+    )
+    return { sorted, failed }
+  }, [sources, sourceHits, sourceErrors])
+
   const coverOf = (s: BgmSubject) =>
     s.images?.large ?? s.images?.common ?? s.images?.medium ?? s.images?.small ?? s.images?.grid ?? ''
 
@@ -98,7 +112,7 @@ export default function SearchPage() {
       ] as [string | null | undefined, string][]
     )
       .filter(([u]) => !!u)
-      .map(([u, w]) => `${u} ${w}`)
+      .map(([u, w]) => `${proxiedImage(u)} ${w}`)
       .join(', ')
 
   return (
@@ -137,11 +151,12 @@ export default function SearchPage() {
             {coverOf(s) ? (
               <img
                 className="cover"
-                src={coverOf(s)}
+                src={proxiedImage(coverOf(s))}
                 srcSet={coverSrcSet(s)}
                 sizes="(max-width: 720px) 45vw, 200px"
                 alt={s.name_cn}
                 loading="lazy"
+                onError={onCoverError}
               />
             ) : (
               <div className="cover" />
@@ -167,7 +182,7 @@ export default function SearchPage() {
           配置
         </div>
       )}
-      {sources.map((s) => (
+      {ranked.sorted.map((s) => (
         <div key={s.arguments.name} style={{ marginBottom: 18 }}>
           <div style={{ fontSize: 14, marginBottom: 8, color: 'var(--text-secondary)' }}>
             {s.arguments.name}
@@ -175,9 +190,6 @@ export default function SearchPage() {
               {sourceHits[s.arguments.name]?.length ?? 0} 个结果
             </span>
           </div>
-          {sourceErrors[s.arguments.name] && (
-            <div className="error-box">{sourceErrors[s.arguments.name]}</div>
-          )}
           <div className="hit-list">
             {(sourceHits[s.arguments.name] ?? []).slice(0, 20).map((hit) => (
               <div className="hit-item" key={hit.url}>
@@ -195,6 +207,22 @@ export default function SearchPage() {
           </div>
         </div>
       ))}
+
+      {ranked.failed.length > 0 && (
+        <details className="source-fail">
+          <summary>
+            {ranked.failed.length} 个数据源无响应（点开看原因，不影响上面已成功的结果）
+          </summary>
+          <ul>
+            {ranked.failed.map((f) => (
+              <li key={f.name}>
+                <b>{f.name}</b>
+                <span className="source-fail-msg">{f.error}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
     </div>
   )
 }

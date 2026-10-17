@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { api, errMsg } from '../api'
+import { api, errMsg, onCoverError, proxiedImage } from '../api'
 import type { BgmEpisode, BgmSubject, EpisodesResult, StoredSource } from '../types'
 import { isFavorite, toggleFavorite } from '../lib/storage'
 import { IconHeart, IconHeartFilled } from '../lib/icons'
@@ -178,7 +178,7 @@ export default function SubjectPage() {
     ] as [string | null | undefined, string][]
   )
     .filter(([u]) => !!u)
-    .map(([u, w]) => `${u} ${w}`)
+    .map(([u, w]) => `${proxiedImage(u)} ${w}`)
     .join(', ')
   const epsList = Array.isArray(subject.eps) ? subject.eps : []
   const episodes = [...epsList].sort((a, b) => (a.sort ?? 0) - (b.sort ?? 0))
@@ -189,10 +189,11 @@ export default function SubjectPage() {
         {cover && (
           <img
             className="cover"
-            src={cover}
+            src={proxiedImage(cover)}
             srcSet={coverSrcSet}
             sizes="(max-width: 720px) 40vw, 220px"
             alt={subject.name_cn}
+            onError={onCoverError}
           />
         )}
         <div className="meta">
