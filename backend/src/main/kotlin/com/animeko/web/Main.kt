@@ -105,18 +105,19 @@ fun Application.module(
     )
     val bangumi = BangumiClient(fetcher, cfg.bangumiBaseUrls)
     val repo = SelectorRepository(cfg.selectorsDir)
-    repo.seedIfEmpty()
     val engine = SelectorEngine(fetcher, cfg.allowPrivateTargets)
     val sessions = proxySessions
     val userData = UserDataStore(cfg.userDataFile)
     val subscriptions = SubscriptionService(fetcher, repo, cfg.allowPrivateTargets)
 
-    // 开机自动导入订阅：放到协程里，绝不在模块初始化里做网络 I/O
-    // （订阅站慢或挂了会把启动卡住，而且失败根本不该影响服务可用性）
-    if (cfg.subscriptionAutoImport.isNotEmpty()) {
+    // 示例源先落地（纯本地文件操作，不开网络），保证列表立刻非空；
+    // 默认订阅随后异步导入 —— 绝不在模块初始化里做网络 I/O：订阅站慢或挂了会把
+    // 启动卡住，而端口还没监听时连健康检查都过不去。
+    repo.seedIfEmpty()
+    if (cfg.autoImportUrls.isNotEmpty()) {
         launch {
             val summaries = runCatching {
-                subscriptions.autoImport(cfg.subscriptionAutoImport, cfg.subscriptionAutoTiers)
+                subscriptions.autoImport(cfg.autoImportUrls, cfg.subscriptionAutoTiers)
             }.getOrElse { e ->
                 appLog.warn("自动导入订阅异常：{}", e.message ?: e::class.simpleName)
                 emptyList()

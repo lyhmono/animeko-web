@@ -553,4 +553,45 @@ class ProxyRouteTest {
         assertEquals(HttpStatusCode.OK, resp.status)
         assertEquals(total, resp.bodyAsBytes().size, "慢但活着的流必须完整转完")
     }
+
+    @Test
+    fun `proxied images get a browser cache header`() = testApplication {
+        val img = Harness(
+            listOf(
+                StreamStubFetcher.Spec(status = 200, contentType = "image/jpeg", body = "JPEGDATA"),
+            ),
+        )
+        application { module(img.cfg, img.stub, img.sessions) }
+        val r = client.get("/api/proxy") {
+            parameter("url", "https://lain.bgm.tv/pic/cover/l/e2/e7/328609_2EHLJ.jpg")
+        }
+        assertEquals(HttpStatusCode.OK, r.status)
+        assertEquals("public, max-age=86400", r.headers["Cache-Control"])
+    }
+
+    @Test
+    fun `playlists are never cacheable`() = testApplication {
+        // 清单缓存一天 = 源站换源之后浏览器还在拿旧清单播过期地址
+        val m3u8 = Harness(listOf(hlsPlaylist("seg1.ts")))
+        application { module(m3u8.cfg, m3u8.stub, m3u8.sessions) }
+        val r = client.get("/api/proxy") {
+            parameter("url", "https://cdn.example.com/hls/index.m3u8")
+            parameter("sid", m3u8.sid)
+        }
+        assertEquals(HttpStatusCode.OK, r.status)
+        assertEquals(null, r.headers["Cache-Control"], r.headers["Cache-Control"])
+    }
+
+    @Test
+    fun `a refused image is not labelled cacheable`() = testApplication {
+        val img = Harness(
+            listOf(
+                StreamStubFetcher.Spec(status = 403, contentType = "image/jpeg", body = "no"),
+            ),
+        )
+        application { module(img.cfg, img.stub, img.sessions) }
+        val r = client.get("/api/proxy") { parameter("url", "https://lain.bgm.tv/x.jpg") }
+        assertEquals(HttpStatusCode.Forbidden, r.status)
+        assertEquals(null, r.headers["Cache-Control"])
+    }
 }

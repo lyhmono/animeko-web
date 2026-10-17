@@ -105,6 +105,7 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 | `ANIMEKO_ALLOW_PRIVATE_TARGETS` | `false` | 是否允许代理/抓取内网地址（见下方安全说明） |
 | `ANIMEKO_ALLOW_CROSS_ORIGIN` | `false` | 是否放开「写接口仅限同源」的 CSRF 检查（见下方安全说明） |
 | `ANIMEKO_TRUSTED_PROXY_HOPS` | `0` | 服务前面有几层**你控制**的反代。0=直连（X-Forwarded-* 一律不信）；填 N 后限速按 XFF 从右数第 N 个真实客户端记账、同源判定改看 `X-Forwarded-Host`。层数要如实填：少了把代理 IP 当客户端（限速全员共享），多了把客户端伪造的 XFF 当真值 |
+| `ANIMEKO_SEED_SUBSCRIPTION_URL` | 空 | `ANIMEKO_SUBSCRIPTION_AUTO_IMPORT` 的**别名**（旧名字），等价于往那个列表里追加一个地址。两个只配一个。曾经它代表另一套「只在空仓库时同步阻塞启动拉一次」的机制，最坏情况会让端口迟迟不监听，现已统一到异步这一套 |
 | `ANIMEKO_BANGUMI_BASE_URLS` | `https://api.bgm.tv,https://bgmapi.anibt.net` | Bangumi API 地址列表（逗号分隔，按顺序故障转移；官方域名在部分地区被墙，可改用社区镜像） |
 | `ANIMEKO_REQUEST_TIMEOUT_MS` | `20000` | 元数据/抓取类出站请求超时 |
 | `ANIMEKO_PROXY_TIMEOUT_MS` | `120000` | 视频代理的连接与**响应头**超时（body 阶段刻意不设时限，见下方安全说明） |
@@ -263,7 +264,7 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 
 ## 使用流程
 
-1. **导入数据源**：进入「数据源」页，粘贴 animeko 的 Selector 数据源 JSON（与 animeko App 内「设置 → 数据源管理」添加的配置格式一致），点击导入并启用。
+1. **导入数据源**：首次启动会先种内置示例源，再在后台协程里拉取默认订阅并导入（compose 里 `ANIMEKO_SUBSCRIPTION_AUTO_IMPORT`，默认社区 css1.json），打开就能用；订阅站挂了或很慢都不影响启动。之后想增删，进入「数据源」页粘贴 animeko 的 Selector 数据源 JSON（与 animeko App 内「设置 → 数据源管理」添加的配置格式一致），或再用聚合订阅入口挑源。
 2. **搜索**：首页搜索 → Bangumi 条目 + 各数据源结果。
 3. **播放**：
    - Bangumi 条目页 → 剧集「播放」→ 选择数据源「自动匹配」（或「手动」）→ 自动在数据源中匹配番剧与集数；

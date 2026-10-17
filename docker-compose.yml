@@ -42,8 +42,11 @@ services:
       # ---- 开机自动导入聚合订阅，省掉每次去界面里勾选 ----
       # 逗号分隔可写多个地址。只覆盖同名源，不会删你手动加的源；
       # 你在界面上「关掉」的源会保持关闭（重启不会偷偷给你打开）。
-      # 订阅站挂了只记日志，不影响服务启动。
+      # 导入跑在后台协程里：订阅站挂了或很慢都不影响启动与端口监听。
       - ANIMEKO_SUBSCRIPTION_AUTO_IMPORT=https://sub.creamycake.org/v1/css1.json
       # 只要某几个分级（tier 越低质量越好）。境外 VPS 上高 tier 常是 JS 加密源
       # 或只对国内 IP 开放的 CDN，导进来只会让每次搜索多打几个死站。留空 = 全导。
       # - ANIMEKO_SUBSCRIPTION_AUTO_TIERS=0,1
+      # ANIMEKO_SEED_SUBSCRIPTION_URL 是上面那个的别名（旧名字，等价于追加一个地址），
+      # 只配一个就行，别两个都写。
+      # - ANIMEKO_SEED_SUBSCRIPTION_URL=https://sub.creamycake.org/v1/css1.json

@@ -805,6 +805,13 @@ private suspend fun proxyVideo(
     } else {
         null
     }
+    // 封面/图标的浏览器缓存。经代理的图片 URL 只由内容决定（同一张封面永远是同一个
+    // /api/proxy 地址），缓存一天能省掉每次刷新都穿透服务器拉图床的开销。
+    // 只对图片生效：m3u8 清单缓存一天等于源站换源不生效，视频分片没有缓存的意义
+    // （每个分片只被请求一次，带签名的地址也不该进磁盘缓存）。
+    if (ct?.match("image/*") == true && result.status == 200) {
+        call.response.header(HttpHeaders.CacheControl, "public, max-age=86400")
+    }
     // body 阶段刻意**不设**超时。试过，两种做法都不成立，理由写在这里免得被人再加回来：
     //  1) 绝对期限（从响应头开始计时）会砍掉健康的慢速长传输。实测一部 700KB 的
     //     「每秒给一段」的流被 4 秒期限砍断后，声明了 Content-Length 的响应既不补字节也不关闭，

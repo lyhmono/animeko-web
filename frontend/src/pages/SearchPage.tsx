@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import Poster from '../components/Poster'
 import { api, errMsg } from '../api'
@@ -69,12 +69,12 @@ export default function SearchPage() {
         if (cancelled) return
         const enabled = list.filter((s) => s.enabled)
         setSources(enabled)
-        // 逐个回填，不能等 Promise.all 一次性 set：21 个源里有几个是死的，
-        // 每个要等到 20 秒超时才回来。攒齐再渲染的结果是「明明有结果的源
+        // 逐个回填，不能等 Promise.all 一次性 set：十几个源里有几个是死的，
+        // 每个要等到超时才回来。攒齐再渲染的结果是「明明有结果的源
         // 也陪着死源一起空转」，用户看到满屏「0 个结果」以为功能坏了 —— 实测如此。
         //
         // 并发必须设上限：浏览器对同一来源只有 6 条连接，全部源一起发会把它们占满，
-        // 于是 /api/health、/api/data 这类小请求排在 20 秒超时后面 —— 实测表现为
+        // 于是 /api/health、/api/data 这类小请求排在超时后面 —— 实测表现为
         // 重新打开标签页时整个应用卡在「正在连接服务器…」。
         let next = 0
         const worker = async () => {
@@ -112,10 +112,44 @@ export default function SearchPage() {
   const hitsWithCovers = (source: string) =>
     (sourceHits[source] ?? []).some((h) => !!h.cover)
 
+  /**
+   * 源的展示顺序：有结果的按命中数降序排最前，失败的折叠成一行摘要 ——
+   * 十几个源里挂掉三五个时，平铺 error-box 会把整页结果推到屏幕外。
+   *
+   * 分三段而不是直接按命中数排，是为了配合「逐个回填」不抖动：只按数字排的话，
+   * 一个源从 2 条变 6 条就会在页面上跳一次位置。这里 pending 的单独一段，
+   * 每个源最多只移动一次（从「搜索中」落到有结果或零命中段）。
+   */
+  const ranked = useMemo(() => {
+    const failed: { name: string; error: string }[] = []
+    const withHits: { name: string; count: number }[] = []
+    const pending: string[] = []
+    const zero: string[] = []
+    for (const s of sources) {
+      const name = s.arguments.name
+      const error = sourceErrors[name]
+      if (error !== undefined) {
+        failed.push({ name, error })
+      } else if (name in sourceHits) {
+        const count = sourceHits[name].length
+        if (count > 0) withHits.push({ name, count })
+        else zero.push(name)
+      } else {
+        pending.push(name)
+      }
+    }
+    withHits.sort((a, b) => b.count - a.count)
+    return {
+      order: [...withHits.map((x) => x.name), ...pending, ...zero],
+      failed,
+    }
+  }, [sources, sourceHits, sourceErrors])
+
   const coverOf = (s: BgmSubject) =>
     s.images?.large ?? s.images?.common ?? s.images?.medium ?? s.images?.small ?? s.images?.grid ?? ''
 
-  // Bangumi 封面多尺寸 srcset：浏览器按实际显示宽度选图，移动端/低 DPR 下载小图省流量
+  // Bangumi 封面多尺寸 srcset：浏览器按实际显示宽度选图，移动端/低 DPR 下载小图省流量。
+  // 这里给的是**原始地址**：Poster 在直连失败时才改走代理，那条路径会主动丢掉 srcset
   const coverSrcSet = (s: BgmSubject) =>
     (
       [
@@ -165,8 +199,8 @@ export default function SearchPage() {
               className="cover"
               src={coverOf(s)}
               srcSet={coverSrcSet(s)}
-              sizes="(max-width: 720px) 45vw, 200px"
-              alt={s.name_cn}
+              sizes="(max-width: 720px) 40vw, 220px"
+              alt={s.name_cn || s.name}
             />
             <div className="info">
               <div className="title">{s.name_cn || s.name}</div>
@@ -190,66 +224,77 @@ export default function SearchPage() {
           配置
         </div>
       )}
-      {sources.map((s) => {
-        const name = s.arguments.name
-        // 结果和错误都没回来 = 这个源还在跑。直接显示「0 个结果」是谎报：
-        // 死源要 20 秒才超时，这期间用户看到的就是「所有源都是 0」
+      {ranked.order.map((name) => {
+        const hits = sourceHits[name] ?? []
         const pending = !(name in sourceHits) && !(name in sourceErrors)
         return (
-        <div key={name} style={{ marginBottom: 18 }}>
-          <div style={{ fontSize: 14, marginBottom: 8, color: 'var(--text-secondary)' }}>
-            {name}
-            <span className="count" style={{ marginLeft: 8, fontSize: 12 }}>
-              {pending ? '搜索中…' : `${sourceHits[name]?.length ?? 0} 个结果`}
-            </span>
-          </div>
-          {sourceErrors[name] && (
-            <div className="error-box">{sourceErrors[name]}</div>
-          )}
-          {/* 有封面就排成卡片，没有就退回紧凑列表：
-              不同源的条目格式差别很大（CSS / JsonPath），不能假定都有图 */}
-          {!pending && (hitsWithCovers(name) ? (
-            <div className="result-grid">
-              {(sourceHits[name] ?? []).slice(0, 20).map((hit) => (
-                <Link
-                  key={hit.url}
-                  className="subject-card"
-                  to={sourceDetailHref(name, hit.name, hit.url, hit.cover ?? '')}
-                >
-                  <Poster
-                    className="cover"
-                    src={hit.cover ?? ''}
-                    alt={hit.name}
-                    sizes="(max-width: 720px) 45vw, 200px"
-                  />
-                  <div className="info">
-                    <div className="title" title={hit.name}>
-                      {hit.name}
-                    </div>
-                    <div className="meta">
-                      <span className="count">剧集</span>
-                    </div>
-                  </div>
-                </Link>
-              ))}
+          <div key={name} style={{ marginBottom: 18 }}>
+            <div style={{ fontSize: 14, marginBottom: 8, color: 'var(--text-secondary)' }}>
+              {name}
+              <span className="count" style={{ marginLeft: 8, fontSize: 12 }}>
+                {pending ? '搜索中…' : `${hits.length} 个结果`}
+              </span>
             </div>
-          ) : (
-            <div className="hit-list">
-              {(sourceHits[name] ?? []).slice(0, 20).map((hit) => (
-                <div className="hit-item" key={hit.url}>
-                  <span className="name" title={hit.name}>
-                    {hit.name}
-                  </span>
-                  <Link className="btn btn-sm" to={sourceDetailHref(name, hit.name, hit.url, hit.cover ?? '')}>
-                    剧集
+            {/* 有封面就排成卡片，没有就退回紧凑列表：
+                不同源的条目格式差别很大（CSS / JsonPath），不能假定都有图 */}
+            {!pending && (hitsWithCovers(name) ? (
+              <div className="result-grid">
+                {hits.slice(0, 20).map((hit) => (
+                  <Link
+                    key={hit.url}
+                    className="subject-card"
+                    to={sourceDetailHref(name, hit.name, hit.url, hit.cover ?? '')}
+                  >
+                    <Poster
+                      className="cover"
+                      src={hit.cover ?? ''}
+                      alt={hit.name}
+                      sizes="(max-width: 720px) 40vw, 220px"
+                    />
+                    <div className="info">
+                      <div className="title" title={hit.name}>
+                        {hit.name}
+                      </div>
+                      <div className="meta">
+                        <span className="count">剧集</span>
+                      </div>
+                    </div>
                   </Link>
-                </div>
-              ))}
-            </div>
-          ))}
-        </div>
+                ))}
+              </div>
+            ) : (
+              <div className="hit-list">
+                {hits.slice(0, 20).map((hit) => (
+                  <div className="hit-item" key={hit.url}>
+                    <span className="name" title={hit.name}>
+                      {hit.name}
+                    </span>
+                    <Link className="btn btn-sm" to={sourceDetailHref(name, hit.name, hit.url, hit.cover ?? '')}>
+                      剧集
+                    </Link>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
         )
       })}
+
+      {ranked.failed.length > 0 && (
+        <details className="source-fail">
+          <summary>
+            {ranked.failed.length} 个数据源无响应（点开看原因，不影响上面已成功的结果）
+          </summary>
+          <ul>
+            {ranked.failed.map((f) => (
+              <li key={f.name}>
+                <b>{f.name}</b>
+                <span className="source-fail-msg">{f.error}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
     </div>
   )
 }

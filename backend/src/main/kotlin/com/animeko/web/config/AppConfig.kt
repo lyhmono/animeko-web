@@ -97,7 +97,23 @@ data class AppConfig(
      */
     val trustedProxyHops: Int =
         env("ANIMEKO_TRUSTED_PROXY_HOPS", "0").toIntOrNull()?.coerceIn(0, 8) ?: 0,
+
+    /**
+     * `ANIMEKO_SUBSCRIPTION_AUTO_IMPORT` 的别名：等价于往那个列表里追加一个地址。
+     *
+     * 这里曾经并存两套机制 —— 这套是「只在仓库为空时、同步阻塞启动拉一次」，
+     * 另一套是「每次启动异步导入、可限 tier、沿用本机已关闭的源」。同步那套最坏
+     * 情况是端口还没监听就卡几分钟（订阅站挂起 + 逐跳重定向各算一次超时），而且
+     * preview 与 import 会把同一个 URL 各拉一遍。现在只留异步这一套；变量名保留，
+     * 是为了不让已经写上它的部署静默失效。
+     */
+    val seedSubscriptionUrl: String? = envOrNull("ANIMEKO_SEED_SUBSCRIPTION_URL"),
 ) {
+
+    /** 开机要导入的订阅地址：主变量 + 别名，去重后按书写顺序 */
+    val autoImportUrls: List<String> =
+        (subscriptionAutoImport + listOfNotNull(seedSubscriptionUrl?.trim()?.takeIf { it.isNotEmpty() })).distinct()
+
     val selectorsDir: Path get() = dataDir.resolve("selectors")
 
     /** 个人数据（收藏/历史/进度）在服务端的落点 */

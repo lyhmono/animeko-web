@@ -187,15 +187,15 @@ export default function SubjectPage() {
   return (
     <div>
       <div className="subject-header">
-        {cover && (
-          <Poster
-            className="cover"
-            src={cover}
-            srcSet={coverSrcSet}
-            sizes="(max-width: 720px) 45vw, 200px"
-            alt={subject.name_cn || subject.name}
-          />
-        )}
+        {/* 给 Poster 原始地址而不是代理地址：它自己会在直连失败时改走 /api/proxy。
+            传代理地址进去等于双层代理 —— 直连失败时它会把「代理地址」再代理一次 */}
+        <Poster
+          className="cover"
+          src={cover}
+          srcSet={coverSrcSet}
+          sizes="(max-width: 720px) 40vw, 220px"
+          alt={subject.name_cn || subject.name}
+        />
         <div className="meta">
           <h1>{subject.name_cn || subject.name}</h1>
           {subject.name_cn && subject.name && <div className="sub">{subject.name}</div>}

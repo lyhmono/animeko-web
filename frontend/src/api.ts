@@ -170,10 +170,10 @@ export function errMsg(e: unknown): string {
 }
 
 export function isDirectPlayable(url: string): boolean {
-  // 注意：播放地址通常是 /api/proxy?url=<encoded>&ua=...&referer=... 形式，
-  // url 参数后面还带有 ua/referer/cookie，媒体后缀不在字符串末尾。
-  // 必须先取出 url 参数的值再判断后缀，否则直链视频会被误判为 HLS
-  // （hls.js 把 WebM 字节流当 m3u8 解析 → manifestParsingError → 播放失败）
+  // 播放地址是 /api/proxy?url=<encoded>（凭据在服务端会话里，URL 只带 sid），
+  // 内层真实地址不在字符串末尾。必须先取出 url 参数的值再判断后缀，
+  // 否则直链视频会被误判为 HLS（hls.js 把 WebM 字节流当 m3u8 解析 →
+  // manifestParsingError → 播放失败）
   let target = url
   if (url.includes('/api/proxy?')) {
     try {
