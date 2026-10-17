@@ -556,6 +556,7 @@ class ProxyRouteTest {
 
     @Test
     fun `proxied images get a browser cache header`() = testApplication {
+        // 封面经 /api/proxy 中转后必须让浏览器缓存，否则每次刷新都穿透服务器拉图床
         val img = Harness(
             listOf(
                 StreamStubFetcher.Spec(status = 200, contentType = "image/jpeg", body = "JPEGDATA"),
@@ -570,7 +571,7 @@ class ProxyRouteTest {
     }
 
     @Test
-    fun `playlists are never cacheable`() = testApplication {
+    fun `playlists are never given a browser cache`() = testApplication {
         // 清单缓存一天 = 源站换源之后浏览器还在拿旧清单播过期地址
         val m3u8 = Harness(listOf(hlsPlaylist("seg1.ts")))
         application { module(m3u8.cfg, m3u8.stub, m3u8.sessions) }
@@ -584,6 +585,7 @@ class ProxyRouteTest {
 
     @Test
     fun `a refused image is not labelled cacheable`() = testApplication {
+        // 403 的图标成可缓存，等于让浏览器把「拒绝」存一整天
         val img = Harness(
             listOf(
                 StreamStubFetcher.Spec(status = 403, contentType = "image/jpeg", body = "no"),
