@@ -107,7 +107,8 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 | `ANIMEKO_TRUSTED_PROXY_HOPS` | `0` | 服务前面有几层**你控制**的反代。0=直连（X-Forwarded-* 一律不信）；填 N 后限速按 XFF 从右数第 N 个真实客户端记账、同源判定改看 `X-Forwarded-Host`。层数要如实填：少了把代理 IP 当客户端（限速全员共享），多了把客户端伪造的 XFF 当真值 |
 | `ANIMEKO_SEED_SUBSCRIPTION_URL` | 空 | `ANIMEKO_SUBSCRIPTION_AUTO_IMPORT` 的**别名**（旧名字），等价于往那个列表里追加一个地址。两个只配一个。曾经它代表另一套「只在空仓库时同步阻塞启动拉一次」的机制，最坏情况会让端口迟迟不监听，现已统一到异步这一套 |
 | `ANIMEKO_BANGUMI_BASE_URLS` | `https://api.bgm.tv,https://bgmapi.anibt.net` | Bangumi API 地址列表（逗号分隔，按顺序故障转移；官方域名在部分地区被墙，可改用社区镜像） |
-| `ANIMEKO_REQUEST_TIMEOUT_MS` | `20000` | 元数据/抓取类出站请求超时 |
+| `ANIMEKO_REQUEST_TIMEOUT_MS` | `20000` | 数据源抓取类出站请求超时 |
+| `ANIMEKO_BANGUMI_TIMEOUT_MS` | `45000` | **Bangumi 元数据单独一档**。社区镜像实测要 13~45 秒才返回一次搜索，套用上面那个 20 秒上限会把它正好掐死——症状是「搜索页永远没有 Bangumi 条目和简介」，而你手动 curl 镜像又是通的 |
 | `ANIMEKO_PROXY_TIMEOUT_MS` | `120000` | 视频代理的连接与**响应头**超时（body 阶段刻意不设时限，见下方安全说明） |
 | `ANIMEKO_SUBSCRIPTION_AUTO_IMPORT` | 空 | 开机自动导入的聚合订阅地址（逗号分隔可多个），免去每次去界面里勾选。**只覆盖同名源、只增不删**，且沿用本机已有的启用/关闭状态——你在界面上关掉的源，重启后仍然是关掉的。订阅站挂了只写日志，不影响服务启动 |
 | `ANIMEKO_SUBSCRIPTION_AUTO_TIERS` | 空 | 自动导入时的 tier 白名单（逗号分隔，如 `0,1`；tier 越低质量越好）。空=全导。**只作用于自动导入**，界面里的勾选导入不受限制 |
@@ -257,7 +258,10 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
   `index.html` 为 `no-cache`；缺失的资源请求返回 **404** 而不是回退 `index.html`——
   否则重新部署后，浏览器会把 HTML 当 ES module 执行，且 `React.lazy` 会永久记住这次失败。
 
-> Bangumi 说明：官方 `api.bgm.tv` 在部分地区不可达。客户端按列表顺序尝试，首个可用的会被记住。
+> Bangumi 说明：官方 `api.bgm.tv` 在部分地区不可达。客户端先试上次成功的那个地址；
+> 还没有记录、或它已经不好用时，把列表里所有地址**同时发出去竞速**，第一个成功的赢、其余取消
+> （串行按顺序试的话，官方域名挂死时每次搜索都要先白等满超时，实测 42 秒后仍然失败）。
+> 首次成功之后该地址会被记住，稳态下不再给已知的死域名开连接。
 > 如果部署环境访问官方域名会长时间超时，建议直接把 `ANIMEKO_BANGUMI_BASE_URLS` 设为可用的镜像
 > （如 `https://bgmapi.anibt.net`），避免每次冷启动等待官方超时。
 > 旧版单值变量 `ANIMEKO_BANGUMI_BASE_URL` 仍作为兼容别名生效（优先于默认列表，被 `..._URLS` 覆盖）。

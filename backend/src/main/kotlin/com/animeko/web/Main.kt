@@ -103,7 +103,15 @@ fun Application.module(
         timeoutMs = cfg.requestTimeoutMs,
         streamTimeoutMs = cfg.proxyTimeoutMs,
     )
-    val bangumi = BangumiClient(fetcher, cfg.bangumiBaseUrls)
+    // Bangumi 用独立的超时：社区镜像实测要 13~25 秒返回一次搜索，套用抓取那边
+    // 的 20 秒上限会把它正好掐死（症状是「搜索页永远没有 Bangumi 结果」，
+    // 而手动 curl 是通的）。测试注入 override 时不另开客户端。
+    val bangumiFetcher = when {
+        fetcherOverride != null -> fetcher
+        cfg.bangumiTimeoutMs == cfg.requestTimeoutMs -> fetcher
+        else -> JdkFetcher(timeoutMs = cfg.bangumiTimeoutMs)
+    }
+    val bangumi = BangumiClient(bangumiFetcher, cfg.bangumiBaseUrls)
     val repo = SelectorRepository(cfg.selectorsDir)
     val engine = SelectorEngine(fetcher, cfg.allowPrivateTargets)
     val sessions = proxySessions

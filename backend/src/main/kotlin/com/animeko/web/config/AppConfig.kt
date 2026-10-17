@@ -50,6 +50,12 @@ data class AppConfig(
                     ?: listOf("https://api.bgm.tv", "https://bgmapi.anibt.net")
             },
     val requestTimeoutMs: Long = env("ANIMEKO_REQUEST_TIMEOUT_MS", "20000").toLongOrNull() ?: 20_000,
+    /**
+     * Bangumi 元数据请求的超时，单独配。社区镜像（bgmapi.anibt.net）实测要
+     * 13~25 秒才能返回一次搜索，而抓取用的 20 秒上限会把它正好掐死 ——
+     * 表现是「搜索页永远没有 Bangumi 结果」，而镜像手动 curl 又是通的。
+     */
+    val bangumiTimeoutMs: Long = env("ANIMEKO_BANGUMI_TIMEOUT_MS", "45000").toLongOrNull() ?: 45_000,
     val proxyTimeoutMs: Long = env("ANIMEKO_PROXY_TIMEOUT_MS", "120000").toLongOrNull() ?: 120_000,
 
     /**

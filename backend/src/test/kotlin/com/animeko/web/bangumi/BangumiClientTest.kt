@@ -4,6 +4,9 @@ import com.animeko.web.http.Fetcher
 import com.animeko.web.http.HttpResult
 import com.animeko.web.http.StreamResult
 import com.animeko.web.http.UpstreamException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -55,6 +58,7 @@ class BangumiStubFetcher(
     ): StreamResult = throw UnsupportedOperationException()
 }
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class BangumiClientTest {
 
     private val searchResponse = """
@@ -177,5 +181,108 @@ class BangumiClientTest {
         // 第二次不再请求已失败的官方地址
         val officialCalls = fetcher.requests.count { it.startsWith("POST https://api.bgm.tv") }
         assertEquals(1, officialCalls)
+    }
+
+    /** 按地址模拟快慢不同的上游（runTest 的虚拟时钟，delay 不真的等） */
+    private class TimingFetcher(
+        private val delayByPrefix: Map<String, Long>,
+        private val failPrefixes: Set<String> = emptySet(),
+        private val body: String,
+    ) : Fetcher {
+        val requests = mutableListOf<String>()
+
+        override suspend fun fetch(
+            url: String,
+            headers: Map<String, String>,
+            followRedirects: Boolean,
+        ): HttpResult = throw UnsupportedOperationException()
+
+        override suspend fun post(
+            url: String,
+            body: String,
+            headers: Map<String, String>,
+            contentType: String,
+        ): HttpResult {
+            requests.add(url)
+            delayByPrefix.entries.firstOrNull { url.startsWith(it.key) }?.let { delay(it.value) }
+            if (failPrefixes.any { url.startsWith(it) }) throw IllegalStateException("hang then die")
+            return HttpResult(200, mapOf("content-type" to listOf("application/json")), this.body.toByteArray())
+        }
+
+        override suspend fun fetchStream(
+            url: String,
+            headers: Map<String, String>,
+            followRedirects: Boolean,
+        ): StreamResult = throw UnsupportedOperationException()
+    }
+
+    @Test
+    fun `a hanging base must not delay the one that answers`() = runTest {
+        // 实测就是用户那台 VPS 的形状：官方域名挂住不回，镜像要 13~25 秒才给结果。
+        // 串行尝试时总耗时是「两者相加」，42 秒后两个都超时 —— 搜索页就此永远没有条目。
+        val fetcher = TimingFetcher(
+            delayByPrefix = mapOf("https://api.bgm.tv" to 30_000L, "https://bgmapi.anibt.net" to 1_000L),
+            failPrefixes = setOf("https://api.bgm.tv"),
+            body = searchResponse,
+        )
+        val client = BangumiClient(fetcher, listOf("https://api.bgm.tv", "https://bgmapi.anibt.net"))
+        client.search("CLANNAD")
+        // 竞速：1 秒时镜像就赢了，不该被官方那 30 秒拖住
+        assertTrue(currentTime < 5_000L, "总耗时 $currentTime ms，说明还是在串行等慢的那个")
+        assertEquals(2, fetcher.requests.size, "两个地址应同时发出")
+    }
+
+    @Test
+    fun `the winner is used alone next time`() = runTest {
+        val fetcher = TimingFetcher(
+            delayByPrefix = mapOf("https://api.bgm.tv" to 30_000L, "https://bgmapi.anibt.net" to 1_000L),
+            failPrefixes = setOf("https://api.bgm.tv"),
+            body = searchResponse,
+        )
+        val client = BangumiClient(fetcher, listOf("https://api.bgm.tv", "https://bgmapi.anibt.net"))
+        client.search("第一次")
+        client.search("第二次")
+        // 稳态下不该再给那个已知挂死的域名开连接：竞速只在第一轮发生一次
+        val official = fetcher.requests.count { it.startsWith("https://api.bgm.tv") }
+        assertEquals(1, official, "死域名被打了 $official 次：${fetcher.requests}")
+        assertEquals(2, fetcher.requests.count { it.startsWith("https://bgmapi.anibt.net") })
+    }
+
+    @Test
+    fun `a stale winner falls back to racing instead of failing`() = runTest {
+        // 记住的地址后来挂了：不能一直信记录，必须回到竞速，否则整站元数据就此死掉
+        var mirrorAlive = true
+        val fetcher = object : Fetcher {
+            val seen = mutableListOf<String>()
+            override suspend fun fetch(
+                url: String,
+                headers: Map<String, String>,
+                followRedirects: Boolean,
+            ): HttpResult = throw UnsupportedOperationException()
+
+            override suspend fun post(
+                url: String,
+                body: String,
+                headers: Map<String, String>,
+                contentType: String,
+            ): HttpResult {
+                seen.add(url)
+                val alive = if (url.startsWith("https://bgmapi.anibt.net")) mirrorAlive else !mirrorAlive
+                if (!alive) throw IllegalStateException("down")
+                return HttpResult(200, mapOf("content-type" to listOf("application/json")), searchResponse.toByteArray())
+            }
+
+            override suspend fun fetchStream(
+                url: String,
+                headers: Map<String, String>,
+                followRedirects: Boolean,
+            ): StreamResult = throw UnsupportedOperationException()
+        }
+        val client = BangumiClient(fetcher, listOf("https://api.bgm.tv", "https://bgmapi.anibt.net"))
+        assertEquals(1, client.search("第一次").size, "第一轮镜像活，应由镜像赢")
+        // 换过来：记住的镜像挂了、之前挂死的官方活了
+        mirrorAlive = false
+        val second = client.search("第二次")
+        assertEquals(1, second.size, "首选地址挂掉后必须回退到竞速，而不是直接失败")
     }
 }

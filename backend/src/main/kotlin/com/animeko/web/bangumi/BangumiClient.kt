@@ -4,6 +4,9 @@ import com.animeko.web.http.Fetcher
 import com.animeko.web.http.HttpResult
 import com.animeko.web.http.UpstreamException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -180,23 +183,64 @@ class BangumiClient(
             throw UpstreamException("$source 返回的不是预期 JSON")
         }
 
-    /** 按顺序尝试各 base URL，记住第一个可用的 */
+    /**
+     * 按「记住的可用地址 → 全部地址并发竞速」的顺序取一个能用的结果。
+     *
+     * 以前是**串行**按顺序试。在「官方域名不可达 + 镜像要十几到二十几秒」这种真实部署上
+     * （实测就是用户那台 VPS），一次搜索要先白等官方满 20 秒超时，再轮到镜像，
+     * 42 秒之后两个都失败。而且只有**成功**才会被记住，所以只要镜像从没在超时内
+     * 回来过，每一次搜索都要重新把那个死域名等满一遍 —— 慢不是偶发，是常态。
+     *
+     * 现在：有记录就先只试它（稳态下不给已知死掉的域名开连接）；它失败就把记录清掉，
+     * 剩下所有候选**同时发**，第一个成功的赢、其余立刻取消。总耗时从「各超时之和」
+     * 变成「最慢的那个」，并且第一次成功之后就走快路径。
+     */
     private suspend fun <T> withFallback(block: suspend (base: String) -> T): T {
-        val order = buildList {
-            preferredBase?.let { add(it) }
-            bases.forEach { if (it != preferredBase) add(it) }
-        }
-        var lastError: Exception? = null
-        for (base in order) {
+        val preferred = preferredBase
+        if (preferred != null) {
             try {
-                val result = block(base)
-                preferredBase = base
-                return result
+                return block(preferred)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                lastError = e
+                // 记下来的这个已经不好用了：清掉，别让它一直挡在真正能用的前面
+                preferredBase = null
+                if (bases.size == 1) throw e
             }
         }
-        throw lastError ?: IllegalStateException("no bangumi base url configured")
+        return raceAll(block)
+    }
+
+    private suspend fun <T> raceAll(block: suspend (base: String) -> T): T = coroutineScope {
+        val results = Channel<Pair<String, Result<T>>>(bases.size)
+        val jobs = bases.map { base ->
+            launch {
+                val outcome = try {
+                    Result.success(block(base))
+                } catch (c: CancellationException) {
+                    throw c
+                } catch (t: Throwable) {
+                    Result.failure(t)
+                }
+                results.send(base to outcome)
+            }
+        }
+        try {
+            var lastError: Throwable? = null
+            repeat(bases.size) {
+                val (base, outcome) = results.receive()
+                if (outcome.isSuccess) {
+                    preferredBase = base
+                    return@coroutineScope outcome.getOrThrow()
+                }
+                // 全失败时抛最后一个错：404 要能一路传到 API 层变成 404 而不是 502
+                lastError = outcome.exceptionOrNull()
+            }
+            throw lastError ?: IllegalStateException("没有可用的 Bangumi API 地址")
+        } finally {
+            // 赢家出现后必须掐掉其余的：否则 coroutineScope 要等最慢那条（可能是 30 秒超时）
+            jobs.forEach { it.cancel() }
+        }
     }
 
     companion object {
