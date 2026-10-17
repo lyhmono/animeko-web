@@ -105,14 +105,25 @@ export const api = {
     }
     return { doc, etag: unquote(resp.headers.get('ETag')) }
   },
-  /** 条件写。返回服务端新版本；版本不符时服务端回 409 DATA_STALE。 */
-  saveData: async (doc: unknown, etag: string): Promise<string> => {
+  /**
+   * 条件写。返回服务端新版本与落盘字节数；版本不符时服务端回 409 DATA_STALE。
+   * bytes 不是装饰：服务端有 512KB 的文档上限，撞上之后每次保存都是 400，
+   * 而「收藏点不动」这种症状没人会想到是满了 —— 所以要提前说。
+   */
+  saveData: async (doc: unknown, etag: string): Promise<{ etag: string; bytes: number }> => {
     const resp = await send('/api/data', {
       method: 'PUT',
       body: JSON.stringify(doc),
       headers: etag ? { 'If-Match': `"${etag}"` } : undefined,
     })
-    return unquote(resp.headers.get('ETag'))
+    let bytes = 0
+    try {
+      const body = (await resp.json()) as { bytes?: number }
+      bytes = typeof body?.bytes === 'number' ? body.bytes : 0
+    } catch {
+      // 老服务端不回 bytes：不能因此把一次成功的写入当成失败
+    }
+    return { etag: unquote(resp.headers.get('ETag')), bytes }
   },
 
   // ---- Bangumi ----

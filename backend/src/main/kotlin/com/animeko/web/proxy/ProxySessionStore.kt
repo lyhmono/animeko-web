@@ -1,5 +1,6 @@
 package com.animeko.web.proxy
 
+import com.animeko.web.appLog
 import com.animeko.web.http.UrlGuard
 import java.security.SecureRandom
 import java.util.Collections
@@ -86,14 +87,34 @@ class ProxySessionStore(
     }
 
     /** 清单改写完成后，把里面出现的分片/密钥主机登记为该会话可用主机。 */
+    /**
+     * 登记清单里出现的分片/密钥主机。
+     *
+     * 必须设上界：清单体积上限是 4MB，理论上能塞进上万个**不同**主机，而这个集合
+     * 只会随会话滑动续期一直长大（真实清单只有 1~3 个主机）。不设限等于让一个
+     * 恶意数据源用一份清单把服务端内存吃掉几十 MB，并且每次重拉清单都要把 4MB
+     * 全量正则 + 逐条 URL 解码一遍。
+     * 超限后不再扩大：后面的分片会以 HOST_NOT_ALLOWED 失败，是可诊断的错，
+     * 比静默 OOM 好。
+     */
     fun allowPlaylistHosts(sid: String, rewrittenPlaylist: String) {
         if (sid.isEmpty()) return
         val entry = sessions[sid] ?: return
+        var added = 0
         for (encoded in PROXY_URL_PARAM.findAll(rewrittenPlaylist)) {
+            if (entry.allowedHosts.size >= MAX_HOSTS_PER_SESSION) {
+                appLog.warn(
+                    "清单的主机数超过单会话上限 {}，后续分片会被拒（sid 已登记 {} 个主机）",
+                    MAX_HOSTS_PER_SESSION,
+                    entry.allowedHosts.size,
+                )
+                return
+            }
             val host = runCatching { hostOf(java.net.URLDecoder.decode(encoded.groupValues[1], "UTF-8")) }
                 .getOrNull()
-            if (host != null) entry.allowedHosts.add(host)
+            if (host != null && entry.allowedHosts.add(host)) added++
         }
+        if (added > 0) appLog.debug("会话登记了 {} 个清单主机", added)
     }
 
     val size: Int get() = sessions.size
@@ -132,5 +153,8 @@ class ProxySessionStore(
         private const val DEFAULT_TTL_MS = 6L * 60 * 60 * 1000
 
         private const val DEFAULT_MAX_ENTRIES = 4096
+
+        /** 单个会话最多登记多少个清单主机（真实清单是 1~3 个） */
+        private const val MAX_HOSTS_PER_SESSION = 64
     }
 }

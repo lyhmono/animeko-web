@@ -30,14 +30,22 @@ export interface SyncState {
   /** 出错的是读取还是写入：读取失败时界面要停下写入，而不是喊「保存失败」 */
   kind: 'load' | 'save' | null
   error: string
+  /** 不是故障但该让用户知道的事（例如个人数据快撞到服务端上限） */
+  note?: string
 }
 
-let sync: SyncState = { status: 'ready', kind: null, error: '' }
+let sync: SyncState = { status: 'ready', kind: null, error: '', note: '' }
+
+/** 服务端个人数据文档上限 512KB，到八成提醒一次 */
+const DOC_SOFT_LIMIT = 0.8 * 512 * 1024
+let sizeNote = ''
 const syncListeners = new Set<(s: SyncState) => void>()
 
 function setSync(next: SyncState): void {
-  sync = next
-  syncListeners.forEach((l) => l(next))
+  // note 为空时带上体积提醒：状态点每变一次都要重算，否则一次成功的保存
+  // 就把「快满了」的提醒抹掉了，而那个提醒的意义正是「现在还能写，但快写不下了」
+  sync = next.note || !sizeNote ? next : { ...next, note: sizeNote }
+  syncListeners.forEach((l) => l(sync))
 }
 
 export function getSyncState(): SyncState {
@@ -63,7 +71,7 @@ export async function loadUserData(): Promise<void> {
     loaded = true
     pendingKeys.clear()
     pendingProgressKeys.clear()
-    setSync({ status: 'ready', kind: null, error: '' })
+    setSync({  status: 'ready', kind: null, error: ''  })
   } catch (e) {
     loaded = false
     doc = {}
@@ -94,7 +102,7 @@ function scheduleFlush(key?: string, progressEntry?: string): void {
   if (key) pendingKeys.add(key)
   if (progressEntry) pendingProgressKeys.add(progressEntry)
   if (!loaded) return // 见文件头第 1 条：没有服务端文档就没有可覆盖的基准
-  setSync({ status: 'pending', kind: null, error: '' })
+  setSync({  status: 'pending', kind: null, error: ''  })
   if (timer) clearTimeout(timer)
   timer = setTimeout(() => void flushUserData(), DEBOUNCE_MS)
 }
@@ -107,7 +115,7 @@ export async function flushUserData(): Promise<void> {
   }
   if (!loaded) {
     if (sync.status !== 'error') {
-      setSync({ status: 'error', kind: 'load', error: '还没读到服务器数据，写入已暂停' })
+      setSync({  status: 'error', kind: 'load', error: '还没读到服务器数据，写入已暂停'  })
     }
     return
   }
@@ -130,18 +138,24 @@ async function pushOnce(): Promise<void> {
     attempt++
     const keys = [...pendingKeys]
     const progressKeys = [...pendingProgressKeys]
-    setSync({ status: 'saving', kind: null, error: '' })
+    setSync({  status: 'saving', kind: null, error: ''  })
     try {
-      baseEtag = await api.saveData(doc, baseEtag)
+      const saved = await api.saveData(doc, baseEtag)
+      baseEtag = saved.etag
+      // 服务端上限 512KB，撞到之后每次保存都是 400，而症状只是「收藏点不动」。
+      // 提前到八成就说，用户还有机会自己清一清，而不是等写失败去猜原因
+      sizeNote = saved.bytes > 0 && saved.bytes >= DOC_SOFT_LIMIT
+        ? `个人数据已有 ${(saved.bytes / 1024).toFixed(0)}KB，接近服务端 512KB 上限，建议清理不再看的收藏与历史`
+        : ''
       // 只清这一轮带出去的键：await 期间新产生的改动必须留给下一轮
       keys.forEach((k) => pendingKeys.delete(k))
       progressKeys.forEach((k) => pendingProgressKeys.delete(k))
-      setSync({ status: 'ready', kind: null, error: '' })
+      setSync({  status: 'ready', kind: null, error: ''  })
     } catch (e) {
       if (isApiError(e, 409, ERR_DATA_STALE)) {
         const merged = await mergeWithServer(keys, progressKeys)
         if (merged) continue // 换好基准，重试这一次写
-        setSync({ status: 'error', kind: 'save', error: '本机改动与服务端冲突且无法合并，请刷新页面重试' })
+        setSync({  status: 'error', kind: 'save', error: '本机改动与服务端冲突且无法合并，请刷新页面重试'  })
         return
       }
       // 超上限、格式错这类不会自己变好，别把浏览器变成打服务端的循环
@@ -500,5 +514,5 @@ export function markUserDataStale(): void {
   loaded = false
   doc = {}
   baseEtag = ''
-  setSync({ status: 'ready', kind: null, error: '' })
+  setSync({  status: 'ready', kind: null, error: ''  })
 }

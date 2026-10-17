@@ -159,6 +159,47 @@ class UserDataStoreTest {
     }
 
     @Test
+    fun `If-Match follows HTTP semantics not literal string compare`() {
+        // 回归：以前把整个头 trim('"') 后与当前指纹逐字比较，于是下面这些
+        // 合法写法全部恒定 409 —— 照 HTTP 惯例写的脚本客户端永远写不进去
+        val (s, _) = store()
+        val first = s.write("""{"v":1}""", null)
+
+        // 单个强标签
+        s.write("""{"v":2}""", "\"${first.etag}\"")
+        val second = s.read()
+
+        // 多值里含当前标签：任一匹配即可
+        s.write("""{"v":3}""", "\"deadbeef\", \"${second.etag}\"")
+        val third = s.read()
+
+        // * = 资源存在就允许写
+        s.write("""{"v":4}""", "*")
+
+        // 大小写与空白不该影响判定
+        s.write("""{"v":5}""", "  \"${s.read().etag}\"  ")
+
+        // 过期标签仍然必须拒
+        assertFailsWith<UserDataStore.Stale> { s.write("""{"v":6}""", "\"${first.etag}\"") }
+        // 弱标签不参与强比较
+        assertFailsWith<UserDataStore.Stale> { s.write("""{"v":7}""", "W/\"${s.read().etag}\"") }
+        // 全是弱标签/全不匹配的多值也要拒
+        assertFailsWith<UserDataStore.Stale> { s.write("""{"v":8}""", "\"a\", W/\"${s.read().etag}\"") }
+        assertEquals("5", doc(s.read().text)["v"]?.toString()?.trim('"'), "前面 4 次条件写都应生效，最后一次是 v5")
+    }
+
+    @Test
+    fun `star does not match when the document does not exist yet`() {
+        // If-Match: * 的含义是「只在资源已存在时更新」，首次创建该用不带 If-Match 的写
+        val (s, file) = store()
+        assertFailsWith<UserDataStore.Stale> { s.write("""{"v":1}""", "*") }
+        assertFalse(Files.exists(file), "被拒时不该留下文件")
+        s.write("""{"v":1}""", null)
+        s.write("""{"v":2}""", "*") // 现在存在了，* 应放行
+        assertEquals("""{"v":2}""", s.read().text)
+    }
+
+    @Test
     fun `reading while writing never quarantines the freshly committed file`() {
         // 回归：read() 不在写锁里，而它遇到坏文件会把主文件 move 成 .bad。
         // 与并发 write() 的非原子回退路径交错时，读侧能把写侧刚提交好的文件搬走，

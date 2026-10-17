@@ -11,4 +11,13 @@ if [ "$(id -u)" = "0" ]; then
   exec gosu app "$0" "$@"
 fi
 
+# 降权后重跑会带着原来的参数进来（上面那行 "$@"）。这时候如果参数非空，
+# 说明用户是 `docker run <image> /bin/sh` 想进容器调试 —— 必须执行它，
+# 而不是无条件起服务。实测旧写法会把 /bin/sh 静默丢掉、直接启动服务器，
+# 于是「docker run 进去看看」这条常规调试路径根本不成立。
+# 没给参数（compose 里 ENTRYPOINT 没有 CMD 的常态）才起服务本体。
+if [ "$#" -gt 0 ]; then
+  exec "$@"
+fi
+
 exec /app/bin/animeko-web

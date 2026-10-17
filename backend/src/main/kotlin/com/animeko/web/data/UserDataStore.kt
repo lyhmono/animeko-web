@@ -87,6 +87,12 @@ class UserDataStore(
     /**
      * 整体覆盖写入。非法内容或超限抛 IllegalArgumentException（对外是 400），
      * 版本不符抛 Stale（对外是 409）。返回写入后的快照，客户端据此更新手里的指纹。
+     *
+     * @param ifMatch 是 **HTTP If-Match 头的原文**，不是单个指纹。按 RFC 7232 解释：
+     *  `*` 表示「只要资源已存在就允许写」，`"a", "b"` 表示任一强标签匹配即可，
+     *  `W/"a"` 这类弱标签**不参与**强比较（视为不匹配）。
+     *  以前是把整串去掉首尾引号后与当前指纹逐字比较，于是 `*` 和「多值里含正确指纹」
+     *  这两种合法写法都恒定返回 409 —— 脚本客户端照 HTTP 惯例写就会永远写不进去。
      */
     fun write(text: String, ifMatch: String? = null): Snapshot {
         val parsed = try {
@@ -104,7 +110,7 @@ class UserDataStore(
             // 条件写必须和写入在同一个临界区里，否则「检查通过」和「覆盖落盘」
             // 之间还能挤进另一个写者，检查就只是装饰
             val current = currentEtagLocked()
-            if (ifMatch != null && ifMatch != current) throw Stale()
+            if (!ifMatchAllows(ifMatch, current)) throw Stale()
             Files.createDirectories(file.parent)
             val tmp = sib("tmp")
             // 先写临时文件、fsync、再 rename：写入中途被 kill 或被断电都不会留下半个文件。
@@ -133,6 +139,23 @@ class UserDataStore(
             }
         }
         return Snapshot(text, sha256Hex(bytes))
+    }
+
+    /**
+     * 解释 If-Match 头。必须在持有写锁时调用（`*` 要看资源此刻是否存在）。
+     * 不带该头 = 不做条件检查，按客户端的明确意图直接覆盖。
+     */
+    private fun ifMatchAllows(header: String?, currentEtag: String): Boolean {
+        val value = header?.trim()?.takeIf { it.isNotEmpty() } ?: return true
+        if (value == "*") return Files.isRegularFile(file) && runCatching { Files.size(file) > 0L }.getOrDefault(false)
+        return value.split(',')
+            .asSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            // 弱标签不参与强比较：W/"x" 与 "x" 在 If-Match 里都不该匹配
+            .filterNot { it.startsWith("W/", ignoreCase = true) }
+            .map { it.trim('"') }
+            .any { it == currentEtag }
     }
 
     private fun currentEtagLocked(): String {

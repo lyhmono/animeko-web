@@ -140,7 +140,7 @@ export default function Layout() {
         <span className="footer-right">
           {user && <span className="footer-user">{user}</span>}
           {/* 保存失败要点得出原因，否则「收藏不见了」这种问题根本没法排查 */}
-          <span className={`sync-pill ${sync.status}`} title={sync.error || syncText(sync)}>
+          <span className={`sync-pill ${sync.status}`} title={sync.error || sync.note || syncText(sync)}>
             {syncText(sync)}
           </span>
         </span>

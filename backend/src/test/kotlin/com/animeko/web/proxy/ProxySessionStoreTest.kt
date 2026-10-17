@@ -77,6 +77,29 @@ class ProxySessionStoreTest {
     }
 
     @Test
+    fun `playlist host registration is bounded per session`() {
+        // 真实清单只有 1~3 个主机。不设上界的话，一份 4MB 清单能往单个会话里
+        // 塞进上万个主机字符串，并且每次重拉清单都要全量正则 + 逐条解码
+        val s = store()
+        val sid = mint(s)
+        val playlist = (1..500).joinToString("\n") {
+            "/api/proxy?url=${java.net.URLEncoder.encode("https://h$it.example/seg.ts", "UTF-8")}&sid=$sid"
+        }
+        s.allowPlaylistHosts(sid, playlist)
+        // 前 64 个主机可用
+        assertEquals(
+            ProxySessionStore.Kind.GRANTED,
+            s.grant(sid, "https://h1.example/seg.ts").kind,
+        )
+        // 超出的不再扩权
+        assertEquals(
+            ProxySessionStore.Kind.HOST_NOT_ALLOWED,
+            s.grant(sid, "https://h499.example/seg.ts").kind,
+            "清单主机数超过上界后不该继续登记",
+        )
+    }
+
+    @Test
     fun `an address with no extractable authority is refused`() {
         val s = store()
         val sid = mint(s)

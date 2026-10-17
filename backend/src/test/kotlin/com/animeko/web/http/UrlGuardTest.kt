@@ -35,6 +35,46 @@ class UrlGuardTest {
     }
 
     @Test
+    fun `rejects reserved ranges that Java's isXxx helpers miss`() {
+        // 回归：这些在旧清单下是**放行**的（实测表现为 20 秒连接超时，即真的去连了）。
+        // Java 的 isAnyLocalAddress 只管精确的 0.0.0.0，不管整个 0.0.0.0/8；
+        // 100.64.0.0/10 是运营商 NAT，机房里大量内部地址就落在这段。
+        listOf(
+            "http://100.64.0.1/x",
+            "http://100.127.255.255/x",
+            "http://0.1.2.3:8080/api/health",
+            "http://0.255.255.255/x",
+            "http://198.18.0.1/x",
+            "http://198.19.255.255/x",
+            "http://192.0.2.1/x",
+            "http://198.51.100.7/x",
+            "http://203.0.113.9/x",
+            "http://[100::1]/x",
+            "http://[2001:db8::1]/x",
+            "http://[2002:c000:204::]/x",
+        ).forEach { url ->
+            assertTrue(blocked(url).isNotBlank(), "$url 属于保留地址段，应当被拒绝")
+        }
+    }
+
+    @Test
+    fun `reserved ranges stay blocked at the boundary and do not swallow public space`() {
+        // 边界：100.63.x 与 100.128.x 都在 CGNAT 段外，不该被顺手拦掉。
+        // 这里只断言「不是因为落在保留段而被拒」——它们解析不出来时按设计放行，
+        // 所以用字面 IP 才有效。
+        listOf("http://100.63.255.255/x", "http://100.128.0.1/x", "http://198.17.255.255/x", "http://198.20.0.1/x")
+            .forEach { url ->
+                val e = runCatching { UrlGuard.requireAllowed(url) }.exceptionOrNull()
+                if (e is UrlGuard.Blocked) {
+                    assertTrue(
+                        !e.message.orEmpty().contains("内网/保留"),
+                        "$url 不在保留段内，却被当成内网拦了：${e.message}",
+                    )
+                }
+            }
+    }
+
+    @Test
     fun `non-http scheme is rejected even when private targets are allowed`() {
         // allowPrivate 只放开内网地址，不该顺手把 file:// 之类的协议放行
         assertFailsWith<UrlGuard.Blocked> {

@@ -96,13 +96,52 @@ object UrlGuard {
         host.contains(':') || host.matches(Regex("""\d{1,3}(\.\d{1,3}){0,3}""")) ||
             host.matches(Regex("""0[xX][0-9a-fA-F]+(\.0[xX][0-9a-fA-F]+){0,3}"""))
 
-    private fun isInternalAddress(addr: InetAddress): Boolean =
-        addr.isLoopbackAddress ||
+    private fun isInternalAddress(addr: InetAddress): Boolean {
+        if (
+            addr.isLoopbackAddress ||
             addr.isAnyLocalAddress ||
             addr.isLinkLocalAddress ||
             addr.isSiteLocalAddress ||
             addr.isMulticastAddress ||
             isIpv6UniqueLocal(addr)
+        ) return true
+        // Java 那几个 isXxx 不够：实测 http://100.64.0.1/ 与 http://0.1.2.3:8210/
+        // 都能穿过原来的清单（表现是 20 秒连接超时，也就是真的去连了）。
+        // 0.0.0.0/8 里只有精确的 0.0.0.0 算 isAnyLocalAddress，整段在 Linux 上
+        // 都按「本网络」处理；100.64.0.0/10 是运营商 NAT，很多机房内部地址就落在
+        // 这一段，对外的服务被它当跳板并不稀奇。
+        val bytes = addr.address
+        return when (bytes.size) {
+            4 -> isReservedIpv4(bytes)
+            16 -> isReservedIpv6(bytes)
+            else -> false
+        }
+    }
+
+    /** IPv4 保留段：0/8、100.64/10（CGNAT）、198.18/15（基准测试）、以及三个 TEST-NET */
+    private fun isReservedIpv4(b: ByteArray): Boolean {
+        fun oct(i: Int) = b[i].toInt() and 0xff
+        val a0 = oct(0)
+        val a1 = oct(1)
+        return when {
+            a0 == 0 -> true                       // 0.0.0.0/8 本网络
+            a0 == 100 && a1 >= 64 && a1 <= 127 -> true  // 100.64.0.0/10 CGNAT
+            a0 == 198 && (a1 == 18 || a1 == 19) -> true // 198.18.0.0/15 设备基准测试
+            a0 == 192 && a1 == 0 && (oct(2) == 2 || oct(2) == 3) -> true // TEST-NET-1 / 保留
+            a0 == 198 && a1 == 51 && oct(2) == 100 -> true               // TEST-NET-2
+            a0 == 203 && a1 == 0 && oct(2) == 113 -> true                // TEST-NET-3
+            else -> false
+        }
+    }
+
+    /** IPv6 保留段：100::/64（discard-only）、2001:db8::/32（文档）、2002::/16（6to4） */
+    private fun isReservedIpv6(b: ByteArray): Boolean {
+        // 参数是**字节偏移**，不是第 n 组：2001:db8:: 的第二组在 b[2..3]。
+        // 写成 word(1) 会读到 b[1..2]（0x010d），于是 2001:db8::/32 永远匹配不上
+        fun wordAt(byteAt: Int) = ((b[byteAt].toInt() and 0xff) shl 8) or (b[byteAt + 1].toInt() and 0xff)
+        val head = wordAt(0)
+        return head == 0x0100 || head == 0x2002 || (head == 0x2001 && wordAt(2) == 0x0db8)
+    }
 
     /** IPv6 唯一本地地址 fc00::/7，Java 不把它归入 siteLocal。 */
     private fun isIpv6UniqueLocal(addr: InetAddress): Boolean {

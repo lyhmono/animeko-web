@@ -352,10 +352,10 @@ fun Application.configureApiRoutes(
         put("/api/data") {
             val text = call.receiveCappedText()
             // 客户端带上它读到的版本时才做条件写；不带（curl、旧版前端）就退回无条件覆盖
-            val ifMatch = call.request.headers[HttpHeaders.IfMatch]
-                ?.trim()
-                ?.trim('"')
-                ?.takeIf { it.isNotEmpty() }
+            // 原样交给数据层解释：If-Match 可以是 *、可以是逗号分隔的多个标签、
+            // 也可以带 W/ 前缀。在这里 trim('"') 会把它们压成一个奇怪的字符串，
+            // 于是「*」和「多值里含正确指纹」这两种合法写法都恒定 409
+            val ifMatch = call.request.headers[HttpHeaders.IfMatch]?.trim()?.takeIf { it.isNotEmpty() }
             try {
                 val snapshot = userData.write(text, ifMatch)
                 call.response.header(HttpHeaders.ETag, "\"${snapshot.etag}\"")
