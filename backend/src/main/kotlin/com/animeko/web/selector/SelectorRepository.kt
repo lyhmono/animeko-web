@@ -4,8 +4,13 @@ import com.animeko.web.appLog
 import java.nio.file.InvalidPathException
 import kotlinx.serialization.json.Json
 import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
 import kotlin.io.path.createDirectories
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.exists
@@ -80,7 +85,7 @@ class SelectorRepository(private val dir: Path) {
     fun find(name: String, enabledOnly: Boolean = false): StoredSource? =
         list().firstOrNull { it.arguments.name == name && (!enabledOnly || it.enabled) }
 
-    fun save(arguments: SelectorSourceArguments, enabled: Boolean = true): StoredSource {
+    fun save(arguments: SelectorSourceArguments, enabled: Boolean = true): StoredSource = synchronized(this) {
         require(arguments.name.isNotBlank()) { "数据源名称不能为空" }
         require(arguments.name.length <= MAX_NAME_LENGTH) { "数据源名称过长（上限 $MAX_NAME_LENGTH 字符）" }
         validateRegexes(arguments.searchConfig)
@@ -93,13 +98,49 @@ class SelectorRepository(private val dir: Path) {
         require(conflict == null) {
             "数据源名称「${arguments.name}」与已有「${existing?.arguments?.name}」会存到同一个文件，请改名后重试"
         }
-        try {
-            target.writeText(json.encodeToString(StoredSource.serializer(), stored))
-        } catch (e: IOException) {
-            throw IllegalArgumentException("写入数据源文件失败：${e.message}", e)
-        }
+        writeAtomic(target, json.encodeToString(StoredSource.serializer(), stored))
         invalidate(target)
-        return stored
+        stored
+    }
+
+    /**
+     * 整目录串行 + 落盘原子化。两处各挡一种事故：
+     *  - 上面的「同名消毒冲突」检查是 read-then-write，并发导入时两个请求都能通过检查，
+     *    后写的把前写的静默盖掉；Ktor 的路由处理跑在线程池上，这真的会并发。
+     *  - writeText 中途被 kill／断电会留下半个 JSON。读侧对坏文件是跳过，
+     *    于是那个数据源就这么「自己消失了」，没有任何报错。
+     * 写法与 UserDataStore 一致（临时文件 + fsync + rename），不另立一套机制。
+     */
+    private fun writeAtomic(target: Path, text: String) {
+        val tmp = target.resolveSibling(target.fileName.toString() + ".tmp")
+        try {
+            FileChannel.open(
+                tmp,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING,
+            ).use { ch ->
+                ch.write(ByteBuffer.wrap(text.toByteArray(Charsets.UTF_8)))
+                ch.force(true)
+            }
+            try {
+                Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE)
+            } catch (e: AtomicMoveNotSupportedException) {
+                // NFS/CIFS 这类挂载不支持原子 rename（/data 挂网络盘并不罕见）。
+                // 退回普通 move 仍比丢掉这次写入好，但**失败必须照抛**：
+                // 这里以前是 runCatching{…}.onFailure{删临时文件}，异常被吞掉，
+                // 于是 save() 返回成功、界面报「导入完成」，而文件根本没写进去。
+                try {
+                    Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING)
+                } catch (e2: IOException) {
+                    runCatching { Files.deleteIfExists(tmp) }
+                    throw IllegalArgumentException("写入数据源文件失败：${e2.message ?: e2::class.simpleName}", e2)
+                }
+            }
+        } catch (e: IOException) {
+            runCatching { Files.deleteIfExists(tmp) }
+            throw IllegalArgumentException("写入数据源文件失败：${e.message ?: e::class.simpleName}", e)
+        }
     }
 
     fun setEnabled(name: String, enabled: Boolean): Boolean {
@@ -108,7 +149,7 @@ class SelectorRepository(private val dir: Path) {
         return true
     }
 
-    fun delete(name: String): Boolean {
+    fun delete(name: String): Boolean = synchronized(this) {
         val target = fileFor(name)
         val stored = runCatching { json.decodeFromString<StoredSource>(target.readText()) }.getOrNull()
             ?: return false

@@ -3,6 +3,7 @@ package com.animeko.web.selector
 import com.animeko.web.http.Fetcher
 import com.animeko.web.http.HttpResult
 import com.animeko.web.http.StreamResult
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -81,6 +82,76 @@ class SelectorEngineTest {
         channelFormatId = channelFormatId,
     )
 
+    /**
+     * requestInterval 是第三方配置里的自由数字。原样接受时，
+     * `{"requestInterval": 86400000}` 会把「下一次允许请求」推到一天之后，
+     * 并且每调一次再往后推一天：这个源永远停在「搜索中」，
+     * 每次搜索还留下一个挂在 delay 上的协程。
+     */
+    @Test
+    fun `an absurd request interval is clamped`() = runTest {
+        val engine = SelectorEngine(StubFetcher(mapOf("$base/search" to fixture("search_page.html"))))
+        val oneDay = 86_400_000L
+        assertEquals(SelectorEngine.MAX_REQUEST_INTERVAL_MS, engine.effectiveInterval(oneDay))
+        assertEquals(0L, engine.effectiveInterval(-5L))
+        assertEquals(3_000L, engine.effectiveInterval(3_000L))
+
+        engine.search(config().copy(requestInterval = oneDay), "示例")
+        assertTrue(
+            currentTime <= SelectorEngine.MAX_REQUEST_INTERVAL_MS + 1_000,
+            "一次搜索就推进了 ${currentTime}ms 虚拟时间，说明间隔没被封顶",
+        )
+        val afterFirst = currentTime
+        engine.search(config().copy(requestInterval = oneDay), "示例")
+        assertTrue(
+            currentTime - afterFirst <= SelectorEngine.MAX_REQUEST_INTERVAL_MS + 1_000,
+            "第二次搜索又被推走 ${currentTime - afterFirst}ms",
+        )
+    }
+
+    /**
+     * 封面要向上找容器时，「这一层是不是还只罩着我这一条」的判据需要一份条目身份集合。
+     * 集合原先**每个条目重建一次**，于是整页成本是 O(N²)：4000 条目的列表页
+     * （8MB 页面上限内完全可能出现）实测要好几秒，而且慢得毫无线索——
+     * 症状只是「这个源搜索特别慢」。改成每个查询建一次后必须是线性。
+     */
+    /** 媒体地址的 query 往往就是签名凭据，日志里不能留 */
+    @Test
+    fun `urlForLog drops the query but keeps what identifies the source`() {
+        assertEquals(
+            "https://cdn.example.com/hls/seg1.m3u8",
+            SelectorEngine.urlForLog("https://cdn.example.com/hls/seg1.m3u8?sign=abc123&t=1700000000"),
+        )
+        assertEquals("https://cdn.example.com/a/b", SelectorEngine.urlForLog("https://cdn.example.com/a/b#frag"))
+        // 解析不了的畸形地址也不能把查询串原样带出去
+        val odd = SelectorEngine.urlForLog("http://bad host/x?token=SECRET")
+        assertTrue(!odd.contains("SECRET"), "泄露了查询串：$odd")
+    }
+
+    @Test
+    fun `cover lookup stays linear on a large list page`() = runTest {
+        val items = (1..4000).joinToString("\n") { i ->
+            """<li><img data-original="/p$i.jpg"><a class="thumb" href="/v$i.html">番$i</a></li>"""
+        }
+        val html = "<html><body><ul>$items</ul></body></html>"
+        val cfg = config().copy(
+            subjectFormatId = SubjectFormatIndexed.ID,
+            selectorSubjectFormatIndexed = SubjectFormatIndexed.Config(
+                selectNames = "a.thumb",
+                selectLinks = "a.thumb",
+            ),
+        )
+        val fetcher = StubFetcher(mapOf("$base/search" to html))
+        val started = System.nanoTime()
+        val hits = SelectorEngine(fetcher).search(cfg, "番")
+        val ms = (System.nanoTime() - started) / 1_000_000
+        assertEquals(4000, hits.size)
+        // 每条的封面必须是它自己的：邻居的海报发错比没图更糟
+        assertEquals("$base/p1.jpg", hits.first().cover)
+        assertEquals("$base/p3000.jpg", hits[2999].cover)
+        assertTrue(ms < 1_500, "4000 条目的封面查找花了 ${ms}ms，又退回到每条目重建集合了")
+    }
+
     @Test
     fun `search with subject format A`() = runTest {
         val fetcher = StubFetcher(mapOf("$base/search" to fixture("search_page.html")))
@@ -138,6 +209,43 @@ class SelectorEngineTest {
         )
         assertEquals(
             listOf("番剧A" to "$base/a/1.html", "番剧B" to "$base/a/2.html"),
+            hits.map { it.name to it.url },
+        )
+    }
+
+    @Test
+    fun `json path with an element missing every name key must not shift later urls`() = runTest {
+        // 第二条既没有 title 也没有 name（广告位、占位项常有这种形状）。
+        // 默认选择器是 $[*]['title','name']，多属性取值时「一个都没命中」会贡献 0 项，
+        // 而 urls 那条为它贡献了 1 项 —— 于是名字与地址整体错位一格：
+        // 用户看到「乙」，点进去播的是广告页。
+        val body = """
+            [{"title":"JSON甲","url":"/j/1.html"},{"url":"/ad.html"},{"title":"JSON乙","url":"/j/2.html"}]
+        """.trimIndent()
+        val fetcher = StubFetcher(mapOf("$base/search" to body))
+        val hits = SelectorEngine(fetcher).search(
+            config(subjectFormatId = SubjectFormatJsonPathIndexed.ID), "JSON",
+        )
+        assertEquals(
+            listOf("JSON甲" to "$base/j/1.html", "JSON乙" to "$base/j/2.html"),
+            hits.map { it.name to it.url },
+            "缺键的元素必须按位置占一格，不能让后面的条目前移",
+        )
+    }
+
+    @Test
+    fun `json path with both title and name on one element must not emit two names`() = runTest {
+        // 镜像情况：一个元素同时带 title 和 name 时，多属性取值给它贡献 2 个名字，
+        // 后面所有条目同样会错位
+        val body = """
+            [{"title":"甲","name":"甲的别名","url":"/j/1.html"},{"title":"乙","url":"/j/2.html"}]
+        """.trimIndent()
+        val fetcher = StubFetcher(mapOf("$base/search" to body))
+        val hits = SelectorEngine(fetcher).search(
+            config(subjectFormatId = SubjectFormatJsonPathIndexed.ID), "JSON",
+        )
+        assertEquals(
+            listOf("甲" to "$base/j/1.html", "乙" to "$base/j/2.html"),
             hits.map { it.name to it.url },
         )
     }

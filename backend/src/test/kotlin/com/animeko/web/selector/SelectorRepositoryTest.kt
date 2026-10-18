@@ -39,6 +39,76 @@ class SelectorRepositoryTest {
         assertEquals("我的 源", r.list().single().arguments.name)
     }
 
+    /**
+     * 并发导入两个「消毒后同名」的源。旧实现是 read-then-write 且没有互斥：
+     * 两个线程都能通过冲突检查，后写的静默盖掉前写的，界面只看到导入成功。
+     *
+     * 说清楚这个用例的力度边界：竞态本身是概率性的，跑不跑得出来取决于调度；
+     * 它锁住的是**不变量**（要么只有一个成功、落盘必须是完整可解析的配置），
+     * 而不是「一定触发过竞态」。
+     */
+    @Test
+    fun `concurrent colliding saves keep the invariant`() {
+        repeat(60) { round ->
+            val r = repo()
+            val results = java.util.concurrent.CountDownLatch(2)
+            val oks = java.util.concurrent.ConcurrentLinkedQueue<String>()
+            val fails = java.util.concurrent.ConcurrentLinkedQueue<String>()
+            listOf("并发 源", "并发_源").map { name ->
+                Thread {
+                    try {
+                        r.save(args(name))
+                        oks.add(name)
+                    } catch (e: IllegalArgumentException) {
+                        fails.add(name)
+                    } finally {
+                        results.countDown()
+                    }
+                }.start()
+            }
+            while (results.count > 0) Thread.sleep(1)
+            val stored = r.list()
+            assertTrue(
+                stored.size <= 1,
+                "第 $round 轮：两个消毒同名源都写成功了（${oks}），冲突检查被并发绕过",
+            )
+            // 落盘的必须是完整可解析的一份配置，不能是半个文件
+            assertEquals(1, stored.size, "第 $round 轮：至少应有一份成功落盘且可读")
+            assertTrue(oks.contains(stored.single().arguments.name))
+        }
+    }
+
+    /** 原子写不该在工作目录里留下临时文件；残留会让下一次导入看到一堆「没有的源」 */
+    @Test
+    fun `saving leaves no temporary files behind`() {
+        val dir = Files.createTempDirectory("animeko-repo-tmp")
+        val r = SelectorRepository(dir)
+        repeat(5) { r.save(args("源 $it")) }
+        r.setEnabled("源 0", false)
+        r.delete("源 4")
+        val leftovers = Files.list(dir).use { it.map { p -> p.fileName.toString() }.toList() }
+            .filter { it.endsWith(".tmp") || it.endsWith(".bak") }
+        assertTrue(leftovers.isEmpty(), "残留了中间文件：$leftovers")
+    }
+
+    /**
+     * 落盘失败必须报错，不能「返回成功但什么都没写」。
+     * 这里用一个占位的目录冒充目标文件：rename 一定失败，走的是 IOException 那一格。
+     *
+     * 说清覆盖边界（别再让注释假装它测了别的东西）：网络盘那条分支
+     * （ATOMIC_MOVE 抛 AtomicMoveNotSupportedException 后退回普通 move）在本地文件系统上
+     * **不会被触发**，所以本用例钉不住那一格——那一格是靠代码形状保证的（失败照抛），
+     * 不是靠这条测试。要真的覆盖它需要注入一个不支持原子 rename 的文件系统。
+     */
+    @Test
+    fun `a destination that cannot be replaced fails loudly`() {
+        val dir = Files.createTempDirectory("animeko-repo-ro")
+        val r = SelectorRepository(dir)
+        Files.createDirectories(dir.resolve("坏目标.json"))
+        val e = assertFailsWith<IllegalArgumentException> { r.save(args("坏目标")) }
+        assertTrue(e.message.orEmpty().contains("写入数据源文件失败"), e.message.orEmpty())
+    }
+
     @Test
     fun `delete only removes the source it names`() {
         val r = repo()

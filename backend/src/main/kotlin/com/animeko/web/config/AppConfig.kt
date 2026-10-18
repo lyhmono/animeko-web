@@ -8,7 +8,7 @@ import java.nio.file.Paths
  */
 data class AppConfig(
     val host: String = env("ANIMEKO_HOST", "0.0.0.0"),
-    val port: Int = env("ANIMEKO_PORT", "8080").toIntOrNull() ?: 8080,
+    val port: Int = intEnv("ANIMEKO_PORT", 8080, min = 1, max = 65535),
     /** 数据目录：数据源配置、缓存等持久化内容 */
     val dataDir: Path = Paths.get(env("ANIMEKO_DATA_DIR", "./data")),
     /** 前端构建产物目录（Docker 镜像内为 /app/frontend） */
@@ -24,16 +24,23 @@ data class AppConfig(
      * 是否启用鉴权。默认跟随凭据：配了 ANIMEKO_AUTH_TOKEN 或账号口令就自动开启，
      * 这样「登录后才能用」是开箱行为，而不是要额外记一个开关。
      * 显式写 ANIMEKO_AUTH_ENABLED=false 可以关掉（例如已有前置反代鉴权）。
+     *
+     * 这里以前是 `toBooleanStrictOrNull() ?: 凭据推导`，两个致命的静默失败：
+     *  1) 只配了 ANIMEKO_AUTH_USER、忘配口令 → 推导结果是 false，实测 /api/data
+     *     无凭据直接 200 读到数据 —— 想开登录的人得到了一台敞开的主机；
+     *  2) 写 `ANIMEKO_AUTH_ENABLED=TRUE`（大写）或 `1`/`yes` → 严格解析返回 null，
+     *     于是「明确要求开启」被当成没写，仍然是 false。
+     * 安全开关只能出错在「更严」的那一侧：值认不出来就报错退出，凭据只配一半也报错退出。
      */
-    val authEnabled: Boolean = env("ANIMEKO_AUTH_ENABLED", "").toBooleanStrictOrNull()
-        ?: (authToken != null || (authUser != null && authPassword != null)),
+    val authEnabled: Boolean = resolveAuthEnabled(
+        System.getenv("ANIMEKO_AUTH_ENABLED"), authUser, authPassword, authToken,
+    ),
     /**
      * 会话 Cookie 是否加 Secure。默认 false：本机 8080 或 SSH 隧道都是 http，
      * 加了 Secure 浏览器会直接丢弃 Set-Cookie，表现为「登录页反复回弹」。
      * 反代配好 HTTPS 之后请设为 true。
      */
-    val cookieSecure: Boolean =
-        env("ANIMEKO_COOKIE_SECURE", "false").toBooleanStrictOrNull() ?: false,
+    val cookieSecure: Boolean = boolEnvStrict("ANIMEKO_COOKIE_SECURE") ?: false,
 
     // ---- 第三方服务 ----
     /**
@@ -49,22 +56,21 @@ data class AppConfig(
                     ?.let { listOf(it.trim().removeSuffix("/")) }
                     ?: listOf("https://api.bgm.tv", "https://bgmapi.anibt.net")
             },
-    val requestTimeoutMs: Long = env("ANIMEKO_REQUEST_TIMEOUT_MS", "20000").toLongOrNull() ?: 20_000,
+    val requestTimeoutMs: Long = longEnv("ANIMEKO_REQUEST_TIMEOUT_MS", 20_000, max = 600_000),
     /**
      * Bangumi 元数据请求的超时，单独配。社区镜像（bgmapi.anibt.net）实测要
      * 13~25 秒才能返回一次搜索，而抓取用的 20 秒上限会把它正好掐死 ——
      * 表现是「搜索页永远没有 Bangumi 结果」，而镜像手动 curl 又是通的。
      */
-    val bangumiTimeoutMs: Long = env("ANIMEKO_BANGUMI_TIMEOUT_MS", "45000").toLongOrNull() ?: 45_000,
-    val proxyTimeoutMs: Long = env("ANIMEKO_PROXY_TIMEOUT_MS", "120000").toLongOrNull() ?: 120_000,
+    val bangumiTimeoutMs: Long = longEnv("ANIMEKO_BANGUMI_TIMEOUT_MS", 45_000, max = 600_000),
+    val proxyTimeoutMs: Long = longEnv("ANIMEKO_PROXY_TIMEOUT_MS", 120_000, max = 3_600_000),
 
     /**
      * 是否允许代理/抓取访问内网与保留地址。默认 false：
      * 服务默认绑定 0.0.0.0 且鉴权默认关闭，放开内网等于给同网段一台任意端口的跳板。
      * 只有当你确实要代理局域网内的 NAS/源站时才设为 true。
      */
-    val allowPrivateTargets: Boolean =
-        env("ANIMEKO_ALLOW_PRIVATE_TARGETS", "false").toBooleanStrictOrNull() ?: false,
+    val allowPrivateTargets: Boolean = boolEnvStrict("ANIMEKO_ALLOW_PRIVATE_TARGETS") ?: false,
 
     /**
      * 开机自动导入的聚合订阅地址（逗号分隔可写多条），例如
@@ -88,8 +94,7 @@ data class AppConfig(
      * 只有在反向代理改写了 Host、导致同源判定误报时才需要设为 true，
      * 那种情况下应当自己确保服务不对不可信网络开放。
      */
-    val allowCrossOrigin: Boolean =
-        env("ANIMEKO_ALLOW_CROSS_ORIGIN", "false").toBooleanStrictOrNull() ?: false,
+    val allowCrossOrigin: Boolean = boolEnvStrict("ANIMEKO_ALLOW_CROSS_ORIGIN") ?: false,
 
     /**
      * 服务前面有几层「由你控制」的反代（nginx / Caddy / CDN）。默认 0 = 直连部署：
@@ -101,8 +106,7 @@ data class AppConfig(
      * 会把代理自己的 IP 当成客户端（限速全员共享），填多了会把客户端伪造的
      * XFF 值当成真实地址（限速可被绕）。
      */
-    val trustedProxyHops: Int =
-        env("ANIMEKO_TRUSTED_PROXY_HOPS", "0").toIntOrNull()?.coerceIn(0, 8) ?: 0,
+    val trustedProxyHops: Int = intEnv("ANIMEKO_TRUSTED_PROXY_HOPS", 0, min = 0, max = 8),
 
     /**
      * `ANIMEKO_SUBSCRIPTION_AUTO_IMPORT` 的别名：等价于往那个列表里追加一个地址。
@@ -126,9 +130,99 @@ data class AppConfig(
     val userDataFile: Path get() = dataDir.resolve("userdata.json")
 
     companion object {
+        /**
+         * 鉴权开关的最终判定。做成纯函数是为了能在 CI 里回归：JVM 改不了自己的
+         * 环境变量，而这些分支恰恰是「读代码看不出危害」的那一类。
+         *
+         * @param raw ANIMEKO_AUTH_ENABLED 的原始值（未配置传 null）
+         * @param user/password/token 已经过空白过滤（空串视为未配置）
+         */
+        fun resolveAuthEnabled(raw: String?, user: String?, password: String?, token: String?): Boolean {
+            val explicit = parseBoolStrict("ANIMEKO_AUTH_ENABLED", raw)
+            // 只配了一半的凭据永远匹配不上（Basic 要求两者齐备），而「按凭据推导」
+            // 会因此得出 false —— 「我以为开了登录」实际变成「服务对整个网络敞开」。
+            // 除了显式关闭，这种写法没有合法用途，所以拒绝启动。
+            if (explicit != false && (user == null) != (password == null)) {
+                val set = if (user != null) "ANIMEKO_AUTH_USER" else "ANIMEKO_AUTH_PASSWORD"
+                val missing = if (user != null) "ANIMEKO_AUTH_PASSWORD" else "ANIMEKO_AUTH_USER"
+                throw IllegalStateException(
+                    "$set 已配置但 $missing 为空：账号口令必须成对生效，否则谁也登录不进来，" +
+                        "而鉴权又会因为「没有完整凭据」被推导为关闭。补齐 $missing，" +
+                        "或显式设置 ANIMEKO_AUTH_ENABLED=false（例如前面已有反代鉴权）。",
+                )
+            }
+            val anyCreds = token != null || (user != null && password != null)
+            if (explicit == true && !anyCreds) {
+                throw IllegalStateException(
+                    "ANIMEKO_AUTH_ENABLED=true 但没有可用凭据：请配置 ANIMEKO_AUTH_TOKEN，" +
+                        "或成对配置 ANIMEKO_AUTH_USER + ANIMEKO_AUTH_PASSWORD。" +
+                        "凭据只能来自环境变量（没有注册接口），这种组合会让所有人都永久进不去。",
+                )
+            }
+            return explicit ?: anyCreds
+        }
+
         fun env(key: String, default: String): String =
             System.getenv(key)?.takeIf { it.isNotBlank() } ?: default
 
         fun envOrNull(key: String): String? = System.getenv(key)?.takeIf { it.isNotBlank() }
+
+        /**
+         * 整数配置：没配（null/空白）走默认值；配了但不是 [min,max] 内的整数就拒绝启动。
+         *
+         * `toIntOrNull() ?: 默认值` 会把 `ANIMEKO_PORT=808o` 变成「起在 8080」，
+         * 把 `ANIMEKO_TRUSTED_PROXY_HOPS=two` 变成「0 跳」——限速键退化成代理 IP，
+         * 所有客户端共享同一个计数器，等于没有上限。端口 0 更糟：值本身合法，
+         * 但 Netty 要到 bind 阶段才拒绝，堆栈里没有变量名，排查时根本想不到是配置。
+         */
+        fun parseIntStrict(key: String, raw: String?, default: Int, min: Int, max: Int): Int {
+            val text = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return default
+            val value = text.toIntOrNull()
+                ?: throw IllegalStateException("$key 的值「$text」不是整数。")
+            if (value !in min..max) {
+                throw IllegalStateException("$key 必须在 $min..$max 范围内，当前为 $value。")
+            }
+            return value
+        }
+
+        fun intEnv(key: String, default: Int, min: Int, max: Int): Int =
+            parseIntStrict(key, System.getenv(key), default, min, max)
+
+        /** 毫秒类超时：同上，但必须为正数，且上限防呆（避免写成 1e15 让请求永久挂起） */
+        fun parseLongStrict(key: String, raw: String?, default: Long, max: Long): Long {
+            val text = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return default
+            val value = text.toLongOrNull()
+                ?: throw IllegalStateException("$key 的值「$text」不是整数。")
+            if (value !in 1..max) {
+                throw IllegalStateException("$key 必须在 1..$max 之间，当前为 $value。")
+            }
+            return value
+        }
+
+        fun longEnv(key: String, default: Long, max: Long): Long =
+            parseLongStrict(key, System.getenv(key), default, max)
+
+        /**
+         * 解析一个布尔量：没配返回 null，交给调用方的默认值；配了但认不出来**直接报错**。
+         *
+         * 为什么不能「解析失败就取默认值」：`toBooleanStrictOrNull()` 会把 `TRUE`（大写）、
+         * `1`、`yes` 这类再自然不过的写法当成「没配」。对功能开关来说那只是回到默认行为；
+         * 对 ANIMEKO_AUTH_ENABLED 来说，「我明确要求开启」被静默降级成「没配 → 按凭据推导 →
+         * 凭据只配了一半 → 关闭鉴权」，运维以为上了锁，实际得到一台敞开的主机。
+         * 宁可启动失败让容器刷错误日志，也不要在安全属性上猜。
+         */
+        fun parseBoolStrict(key: String, raw: String?): Boolean? {
+            val text = raw?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return null
+            return when (text) {
+                "true", "1", "yes", "on", "y", "t" -> true
+                "false", "0", "no", "off", "n", "f" -> false
+                else -> throw IllegalStateException(
+                    "$key 的值「$text」无法识别，" +
+                        "只接受 true/false（大小写不限，也接受 1/0、yes/no、on/off）。",
+                )
+            }
+        }
+
+        fun boolEnvStrict(key: String): Boolean? = parseBoolStrict(key, System.getenv(key))
     }
 }

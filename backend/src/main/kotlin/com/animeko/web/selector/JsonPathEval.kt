@@ -1,6 +1,7 @@
 package com.animeko.web.selector
 
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -63,10 +64,11 @@ object JsonPathEval {
 
     private fun applyBracket(current: List<JsonElement>, inner: String): List<JsonElement>? {
         if (inner == "*") return current.flatMap { children(it) }
-        // 多属性: 'a','b' 或 "a","b"
+        // 多属性: 'a','b' 或 "a","b"。这里保持 Jayway 语义：一个元素命中几个键就贡献几项、
+        // 一个都不命中贡献 0 项。需要「按位置配对」的调用方请用 evaluateAligned()，
+        // 不要在通用求值器里偷偷改语义 —— 那会让所有其它路径的行为变得不可预期。
         if (inner.contains("'") || inner.contains("\"")) {
-            val keys = Regex("""['"]([^'"]+)['"]""").findAll(inner).map { it.groupValues[1] }.toList()
-            if (keys.isEmpty()) return null
+            val keys = multiKeyNames(inner) ?: return null
             return current.flatMap { e -> keys.flatMap { property(e, it) } }
         }
         // 下标
@@ -75,6 +77,58 @@ object JsonPathEval {
         }
         // 单 key（无引号）
         return current.flatMap { property(it, inner) }
+    }
+
+    private fun multiKeyNames(inner: String): List<String>? {
+        if (!(inner.contains("'") || inner.contains("\""))) return null
+        val keys = Regex("""['"]([^'"]+)['"]""").findAll(inner).map { it.groupValues[1] }.toList()
+        return keys.ifEmpty { null }
+    }
+
+    /**
+     * 与 [evaluate] 同，但**结尾的多属性选择器按元素对齐**：
+     * 每个元素恰好贡献一项（取第一个命中的键，都没有则贡献 JsonNull 占格）。
+     *
+     * 存在的理由：数据源的 `selectNames` / `selectLinks` 形如
+     * `$[*]['title','name']` 与 `$[*]['url','link']`，调用方是**按下标配对**名字与地址的。
+     * 按 Jayway 语义，缺键的元素贡献 0 项、同时带两个键的元素贡献 2 项，于是两条列表长度
+     * 不同、整体错位 —— 症状不是报错而是「显示 A 的名字，点进去播 B 的地址」这种静默错结果。
+     * 补一个占位格让上层按「空名字」丢掉那一条，后面的条目就不会前移。
+     */
+    fun evaluateAligned(path: String, root: JsonElement): List<JsonElement>? {
+        val p = path.trim()
+        // 这里以前是 Regex("""^(.+)\[(.+)\]$""").matchEntire(p)。
+        // 两个贪婪 .+ 加行尾锚点在最坏情况下是**平方级**回溯：实测长度 20001 要 2.7s、
+        // 40001 要 10.5s、80001 要 42s，而选择器字符串来自第三方配置、每次搜索都会重新跑一遍
+        // ——一份 `selectNames = "$[[[[[…"` 的配置就能把这台机器的 CPU 按住。
+        // 语义与那条正则完全一致（贪婪的 group1 恰好停在**最后一个** `[`），但不需要回溯。
+        val close = p.length - 1
+        val open = p.lastIndexOf('[')
+        if (open <= 0 || close <= open || p[close] != ']') return evaluate(p, root)
+        val prefix = p.substring(0, open)
+        val keys = multiKeyNames(p.substring(open + 1, close))
+        if (keys.isNullOrEmpty()) return evaluate(p, root)
+        val elements = evaluate(prefix, root) ?: return null
+        return elements.flatMap { alignedFor(it, keys) }
+    }
+
+    /**
+     * 对一个元素产出「每个叶子一条」的结果：对象贡献 1 条（取第一个命中的键，
+     * 全都没有则 JsonNull 占格）；数组递归到它的每个叶子。
+     *
+     * 必须递归展开数组：默认选择器 `$[*]['title','name']` 作用在
+     * `{"code":0,"data":[{...},{...}]}` 这种根上时，`$[*]` 给出的是**数组本身**，
+     * 旧实现正是靠 property() 对数组的自动展开才拿到两项。只按「一个元素一条」
+     * 处理会把整个数组压成一条，反而丢数据。
+     */
+    private fun alignedFor(e: JsonElement, keys: List<String>): List<JsonElement> = when (e) {
+        is JsonArray -> e.flatMap { alignedFor(it, keys) }
+        is JsonObject -> listOf(
+            keys.asSequence()
+                .mapNotNull { e[it] }
+                .firstOrNull() ?: JsonNull,
+        )
+        else -> emptyList()
     }
 
     /** 属性访问：对象取键值；数组自动映射到每个元素（Jayway 语义） */

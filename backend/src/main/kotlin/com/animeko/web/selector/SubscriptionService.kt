@@ -3,6 +3,7 @@ package com.animeko.web.selector
 import com.animeko.web.appLog
 import com.animeko.web.http.Fetcher
 import com.animeko.web.http.HttpResult
+import com.animeko.web.http.JsonGuard
 import com.animeko.web.http.UrlGuard
 import com.animeko.web.http.UpstreamException
 import kotlinx.coroutines.CancellationException
@@ -11,6 +12,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -217,6 +219,9 @@ class SubscriptionService(
      */
     private fun parse(body: String): Pair<List<SelectorSourceArguments>, List<String>> {
         val root = try {
+            // 订阅正文来自第三方：深度不检查的话，一份 `[[[[…` 会打穿栈，
+            // 而 StackOverflowError 不是 Exception，下面这个 catch 接不住
+            JsonGuard.requireShallow(body)
             json.parseToJsonElement(body)
         } catch (e: Exception) {
             throw IllegalArgumentException("订阅内容不是合法 JSON：${e.message?.take(160)}")
@@ -238,11 +243,17 @@ class SubscriptionService(
                 "订阅内容不是 JSON 对象或数组（订阅站可能返回了错误页）：${shapeOf(root)}",
             )
         }
-        require(elements.size <= MAX_ENTRIES) { "订阅里有 ${elements.size} 个数据源，超过 $MAX_ENTRIES 个上限" }
-
+        // 上限是用来封顶工作量的，不是用来取消全部工作的：
+        // 热门聚合订阅动辄六七百个源，原先直接 require(size <= MAX_ENTRIES) 会让整份订阅
+        // 一个源都导不进来，而下面本来就有「一条坏只丢一条并说明原因」的机制。
+        val overflow = elements.size - MAX_ENTRIES
+        val considered = if (overflow > 0) elements.take(MAX_ENTRIES) else elements
         val items = mutableListOf<SelectorSourceArguments>()
         val rejected = mutableListOf<String>()
-        elements.forEachIndexed { index, el ->
+        if (overflow > 0) {
+            rejected += "另有 $overflow 个数据源超出单次 ${MAX_ENTRIES} 个上限，未列出（可让订阅站拆分，或挑少量源单独导入）"
+        }
+        considered.forEachIndexed { index, el ->
             val args = decode(el)
             val label = args?.name?.takeIf { it.isNotBlank() } ?: "第 ${index + 1} 条（${shapeOf(el)}）"
             when {
@@ -271,10 +282,18 @@ class SubscriptionService(
         else -> el.jsonPrimitive.contentOrNull?.take(20) ?: el.toString().take(20)
     }
 
-    /** tier 在 animeko 里既可能是数字（分级）也可能是字符串，展示时统一成文本。 */
-    private fun displayTier(value: JsonElement?): String = when {
-        value == null || value is JsonNull -> ""
-        else -> value.jsonPrimitive.contentOrNull ?: value.toString().take(40)
+    /**
+     * tier 在 animeko 里既可能是数字（分级）也可能是字符串，展示时统一成文本。
+     *
+     * 社区订阅里它还可能是**对象或数组**（自制映射、`{"t0": ...}` 这种），而
+     * `JsonElement.jsonPrimitive` 对非 primitive 是直接抛 IllegalArgumentException。
+     * 这里必须写成全函数：tier 只是列表里一列展示文本，不值得让一条源的写法
+     * 把整个预览（以及自动导入）打成一团 500。
+     */
+    private fun displayTier(value: JsonElement?): String = when (value) {
+        null, is JsonNull -> ""
+        is JsonPrimitive -> value.contentOrNull ?: value.toString().take(40)
+        else -> value.toString().take(40)
     }
 
     /** 站点主机名：让用户在列表里一眼看出这是哪个站，而不必展开配置。 */

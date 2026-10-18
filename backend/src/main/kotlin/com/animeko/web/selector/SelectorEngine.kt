@@ -3,6 +3,7 @@ package com.animeko.web.selector
 import com.animeko.web.appLog
 import com.animeko.web.http.Fetcher
 import com.animeko.web.http.HttpResult
+import com.animeko.web.http.JsonGuard
 import com.animeko.web.http.UrlGuard
 import com.animeko.web.http.UpstreamException
 import kotlinx.coroutines.CancellationException
@@ -178,8 +179,11 @@ class SelectorEngine(
         }
         fallback?.let {
             // 说清楚走了兜底：这等于「配置里的 CDN 白名单过期了」，
-            // 不记下来的话下次源站换域名时只能看到一堆莫名的失败
-            appLog.info("matchVideoUrl 没有命中，改用通用扩展名兜底：{}", it)
+            // 不记下来的话下次源站换域名时只能看到一堆莫名的失败。
+            // 但只记到 path：这类地址的 query 里通常就是 sign/token/时间戳，
+            // 原样进容器日志等于把可用凭据抄进一份谁都能读的文件
+            // （同一个理由已经用在 /api/proxy 的日志上）。
+            appLog.info("matchVideoUrl 没有命中，改用通用扩展名兜底：{}", urlForLog(it))
             return ResolvedTarget(it, referer, ua, cookies)
         }
         throw SelectorException("未能从播放页提取视频地址（NO_VIDEO_URL_FOUND）")
@@ -190,11 +194,12 @@ class SelectorEngine(
     private fun selectA(doc: Document, cfg: SelectorSearchConfig, base: String): List<SubjectHit> {
         val c = cfg.selectorSubjectFormatA
         val elements = queryAll(doc, c.selectLists) ?: return emptyList()
+        val siblings = siblingSet(elements)
         return elements.mapNotNull { e ->
             val name = e.attr("title").ifBlank { e.text().trim() }
             val href = e.attr("href")
             if (name.isBlank() || href.isBlank()) null
-            else SubjectHit(name, applyLink(c.linkTemplate, href, base), coverOf(e, base, elements))
+            else SubjectHit(name, applyLink(c.linkTemplate, href, base), coverOf(e, base, siblings))
         }
     }
 
@@ -202,10 +207,11 @@ class SelectorEngine(
         val c = cfg.selectorSubjectFormatIndexed
         val names = queryAll(doc, c.selectNames)?.map { it.text().trim() } ?: return emptyList()
         val linkEls = queryAll(doc, c.selectLinks) ?: return emptyList()
+        val siblings = siblingSet(linkEls)
         return pairIndexed(
             names,
             linkEls.map { it.attr("href") },
-            linkEls.map { coverOf(it, base, linkEls) },
+            linkEls.map { coverOf(it, base, siblings) },
             c.linkTemplate,
             base,
         )
@@ -243,20 +249,31 @@ class SelectorEngine(
     private fun selectJsonPathIndexed(body: String, cfg: SelectorSearchConfig, base: String): List<SubjectHit> {
         val c = cfg.selectorSubjectFormatJsonPathIndexed
         val root: JsonElement = try {
+            // 源站返回什么不由我们决定：先用深度闸门挡住「一把左括号」那种
+            // 会打穿栈的载荷（StackOverflowError 不是 Exception，下面的 catch 接不住）
+            JsonGuard.requireShallow(body)
             json.parseToJsonElement(body)
         } catch (e: Exception) {
             return emptyList()
         }
         // 保留位置（取不到字符串就置空串）再配对，理由同 pairIndexed
-        val urls = JsonPathEval.evaluate(c.selectLinks, root)
+        // 名字、地址、封面都是**按下标配对**的，所以必须用对齐版求值：
+        // 通用求值器按 Jayway 语义让缺键元素贡献 0 项、双键元素贡献 2 项，
+        // 结果不是报错而是整列表错位 —— 显示 A 的名字、点进去播 B 的地址
+        val urls = JsonPathEval.evaluateAligned(c.selectLinks, root)
             ?.map { JsonPathEval.singleString(it).orEmpty() }
             ?: return emptyList()
-        val names = JsonPathEval.evaluate(c.selectNames, root)
+        val names = JsonPathEval.evaluateAligned(c.selectNames, root)
             ?.map { JsonPathEval.singleString(it).orEmpty() }
             ?: return emptyList()
         val covers = COVER_KEYS
             .asSequence()
-            .mapNotNull { key -> JsonPathEval.evaluate("$[*].$key", root)?.map { JsonPathEval.singleString(it).orEmpty() } }
+            .mapNotNull { key ->
+                // `$[*]['key']` 而不是 `$[*].['key']`：后者在 `.` 后面接 `[`，
+                // 求值器会当成空键而整条返回 null（封面于是永远取不到）
+                JsonPathEval.evaluateAligned("$[*]['$key']", root)
+                    ?.map { JsonPathEval.singleString(it).orEmpty() }
+            }
             .firstOrNull { it.any { v -> v.isNotBlank() } }
             ?: emptyList()
         return pairIndexed(names, urls, covers, c.linkTemplate, base)
@@ -277,25 +294,38 @@ class SelectorEngine(
     private fun coverOf(
         el: org.jsoup.nodes.Element,
         base: String,
-        siblings: List<org.jsoup.nodes.Element> = emptyList(),
+        siblings: Set<org.jsoup.nodes.Element> = emptySet(),
     ): String? {
         coverUrl(el, base)?.let { return it }
         coverIn(el, base)?.let { return it }
         if (siblings.isEmpty()) return null
-        val all = java.util.Collections.newSetFromMap(
-            java.util.IdentityHashMap<org.jsoup.nodes.Element, Boolean>(),
-        )
-        all += siblings
         var node = el.parent()
         var hops = 0
         while (node != null && hops < MAX_COVER_HOPS) {
             // 这一层已经罩住了别的条目 → 再往上只会更共享，不必也不能继续找
-            if (node.getAllElements().count { it in all } > 1) break
+            if (node.getAllElements().count { it in siblings } > 1) break
             coverIn(node, base)?.let { return it }
             node = node.parent()
             hops++
         }
         return null
+    }
+
+    /**
+     * 一组结果条目的「同一份集合」身份视图。
+     *
+     * 每个条目都要判断「我的祖先里有没有别的条目」，用的是对象身份而不是 equals
+     * （jsoup 的 Element.equals 是结构比较，会把两个不同节点判成相等）。
+     * 这个集合**每个查询建一次**，不是每个条目建一次：N 个条目各建一遍就是 O(N²) 的
+     * 分配与插入，8000 条目的列表页（8MB 上限内完全可能出现）实测要几十秒，
+     * 而这个开销和封面本身没有任何关系。
+     */
+    private fun siblingSet(elements: List<org.jsoup.nodes.Element>): Set<org.jsoup.nodes.Element> {
+        val set = java.util.Collections.newSetFromMap(
+            java.util.IdentityHashMap<org.jsoup.nodes.Element, Boolean>(),
+        )
+        set += elements
+        return set
     }
 
     private fun coverIn(
@@ -453,7 +483,7 @@ class SelectorEngine(
      * 更早的版本只在搜索 phase 限速，连点播放仍然能瞬间打满详情页与播放页。
      */
     private suspend fun throttle(cfg: SelectorSearchConfig) {
-        val interval = cfg.requestInterval.coerceAtLeast(0)
+        val interval = effectiveInterval(cfg.requestInterval)
         if (interval <= 0) return
         val wait = synchronized(lastRequestAt) {
             val now = System.currentTimeMillis()
@@ -464,6 +494,16 @@ class SelectorEngine(
         }
         if (wait > 0) delay(wait)
     }
+
+    /**
+     * `requestInterval` 来自第三方配置，必须封顶。
+     *
+     * 原样接受的话，一份 `{"requestInterval": 86400000}` 的配置会把「下一次允许请求的时间」
+     * 推到一天之后，并且每次调用都再往后推一天：这个源从此永远停在「搜索中」，
+     * 而每个用户的每次搜索都会留下一个挂在 delay 上的协程。上限取 15 秒 ——
+     * 比这更慢的源不该被放进搜索链路；真要限流是源站自己的事。
+     */
+    internal fun effectiveInterval(raw: Long): Long = raw.coerceIn(0, MAX_REQUEST_INTERVAL_MS)
 
     /**
      * 抓取并取文本，并逐跳重新校验重定向。
@@ -544,6 +584,22 @@ class SelectorEngine(
     companion object {
         /** 抓取页面体积上限：同时约束「用户自定义正则」的输入规模（JVM 正则没有超时） */
         const val MAX_PAGE_BYTES: Long = 8L * 1024 * 1024
+
+        /** 第三方配置里 requestInterval 的可用上限，见 effectiveInterval */
+        const val MAX_REQUEST_INTERVAL_MS: Long = 15_000
+
+        /**
+         * 日志用的地址形态：只留 scheme://host/path，query 与 fragment 一律丢掉。
+         *
+         * 这类地址的查询串就是凭据本身（`?sign=…&time=…`、`?token=…`），
+         * 记进容器日志等于把一份可重放的播放地址抄给所有能读日志的人。
+         * 解析不出来时也不能回落到原文：宁可少记，截断到没有查询串为止。
+         */
+        internal fun urlForLog(raw: String): String = runCatching {
+            val u = URI(raw)
+            val authority = u.rawAuthority?.let { "://$it" } ?: ""
+            "${u.scheme}$authority${u.rawPath.orEmpty()}"
+        }.getOrElse { raw.substringBefore('?').take(120) }
         private const val MAX_PAGE_REDIRECTS = 5
 
         /** 找条目封面时最多向上找几层容器。再往上就已经是整个列表了 */
@@ -574,7 +630,11 @@ class SelectorEngine(
             if (cfg.rawBaseUrl.isNotBlank()) return cfg.rawBaseUrl
             return try {
                 val u = URI(requestUrl)
-                "${u.scheme}://${u.authority}"
+                // authority 为 null 时（`http:///x`、`mailto:x` 这类）不能拼出 base：
+                // "${u.scheme}://${u.authority}" 会把 null 直接拼进字符串，
+                // 得到 http://null 这种看着像地址的东西，产出一堆点不开的链接而不是报错
+                val authority = u.rawAuthority ?: return requestUrl
+                "${u.scheme}://$authority"
             } catch (e: Exception) {
                 requestUrl
             }

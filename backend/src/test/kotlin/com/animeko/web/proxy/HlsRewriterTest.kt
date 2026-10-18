@@ -103,4 +103,29 @@ class HlsRewriterTest {
         assertTrue(result.contains("seg%zz.ts"), result)
         assertFalse(result.contains("/api/proxy?url=seg"), "畸形地址不该被改写成必然 400 的代理地址：$result")
     }
+
+    /**
+     * 密钥行要和分片行同规则。分片那一侧有「解析不出绝对地址就原样透传」的退路，
+     * 而 URI 属性改写原先没有：同一类畸形地址（国内 CDN 真会吐 `%` 转义坏掉的密钥 URI）
+     * 会被改写成 /api/proxy?url=key%zz.bin，代理入口判 `!startsWith("http")` 直接 400 ——
+     * 表现是「整条流黑屏且没有任何可诊断的错误」，而这本来只是播放器自己能解的一行相对地址。
+     */
+    @Test
+    fun `a malformed key uri is passed through instead of becoming a broken proxy url`() {
+        val body = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key%zz.bin\"\n#EXTINF:10,\nseg.ts\n"
+        val result = HlsRewriter.rewrite(body, "https://cdn.example.com/hls/index.m3u8")
+        assertTrue(result.contains("""URI="key%zz.bin""""), "畸形密钥地址要原样留着：$result")
+        assertFalse(result.contains("/api/proxy?url=key"), "畸形密钥不该被改写成必然 400 的代理地址：$result")
+    }
+
+    @Test
+    fun `a relative key uri still resolves against the playlist and gets proxied`() {
+        // 反向对照：合法的相对密钥地址必须照常被改写，否则这条流会去请求未代理的源站而 403
+        val body = "#EXT-X-KEY:METHOD=AES-128,URI=\"k.bin\""
+        val result = HlsRewriter.rewrite(body, "https://cdn.example.com/hls/index.m3u8")
+        assertTrue(
+            result.contains("""URI="/api/proxy?url=https%3A%2F%2Fcdn.example.com%2Fhls%2Fk.bin""""),
+            result,
+        )
+    }
 }

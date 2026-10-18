@@ -63,7 +63,11 @@ object HlsRewriter {
             } else {
                 SelectorEngine.absUrl(playlistUrl, url)
             }
-            """URI="${proxyUrl(proxyPath, abs, sid)}""""
+            // 与下面的分片分支同一条规则：解析不出绝对地址就原样留着。
+            // 少了这一格，`URI="key%zz.bin"` 这类畸形密钥地址会被改写成
+            // /api/proxy?url=key%zz.bin，而代理入口要求 url 必须以 http 开头 → 必然 400，
+            // 症状是整条流黑屏且没有任何能看懂的错误。
+            if (!abs.startsWith("http")) m.value else """URI="${proxyUrl(proxyPath, abs, sid)}""""
         }
 
     fun proxyUrl(proxyPath: String, url: String, sid: String = ""): String {

@@ -56,6 +56,51 @@ class SubscriptionServiceTest {
         assertTrue(preview.subscription.contains("css.json"), preview.subscription)
     }
 
+    /**
+     * 社区订阅里 tier 的写法不受我们控制：整数、字符串都见过，对象也完全可能出现
+     * （`"tier": {"t0": "..."}` 这类自制的映射）。`jsonPrimitive` 对非 primitive
+     * 是直接强转，会抛 ClassCastException —— 而 preview 的候选清单是一整条 map，
+     * 一条源的 tier 长得奇怪就让整个预览 500，用户看到的是「这个订阅打不开」。
+     */
+    /**
+     * 热门聚合订阅（css1.json 一类）动辄六七百个源。
+     * 原先 `require(size <= 500)` 让整份订阅直接失败：用户一个源也导不进来，
+     * 而这份文件下面就有「一条坏只丢一条」的机制 —— 上限该用来封顶工作量，
+     * 不该用来取消全部工作。
+     */
+    @Test
+    fun `an over-sized subscription keeps what it can instead of failing entirely`() = runTest {
+        val many = (1..503).joinToString(",") { i ->
+            """{"factoryId":"web-selector","version":2,"arguments":{"name":"源$i",""" +
+                """"searchConfig":{"searchUrl":"https://s$i.test/?wd={keyword}","rawBaseUrl":"https://s$i.test"}}}"""
+        }
+        val body = """{"exportedMediaSourceDataList":{"mediaSources":[$many]}}"""
+        val (svc, _) = service(body)
+        val preview = svc.preview(url = "https://sub.example.test/css.json", text = null)
+        assertEquals(500, preview.candidates.size, "应当列出前 500 个，而不是一个都不给")
+        // rejected 是「说明列表」而不是逐条列表：溢出用一个条目讲清有多少被跳过
+        assertEquals(1, preview.rejected.size, preview.rejected.toString())
+        assertTrue(preview.rejected.single().contains("3 个数据源"), preview.rejected.toString())
+        assertTrue(preview.rejected.single().contains("上限"), preview.rejected.toString())
+    }
+
+    @Test
+    fun `a tier written as an object degrades to text instead of sinking the preview`() = runTest {
+        val odd = aggregate.replace("\"tier\": 0", "\"tier\": {\"label\": \"t0\", \"by\": [1,2]}")
+        // 断言替换真的发生了。原先写的是 assertTrue("{" in odd)，而 JSON 本身就有大括号
+        // —— fixture 一旦改格式（比如去掉冒号两侧空格），替换静默失配，
+        // 对象分支一次都没跑过，这个用例却还是绿的。
+        assertTrue(odd.contains("\"tier\": {\"label\""), "替换没生效，用例失去意义")
+        assertTrue(!odd.contains("\"tier\": 0"), "替换后原值应当消失")
+        val (svc, _) = service(odd)
+        val preview = svc.preview(url = "https://sub.example.test/css.json", text = null)
+        assertEquals(3, preview.candidates.size, preview.candidates.toString())
+        // 别的源照常列出，tier 退化成一段可展示的文本而不是崩掉
+        val tier = preview.candidates.first { it.name == "稀饭动漫" }.tier
+        assertTrue(tier.isNotBlank(), "tier 至少要有个可展示的文本形式")
+        assertEquals("1", preview.candidates.first { it.name == "嘀嗒影视" }.tier)
+    }
+
     @Test
     fun `preview marks what is already imported`() = runTest {
         val (svc, _) = service(aggregate, existing("嘀嗒影视"))
