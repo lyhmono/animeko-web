@@ -20,6 +20,8 @@ services:
       - ANIMEKO_PORT=8080
       # ---- 登录：配了凭据就自动开启登录页（不配则站点打开即用）----
       # 建议单账号自用；口令请换成足够长的随机串
+      # 注意：USER 与 PASSWORD 必须成对打开，只开一个会在启动时报错退出
+      #（半套凭据等于「谁也进不去」，而鉴权又会被推导为关闭，所以不做静默回落）
       # - ANIMEKO_AUTH_USER=animeko
       # - ANIMEKO_AUTH_PASSWORD=***
       # 也可以只配一个口令（登录页用户名任意、密码填它；API 调用可用 Bearer）

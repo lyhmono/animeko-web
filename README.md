@@ -122,6 +122,28 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 | `ANIMEKO_SUBSCRIPTION_AUTO_IMPORT` | 空 | 开机自动导入的聚合订阅地址（逗号分隔可多个），免去每次去界面里勾选。**只覆盖同名源、只增不删**，且沿用本机已有的启用/关闭状态——你在界面上关掉的源，重启后仍然是关掉的。订阅站挂了只写日志，不影响服务启动 |
 | `ANIMEKO_SUBSCRIPTION_AUTO_TIERS` | 空 | 自动导入时的 tier 白名单（逗号分隔，如 `0,1`；tier 越低质量越好）。空=全导。**只作用于自动导入**，界面里的勾选导入不受限制 |
 
+### 配置写错时会拒绝启动
+
+从某一次审计起，配置解析改成**失败关闭**：认不出来的值不再悄悄回落到默认值，而是打印一条
+带变量名的错误后退出。原因是这类静默回落恰好落在安全属性上——`ANIMEKO_AUTH_ENABLED=TRUE`
+（大写）以前会被当成「没配」，鉴权因此被推导为关闭，运维以为上了锁，实际得到一台敞开的主机。
+
+会拒绝启动的几种写法：
+
+- `ANIMEKO_AUTH_ENABLED` / `ANIMEKO_COOKIE_SECURE` / `ANIMEKO_ALLOW_PRIVATE_TARGETS` /
+  `ANIMEKO_ALLOW_CROSS_ORIGIN` 填了 true/false 之外的东西（`1`、`yes`、`on`、`0`、`no`、`off` 都接受，大小写不限）
+- **只配了 `ANIMEKO_AUTH_USER` 或只配了 `ANIMEKO_AUTH_PASSWORD`**：账号口令必须成对，
+  否则谁也登录不进来，而鉴权又会被「没有完整凭据」推导为关闭。要关掉登录页请显式写
+  `ANIMEKO_AUTH_ENABLED=false`（前提是前面已有反代鉴权）
+- `ANIMEKO_PORT` 不是 1–65535 的整数；各类 `*_TIMEOUT_MS` 不是正数
+- `ANIMEKO_TRUSTED_PROXY_HOPS` 不是 0–8 的整数（越界不再夹取：夹到 8 会让限速键取错位置）
+
+容器因此可能进入重启循环。看到 `IllegalStateException: ANIMEKO_...` 就是配置的问题，
+`docker logs` 第一行会直接写明是哪个变量、错在哪。
+
+另外：`ANIMEKO_SUBSCRIPTION_AUTO_IMPORT` 指向的聚合订阅如果源数超过 500 个，
+现在只导入前 500 个并在预览的「未导入」列表里说明剩余数量，不再因为超量而整份订阅导入失败。
+
 ### 接口一览
 
 「凭据」指会话 Cookie、`Authorization: Basic`、或 `Authorization: Bearer <token>` 三者之一

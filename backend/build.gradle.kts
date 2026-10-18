@@ -42,6 +42,16 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    // 测试 JVM 必须自己声明文本编码，不能继承调用者的 locale。
+    //
+    // 数据源文件名由（多为中文的）数据源名派生，而 java.io 拼文件名用的字符集是
+    // sun.jnu.encoding，它跟随**进程启动时**的 locale，`-Dfile.encoding` 管不到它。
+    // CI 与很多最小化镜像里 LANG 是空的（POSIX/ANSI_X3.4-1968），那批用中文名导入数据源
+    // 的用例会整片失败——那不是产品坏了：产品给出的正是那条指名变量的正确报错。
+    // 此前本机的绿灯，只是因为有人恰好 export 过 LANG。
+    environment("LANG", "C.UTF-8")
+    environment("LC_ALL", "C.UTF-8")
+    jvmArgs("-Dfile.encoding=UTF-8")
     testLogging {
         events("passed", "failed", "skipped")
         showStandardStreams = false

@@ -18,6 +18,14 @@ start() { # dataDir port [nolang] [extraEnv...]
   local pre="env"
   # 故意不带 LANG 起第二个实例：模拟裸 java -jar 部署（Docker 镜像里已经设了 C.UTF-8）
   [ -n "$nolang" ] && pre="env -u LANG -u LC_ALL"
+  # 端口必须先是空的。上一次跑挂了的 JVM（或任何别的服务）还在监听时，
+  # readiness 会立刻成功，于是整份冒烟报告验证的是**另一个进程**——
+  # 而且是被旧代码答应的旧进程，绿色结果完全可信却什么都证明不了。
+  if ! port_free "$p"; then
+    echo "端口 $p 已被占用（脚本自己没清干净，或别的服务在用）。先处理再跑。"
+    command -v ss >/dev/null 2>&1 && ss -ltnp 2>/dev/null | grep ":$p "
+    return 1
+  fi
   # 额外变量放在 `env` 之后而不是和前面那些赋值并列：shell 只认命令字之前
   # 字面写出来的赋值，变量展开出来的 A=b 会被当成命令名（No such file or directory）
   ( ANIMEKO_DATA_DIR=$d ANIMEKO_AUTH_USER=me ANIMEKO_AUTH_PASSWORD='s3cret-pass' \
@@ -25,16 +33,59 @@ start() { # dataDir port [nolang] [extraEnv...]
     $pre $extra $BIN ) > "$d/server.log" 2>&1 &
   echo $! > "$d/pid"
   for _ in $(seq 1 80); do
-    curl -fsS -m 2 "http://127.0.0.1:$p/api/health" >/dev/null 2>&1 && return 0
+    curl -fsS -m 2 "http://127.0.0.1:$p/api/health" >/dev/null 2>&1 && break
+    kill -0 "$(cat "$d/pid")" 2>/dev/null || break
     sleep 0.5
   done
-  echo "服务没起来：$p"; tail -20 "$d/server.log"; return 1
+  # readiness 成功还不够，得确认答应的是我们刚拉起的那个进程
+  if ! kill -0 "$(cat "$d/pid")" 2>/dev/null; then
+    echo "我们启动的进程已退出（端口 $p）"; tail -20 "$d/server.log"; return 1
+  fi
+  curl -fsS -m 2 "http://127.0.0.1:$p/api/health" >/dev/null 2>&1 || {
+    echo "服务没起来：$p"; tail -20 "$d/server.log"; return 1; }
+  return 0
 }
-stop() { kill "$(cat "$1/pid")" 2>/dev/null; wait "$(cat "$1/pid")" 2>/dev/null; }
+stop() { kill "$(cat "$1/pid" 2>/dev/null)" 2>/dev/null; }
+
+port_free() { # bash 的 /dev/tcp：连不上才是空的。
+  # 不能用 curl /api/health 判 —— 别的 HTTP 服务回 404 时 curl 也失败，
+  # 那会把「端口被占」误判成「空闲」，正好绕过这道防线。
+  (exec 3<>/dev/tcp/127.0.0.1/"$1") 2>/dev/null && { exec 3>&- 3<&-; return 1; }
+  return 0
+}
+
+require_fresh_build() {
+  # 冒烟跑的是 build/install 与 frontend/dist 里的产物。改了源码忘了重新构建时，
+  # 全套断言会对着旧字节码亮绿灯 —— 这是本脚本最危险的一种假通过。
+  # 只看 src/main 与前端源文件：测试文件的新改动不影响产物，不该逼人重编。
+  local stale=""
+  local newer
+  # 比的是 jar 本体，不是 bin 下的启动脚本：gradle 在输入没变时不会重写启动脚本，
+  # 拿它的 mtime 判会把「刚构建过的产物」说成过期（我自己就被这条误判过一次）。
+  local artifact
+  artifact=$(dirname "$(dirname "$BIN")")/lib/animeko-web-0.1.0.jar
+  [ -f "$artifact" ] || artifact=$BIN
+  newer=$(find backend/src/main frontend/src frontend/index.html -newer "$artifact" -type f \
+    \( -name '*.kt' -o -name '*.ts' -o -name '*.tsx' -o -name '*.css' -o -name '*.html' \) 2>/dev/null | head -3)
+  [ -n "$newer" ] && stale="后端源码比 $(basename "$artifact") 新：$(printf '%s ' $newer)"
+  if [ -f "$DIST/index.html" ]; then
+    newer=$(find frontend/src frontend/index.html frontend/vite.config.ts -newer "$DIST/index.html" -type f \
+      \( -name '*.ts' -o -name '*.tsx' -o -name '*.css' -o -name '*.html' \) 2>/dev/null | head -3)
+    [ -n "$newer" ] && stale="$stale 前端源码比 dist/index.html 新：$(printf '%s ' $newer)"
+  fi
+  if [ -n "$stale" ]; then
+    echo "产物过期，冒烟会验证到旧构建。先重新构建（gradle installDist / npm run build）。"
+    printf '  %s\n' "$stale"
+    return 1
+  fi
+  return 0
+}
 
 A=/tmp/animeko-live-a; B=/tmp/animeko-live-b
 rm -rf $A $B; mkdir -p $A $B
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
+[ -x "$BIN" ] || { echo "没有 $BIN，先 gradle installDist"; exit 1; }
+require_fresh_build || exit 1
 start $A 18099 || exit 1
 JAR=$A/cookies.txt; BASE=http://127.0.0.1:18099
 trap "stop $A; stop $B" EXIT
@@ -72,10 +123,28 @@ check "覆盖写" "200" "$(curl -sS -b "$JAR" -o /dev/null -w '%{http_code}' -m 
 check "残留 tmp 文件" "0" "$(ls "$A" | grep -c '\.tmp$')"
 
 echo "== 4. 聚合订阅（真实订阅站）"
-SUB='https://sub.creamycake.org/v1/css1.json'
+# 可以用 SMOKE_SUB 指向别的订阅源（例如一个必然连不上或只给 0 条的假地址），
+# 用来验证「订阅站挂了」时这份脚本是响亮地失败，而不是静默跳过一堆断言
+SUB="${SMOKE_SUB:-https://sub.creamycake.org/v1/css1.json}"
 P=$(curl -sS -b "$JAR" -m 60 -X POST "$BASE/api/selector/subscriptions/preview" -d "{\"url\":\"$SUB\"}")
 CNT=$(printf '%s' "$P" | python3 -c 'import json,sys;print(len(json.load(sys.stdin).get("candidates",[])))' 2>/dev/null || echo ERR)
-if [ "$CNT" = "ERR" ]; then bad "预览返回不可解析" "$(printf '%s' "$P" | head -c 200)"; else ok "预览到 $CNT 个候选源"; fi
+if [ "$CNT" = "ERR" ]; then
+  bad "预览返回不可解析" "$(printf '%s' "$P" | head -c 200)"
+elif [ "${CNT:-0}" -gt 3 ] 2>/dev/null; then
+  ok "预览到 $CNT 个候选源"
+else
+  # 以前这里是「只要能解析就 ok」，包括 0 个：订阅站挂了或改版时，
+  # 下面那一整段导入断言会被静默跳过，脚本照样退出 0 —— 绿灯什么也没证明
+  bad "订阅站只给出 $CNT 个候选，导入链路无法验证" "$SUB"
+fi
+
+# ---- 与订阅站无关的安全断言：无条件跑，不能被上面的 if 吞掉 ----
+SSRF=$(curl -sS -b "$JAR" -w '\n%{http_code}' -m 10 -X POST "$BASE/api/selector/subscriptions/preview" -d '{"url":"http://127.0.0.1:8080/x.json"}')
+check "内网订阅地址被拦" "403" "${SSRF##*$'\n'}"
+# 拒绝原因里有「主机名 -> 内网 IP」，那对任何能连到这台机器的人都是网络拓扑泄露：只进日志
+if printf '%s' "$SSRF" | grep -q '127\.0\.0\.1'; then bad "403 响应不得回显内网地址" "$SSRF"; else ok "403 响应不回显内网地址"; fi
+check "没勾选就导入被拒" "400" "$(curl -sS -b "$JAR" -o /dev/null -w '%{http_code}' -m 10 -X POST "$BASE/api/selector/subscriptions/import" -d "{\"url\":\"$SUB\"}")"
+
 if [ "${CNT:-0}" -gt 3 ] 2>/dev/null; then
   FIRST=$(printf '%s' "$P" | python3 -c 'import json,sys;print(json.load(sys.stdin)["candidates"][0]["name"])')
   SITE=$(printf '%s' "$P" | python3 -c 'import json,sys;print(json.load(sys.stdin)["candidates"][0]["site"])')
@@ -88,11 +157,6 @@ if [ "${CNT:-0}" -gt 3 ] 2>/dev/null; then
   U=$(curl -sS -b "$JAR" -m 60 -X POST "$BASE/api/selector/subscriptions/import" -d "{\"url\":\"$SUB\",\"names\":[\"$FIRST\"]}")
   check "再导入同一条报 updated" "$FIRST" "$(printf '%s' "$U" | python3 -c 'import json,sys;print(",".join(json.load(sys.stdin)["updated"]))')"
   check "重复导入不新增文件" "3" "$(ls "$A/selectors" | wc -l | tr -d ' ')"
-  SSRF=$(curl -sS -b "$JAR" -w '\n%{http_code}' -m 10 -X POST "$BASE/api/selector/subscriptions/preview" -d '{"url":"http://127.0.0.1:8080/x.json"}')
-  check "内网订阅地址被拦" "403" "${SSRF##*$'\n'}"
-  # 拒绝原因里有「主机名 -> 内网 IP」，那对任何能连到这台机器的人都是网络拓扑泄露：只进日志
-  if printf '%s' "$SSRF" | grep -q '127\.0\.0\.1'; then bad "403 响应不得回显内网地址" "$SSRF"; else ok "403 响应不回显内网地址"; fi
-  check "没勾选就导入被拒" "400" "$(curl -sS -b "$JAR" -o /dev/null -w '%{http_code}' -m 10 -X POST "$BASE/api/selector/subscriptions/import" -d "{\"url\":\"$SUB\"}")"
 fi
 
 echo "== 5. 静态资源与缓存"
