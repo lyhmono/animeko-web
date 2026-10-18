@@ -109,6 +109,14 @@ class AuthFlowTest {
         val cookie = cookieOf(login)
         val token = cookie.substringAfter('=').trim()
         assertEquals(HttpStatusCode.OK, client.get("/api/selector/sources") { header(HttpHeaders.Cookie, cookie) }.status)
+        // 正向对照：会话号本来就**允许**当 Bearer 用（命令行/脚本复放）。
+        // 少了这一行，注销后那两个 401 就分辨不出「会话被作废」和「根本不支持 Bearer」——
+        // 把 headerAuthorized 里的 site.isValid(token) 删掉，这两个断言照样全绿。
+        assertEquals(
+            HttpStatusCode.OK,
+            client.get("/api/selector/sources") { header("Authorization", "Bearer $token") }.status,
+            "注销前同一个会话号当 Bearer 必须可用，否则后面的 401 说明不了吊销",
+        )
 
         val out = client.post("/api/session/logout") { header(HttpHeaders.Cookie, cookie) }
         assertEquals(HttpStatusCode.OK, out.status)

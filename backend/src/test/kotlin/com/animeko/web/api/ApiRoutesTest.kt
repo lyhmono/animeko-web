@@ -266,19 +266,61 @@ class ApiRoutesTest {
         }
     }
 
-@Test
+    /**
+     * 静态托管是「把请求路径拼到前端目录上」实现的，必须钉死它出不了那个目录：
+     * 前端目录旁边往往就挨着 data/userdata.json 与 selectors/，读出去等于把
+     * 收藏和内网配置交给任何一个访客。
+     *
+     * 这一条原先是**空的**：没有 `application { module(...) }`，测试应用里根本没装路由，
+     * 三次请求全是 404 空身体，`assertFalse(body.contains("root:"))` 于是永远成立
+     * ——把 ApiRoutes 里的 `file.startsWith(dir)` 删掉、让它真的去读 /etc/passwd，
+     * 这条用例照样绿灯。所以这次带上「正向对照」：先证明路由装着、合法文件读得到，
+     * 再断言越界读不到。
+     */
+    @Test
     fun `static handler cannot be walked out of the frontend directory`() = testApplication {
-        // 静态托管是「路径拼文件名」实现的，必须钉死它出不了那个目录：
-        // 前端目录旁边就是 data/userdata.json 与 selectors/，读出去等于把收藏和内网配置交给访客
-        val dir = java.nio.file.Files.createTempDirectory("animeko-traversal")
-        java.io.File(dir.toFile(), "index.html").writeText("<html>spa</html>")
-        val resp = client.get("/../../../../etc/passwd")
-        val body = resp.bodyAsText()
-        assertFalse(body.contains("root:"), body.take(120))
-        val dotdot = client.get("/%2e%2e/%2e%2e/%2e%2e/etc/passwd")
-        assertFalse(dotdot.bodyAsText().contains("root:"), dotdot.bodyAsText().take(120))
-        val raw = client.get("/../../../../../etc/hosts")
-        assertFalse(raw.bodyAsText().contains("127.0.0.1"), raw.bodyAsText().take(120))
+        val root = java.nio.file.Files.createTempDirectory("animeko-traversal")
+        val frontend = root.resolve("frontend")
+        java.nio.file.Files.createDirectories(frontend)
+        java.io.File(frontend.toFile(), "index.html").writeText("<html>spa</html>")
+        java.io.File(frontend.toFile(), "app.js").writeText("console.log(1)")
+        // 放在前端目录的**旁边**：越界成功就会读到它
+        java.nio.file.Files.writeString(root.resolve("SECRET.txt"), "root:secret-marker")
+
+        application {
+            module(
+                AppConfig(
+                    dataDir = root,
+                    frontendDir = frontend.toString(),
+                    authEnabled = false,
+                ),
+            )
+        }
+
+        // 正向对照：路由装着、文件命中分支工作。少了这一步，下面的断言可能是「空应用」给的
+        val legit = client.get("/app.js")
+        assertEquals(HttpStatusCode.OK, legit.status, "合法静态文件必须能读到，否则用例失去意义")
+        assertTrue(legit.bodyAsText().contains("console.log"), legit.bodyAsText())
+
+        // 客户端会把字面的 ../ 规范化掉，所以越界写法以编码形式送出去：
+        // Ktor 的路由是按段解码匹配的（`/%61pi/...` 也能命中真接口，这条已被验证过），
+        // 因此 `%2e%2e` 会以 `..` 这一段到达拼路径的那行代码
+        val attempts = listOf(
+            "/../SECRET.txt",
+            "/../../SECRET.txt",
+            "/%2e%2e/SECRET.txt",
+            "/%2e%2e%2fSECRET.txt",
+            "/%252e%252e/SECRET.txt",
+            "/sub/%2e%2e/%2e%2e/SECRET.txt",
+        )
+        for (path in attempts) {
+            val resp = client.get(path)
+            val body = resp.bodyAsText()
+            assertFalse(
+                body.contains("secret-marker"),
+                "越界读到了前端目录之外的文件：$path -> ${resp.status} ${body.take(80)}",
+            )
+        }
     }
 
     @Test

@@ -92,6 +92,16 @@ fun Application.module(
         exception<IllegalArgumentException> { call, cause ->
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to (cause.message ?: "bad request")))
         }
+        // 栈被打穿（超深嵌套 JSON）。它必须排在 Throwable 前面，否则会被兜底吃成 500，
+        // 而且 appLog.error 会为此落下上千行栈 —— 攻击者要的正是这个日志放大。
+        // 这里当兜底用：入站处已有 JsonGuard 提前拦掉，剩下的路径（磁盘上的旧文件等）才走到这。
+        exception<StackOverflowError> { call, _ ->
+            appLog.warn("解析嵌套过深的 JSON: {}", call.request.path())
+            call.respond(
+                HttpStatusCode.BadRequest,
+                mapOf("error" to "内容结构嵌套过深（JSON 层级超出限制）"),
+            )
+        }
         exception<Throwable> { call, cause ->
             appLog.error("未处理异常: {}", call.request.path(), cause)
             // 兜底不回显 cause.message：里面常带路径/上游地址等内部信息，日志里已有完整堆栈

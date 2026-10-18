@@ -7,6 +7,7 @@ import com.animeko.web.config.AppConfig
 import com.animeko.web.appLog
 import com.animeko.web.data.UserDataStore
 import com.animeko.web.http.Fetcher
+import com.animeko.web.http.JsonGuard
 import com.animeko.web.http.StreamResult
 import com.animeko.web.http.UrlGuard
 import com.animeko.web.http.UpstreamException
@@ -42,10 +43,12 @@ import io.ktor.server.routing.put
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.io.ByteArrayOutputStream
@@ -320,7 +323,7 @@ fun Application.configureApiRoutes(
 
         post("/api/selector/subscriptions/import") {
             val form = bodyObject(call)
-            val names = form?.get("names")?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }.orEmpty()
+            val names = form?.stringArrayField("names").orEmpty()
             val url = form?.stringField("url").orEmpty()
             val text = form?.stringField("text").orEmpty()
             // 预览时下发的内容指纹：对不上说明订阅在两步之间被更新过，
@@ -346,6 +349,11 @@ fun Application.configureApiRoutes(
         get("/api/data") {
             val snapshot = userData.read()
             call.response.header(HttpHeaders.ETag, "\"${snapshot.etag}\"")
+            // 个人数据（收藏/历史/进度）绝不能进任何缓存：这份响应的内容随「谁在问」而变，
+            // 而 HTTP 里没有 Vary 能表达按会话用户区分。浏览器磁盘缓存一旦存下上一份，
+            // 换账号（或注销后用另一个身份登录）后可能出现「看到别人的收藏」，
+            // 甚至关掉网络还在放旧进度。SPA 本来就把它读进内存了，缓存这一份毫无收益。
+            call.response.header(HttpHeaders.CacheControl, "no-store")
             call.respondText(snapshot.text, ContentType.Application.Json)
         }
 
@@ -546,7 +554,43 @@ private fun ApplicationCall.isCrossSiteWrite(cfg: AppConfig): Boolean {
     } else {
         hostHeader.substringBeforeLast(':')
     }
-    return originHost != hostName
+    if (originHost != hostName) return true
+    // 主机名相同还要比端口：只比主机的话，同一台机器上**另一个端口**跑的站点
+    // （另一个自托管服务、或被攻破的相邻 Web 应用）发出的跨站写会被当成同源放过。
+    // 实测：服务在 127.0.0.1:8240 时，Origin: http://127.0.0.1:9999 的 PUT 返回 200。
+    //
+    // 反代模式（hops>=1）不比端口：那时 X-Forwarded-Host 里的端口常被改写成内部端口，
+    // 严格比会误杀正常同源请求；那种部署的边界本来就该由反代自己守住。
+    if (cfg.trustedProxyHops >= 1) return false
+    val hostPortText = if (hostHeader.startsWith('[')) {
+        hostHeader.substringAfterLast(']').substringAfter(':', "")
+    } else {
+        hostHeader.substringAfter(':', "")
+    }
+    // Host 头没写端口时，不能一口咬定那是 80 —— 但也不必直接放弃比较：
+    // 「Host 不带端口」只有两种来源，而本进程的监听端口能把它们分开。
+    //  1) 真的在服务默认端口（80/443）：那 cfg.port 就是浏览器看到的外部端口，照常比较。
+    //     这一格必须比：同源判定里「同一台机器的另一个端口」是**同站**（SameSite 不看端口），
+    //     会话 Cookie 照样会跟着发过去，不比端口就等于让本机任意别的服务写这个账号的数据。
+    //  2) 前面的反代把端口抹掉了（nginx 的 `$host` 默认就不带端口）：此时 cfg.port 是内部端口
+    //     （8080 之类），拿它去比浏览器给的 443 只会一律误杀 —— 每一次收藏、每一次保存都 403，
+    //     而用户唯一的自救办法是开 ANIMEKO_ALLOW_CROSS_ORIGIN 把整道防线拆掉。
+    //     那种部署正确做法是如实填 ANIMEKO_TRUSTED_PROXY_HOPS（上面 hops>=1 就不再比端口）。
+    // 所以：拿不到端口时，只有本进程确实在默认端口上才继续比较，否则放行。
+    val hostPort = hostPortText.takeIf { it.isNotBlank() }?.toIntOrNull()
+        ?: cfg.port.takeIf { it == 80 || it == 443 }
+        ?: return false
+    val originPort = runCatching { URI(origin).port }.getOrNull()?.takeIf { it > 0 }
+        ?: defaultPortFor(runCatching { URI(origin).scheme?.lowercase() }.getOrNull())
+    // Origin 侧可以猜：它是浏览器给的可信值，scheme 一定在里面
+    if (originPort == null) return false
+    return originPort != hostPort
+}
+
+private fun defaultPortFor(scheme: String?): Int? = when (scheme) {
+    "http" -> 80
+    "https" -> 443
+    else -> null
 }
 
 /**
@@ -625,7 +669,13 @@ private fun ApplicationCall.authenticate(
     val key = rateLimitKey(cfg)
     if (limiter.blocked(key)) return AuthResult.Throttled
     val ok = headerAuthorized(cfg, site, header)
-    if (ok) limiter.onSuccess(key) else limiter.onFailure(key)
+    // 失败要记账，**成功不注销账**。
+    // 原来这里跟着 `if (ok) limiter.onSuccess(key)`，而 key 在直连部署下就是来源 IP：
+    // 浏览器会自动附带缓存的 Basic 凭据，受害者每正常访问一次就把攻击者的失败计数清零，
+    // 只要这个 IP 上还有人活着地在用页面，在线爆破就没有上限（反代没配 hops 时全站共用一个键，
+    // 更容易触发）。登录接口那边仍然在成功时清账 —— 那是一次「确实知道口令」的、
+    // 需要口令本身才能触发的动作，两者不是一回事。
+    if (!ok) limiter.onFailure(key)
     return if (ok) AuthResult.Authorized else AuthResult.Failed
 }
 
@@ -746,18 +796,28 @@ private suspend fun proxyVideo(
     var redirects = 0
     while (result.status in 301..399 && redirects < MAX_REDIRECTS) {
         val location = result.header("location")
-        result.body.close()
+        // 没有 Location 就没得跟：把这 3xx 原样透传给播放器。
+        // 此时**不能**关流 —— 后面的 readCapped / respondOutputStream 还要读它，
+        // 而 JDK 的响应体流关掉再读直接抛异常，表现成一个与源站无关的 500。
         if (location.isNullOrBlank()) break
         // 每一跳都重新校验：只校验入口地址的话，302 指向 127.0.0.1 照样打进内网。
-        val next = UrlGuard.requireAllowed(
-            SelectorEngine.absUrl(url, location),
-            cfg.allowPrivateTargets,
-        )
-        if (hostOf(next) != hostOf(url)) {
+        val next = try {
+            UrlGuard.requireAllowed(
+                SelectorEngine.absUrl(url, location),
+                cfg.allowPrivateTargets,
+            )
+        } catch (e: Throwable) {
+            // 被拦下的这一跳不会再有消费者，必须关掉：否则每个「302 → 内网」的
+            // 探测请求都留下一条没人回收的上游连接，而这正是免鉴权可试的路径。
+            runCatching { result.body.close() }
+            throw e
+        }
+        if (UrlGuard.hostOf(next) != UrlGuard.hostOf(url)) {
             // 跨主机重定向不再带 Cookie，避免源站凭据被送给第三个域名
             headers.remove("Cookie")
         }
         url = next
+        result.body.close()
         result = fetchStream(fetcher, url, headers)
         redirects++
     }
@@ -855,8 +915,6 @@ private fun readCapped(input: InputStream, maxBytes: Long): String =
         String(out.toByteArray(), Charsets.UTF_8)
     }
 
-private fun hostOf(url: String): String? = runCatching { URI(url).host?.lowercase() }.getOrNull()
-
 /**
  * 请求体上限。登录接口免鉴权也可达，不封顶等于让来访者决定这台机器的堆用量
  * （接收侧此前完全没有上限，只有落盘前的 importJson 才校验大小 —— 那时已经读进内存了）。
@@ -872,8 +930,39 @@ private suspend fun bodyObject(call: ApplicationCall): JsonObject? = try {
     null
 }
 
+/**
+ * 取字符串字段。
+ *
+ * 两个坑都要避开：
+ *  - `jsonPrimitive` 是强转，`{"url":{"a":1}}` 会抛 IllegalArgumentException，
+ *    而它发生在 bodyObject 的 try 之外，于是一个形状奇怪的请求体变成 500；
+ *  - `contentOrNull` 对**任何** primitive 都给得出文本，`{"url":true}` 会变成
+ *    字符串 "true"，接着被 UrlGuard 判成「不允许的目标地址」回 400/403 ——
+ *    把类型错误伪装成安全拒绝，排查时完全看不出是请求体写错了。
+ * 所以：只接受字符串，其它一律当作缺字段（调用方本来就有缺失分支会给 400）。
+ */
 private fun JsonObject.stringField(key: String): String? =
-    this[key]?.jsonPrimitive?.contentOrNull
+    (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
+
+/**
+ * 严格取字符串数组：不是数组、或数组里含非字符串项，都整字段判错。
+ *
+ * 旧写法 `get(key)?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }` 有两处不成立：
+ *  - `jsonArray` 对对象是强转（虽然 IllegalArgumentException 会被兜底成 400，但那是巧合，
+ *    不是这一行的设计意图）；
+ *  - `contentOrNull` 对**数字**也给出文本，于是 `{"names":[1,2]}` 变成两个「源名」，
+ *    导入一条都没匹配上却回 200 —— 类型错误被伪装成一次成功但空的结果。
+ * 半收半丢同样糟：`["订阅甲",{"bad":1}]` 只导入一条却报成功，用户看不出少了东西。
+ */
+private fun JsonObject.stringArrayField(key: String): List<String> {
+    val node = this[key] ?: return emptyList()
+    if (node is JsonNull) return emptyList()
+    val items = node as? JsonArray ?: throw IllegalArgumentException("$key 必须是字符串数组")
+    return items.map {
+        (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content
+            ?: throw IllegalArgumentException("$key 只能包含字符串")
+    }
+}
 
 private suspend fun ApplicationCall.receiveCappedText(maxBytes: Long = MAX_BODY_BYTES): String {
     // 先看 Content-Length 挡掉老实的超大请求，再逐块累加，防止 chunked 传输谎报长度
@@ -890,5 +979,9 @@ private suspend fun ApplicationCall.receiveCappedText(maxBytes: Long = MAX_BODY_
         require(total <= maxBytes) { "请求体超过 ${maxBytes / 1024}KB 上限" }
         out.write(chunk, 0, n)
     }
-    return String(out.toByteArray(), Charsets.UTF_8)
+    val text = String(out.toByteArray(), Charsets.UTF_8)
+    // 体积上限挡不住「400KB 的一把左括号」：那种递归解析会打穿栈，
+    // 而 StackOverflowError 不是 Exception，各处 runCatching 接不住它。
+    JsonGuard.requireShallow(text)
+    return text
 }

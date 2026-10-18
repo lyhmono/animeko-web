@@ -52,6 +52,13 @@ interface Fetcher {
         followRedirects: Boolean = true,
     ): HttpResult
 
+    /**
+     * POST 一律不自动跟随重定向（唯一调用方是 Bangumi 搜索）。
+     * 三个理由，任一都足够：重定向到别的主体时 301/302 会退化成 GET，
+     * 请求体就此丢失；一个 JSON API 本来也不该靠跳转工作；
+     * 而自动跳转意味着镜像站点可以把这台服务器的请求引到内网地址上 ——
+     * 这条链路没有 UrlGuard（代理与抓取那两条有，见各自的逐跳校验）。
+     */
     suspend fun post(
         url: String,
         body: String,
@@ -140,7 +147,8 @@ class JdkFetcher(
                 builder.header(k, v)
             }
         }
-        val resp = client.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray())
+        // 见接口上的注释：POST 永不自动跳转
+        val resp = noRedirectClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray())
         HttpResult(
             status = resp.statusCode(),
             headers = resp.headers().map().mapValues { it.value.toList() },

@@ -94,6 +94,28 @@ private fun redirect(location: String) = StreamStubFetcher.Spec(
     headers = mapOf("location" to listOf(location)),
 )
 
+/**
+ * 像 JDK 那样「关掉再读就抛」的响应体流，并记录是否被关过。
+ * `Stub` 默认用 ByteArrayInputStream，而它的 close() 是空操作 ——
+ * 用它测「提前关流 / 忘关流」这两类 bug 都会假通过，所以必须自己实现。
+ */
+private class TrackedStream : java.io.InputStream() {
+    var closed = false
+        private set
+
+    override fun read(): Int {
+        check(!closed) { "Stream is closed" }
+        return -1
+    }
+
+    override fun read(b: ByteArray, off: Int, len: Int): Int {
+        check(!closed) { "Stream is closed" }
+        return -1
+    }
+
+    override fun close() { closed = true }
+}
+
 private const val UA = "SecretUA/1.0"
 private const val REFERER = "https://v.example.com/watch"
 private const val COOKIE = "token=***"
@@ -283,6 +305,30 @@ class ProxyRouteTest {
         assertEquals(COOKIE, h.sessions.grant(h.sid, MEDIA).headers["Cookie"])
     }
 
+    /**
+     * 主机名含下划线时 `java.net.URI.getHost()` 返回 null（下划线不是合法的 reg-name 字符），
+     * 于是「比较两边 host」的实现会得到 null == null —— 两台完全不同的主机被判成同一台，
+     * 源站 Cookie 跟着 302 送到第三个域名去了。NAS / 内网机器名带下划线并不罕见。
+     */
+    @Test
+    fun `cross host redirect between URI-unparsable hosts still drops cookie`() = testApplication {
+        val from = "https://src_host.example.com/hls/index.m3u8"
+        val to = "https://dst_host.example.com/hls/index.m3u8"
+        assertNull(java.net.URI(from).host, "用例前提：URI 必须读不出这个 host，否则测不到该分支")
+        assertNull(java.net.URI(to).host)
+        val h = Harness(listOf(redirect(to), hlsPlaylist("seg1.ts")))
+        application { module(h.cfg, h.stub, h.sessions) }
+        val sid = h.sessionFor(from)
+        val resp = client.get("/api/proxy") {
+            parameter("url", from)
+            parameter("sid", sid)
+        }
+        assertEquals(HttpStatusCode.OK, resp.status)
+        assertEquals(2, h.stub.requests.size)
+        assertEquals(COOKIE, h.stub.requests[0].second["Cookie"])
+        assertFalse("Cookie" in h.stub.requests[1].second, "跨主机重定向把源站 Cookie 送到了 ${java.net.URI(to).rawAuthority}")
+    }
+
     @Test
     fun `same host redirect keeps cookie and resolves relative location`() = testApplication {
         val h = Harness(
@@ -300,6 +346,65 @@ class ProxyRouteTest {
         assertEquals(2, h.stub.requests.size)
         assertEquals("https://cdn.example.com/hls/index2.m3u8", h.stub.requests[1].first)
         assertEquals(COOKIE, h.stub.requests[1].second["Cookie"])
+    }
+
+    /**
+     * 3xx 但不带 Location —— 坏 CDN 和「会话过期的源站」都长这样。
+     * 没得跟跳就该把这 3xx 如实透传给播放器。循环里原先在判 Location 之前
+     * 就 close 了响应体，而 JDK 的响应体流关掉再读会直接抛：
+     * 播放器于是收到一个与源站毫无关系的 500。
+     */
+    @Test
+    fun `3xx without location is forwarded instead of read after close`() = testApplication {
+        val body = TrackedStream()
+        val h = Harness(
+            listOf(
+                // 304 按定义不带 Location（源站常见：防盗链/会话过期回一个裸 304）
+                StreamStubFetcher.Spec(
+                    status = 304,
+                    contentType = "text/plain",
+                    stream = { body },
+                ),
+            ),
+        )
+        application { module(h.cfg, h.stub, h.sessions) }
+        val resp = client.get("/api/proxy") {
+            parameter("url", MEDIA)
+            parameter("sid", h.sid)
+        }
+        // 期望：如实透传这一跳 3xx，而不是关掉响应体后再去读它抛出来的 500
+        assertTrue(resp.status.value in 300..399, "expected a forwarded 3xx, got ${resp.status}")
+        assertEquals(1, h.stub.requests.size)
+        // 而且这个响应体最终必须被关掉：不关就是每个裸 304 漏一条上游连接。
+        // 只断言状态码的话，「关掉之后再读」（500）和「压根没关」（泄漏）都测不出来。
+        assertTrue(body.closed, "透传 3xx 之后响应体没有被消费/关闭，会漏上游连接")
+    }
+
+    /**
+     * 302 指向内网被 UrlGuard 拦下时，这一跳永远不会有人再读它的响应体，
+     * 必须关掉。否则每个「302 → 127.0.0.1」的探测请求都挂掉一条上游连接 ——
+     * 而这类请求恰好是可以批量发的。
+     */
+    @Test
+    fun `blocked redirect closes the body it will never read`() = testApplication {
+        val body = TrackedStream()
+        // 入口用字面公网 IP：既避开测试环境的真实 DNS，也让 169.254.169.254 这一跳
+        // 无论 allowPrivateTargets 怎么配都必然被拦。
+        val h = Harness(
+            listOf(
+                StreamStubFetcher.Spec(
+                    status = 302,
+                    contentType = "text/plain",
+                    headers = mapOf("location" to listOf("http://169.254.169.254/latest/meta-data/")),
+                    stream = { body },
+                ),
+            ),
+            allowPrivate = false,
+        )
+        application { module(h.cfg, h.stub, h.sessions) }
+        val resp = client.get("/api/proxy") { parameter("url", "https://93.184.216.34/hls/index.m3u8") }
+        assertEquals(HttpStatusCode.Forbidden, resp.status)
+        assertTrue(body.closed, "被拦下的重定向没有关闭上一跳的响应体")
     }
 
     @Test

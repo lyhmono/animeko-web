@@ -114,6 +114,51 @@ class ApiDataSubscriptionsTest {
 
     // ---- 聚合订阅 ----
 
+    /**
+     * 请求体字段写成对象/数组而不是字符串（`{"url":{"a":1}}`）时，
+     * 取字段的 `jsonPrimitive` 会抛异常。那类异常原先落在 bodyObject 的 try 之外，
+     * 于是变成一个 500：客户端一个笔误就能打出服务端栈，而正确的回答是 400。
+     */
+    /**
+     * import 的 `names` 是数组字段，取法与 stringField 同一类坑：
+     * `jsonArray` 对对象是强转、`jsonPrimitive` 对对象/数组也是强转，
+     * 两者抛出的都是 bodyObject 的 try 之外的异常 → 一个笔误的请求体打成 500。
+     */
+    @Test
+    fun `import rejects a mis-shaped names field instead of throwing 500`() = testApplication {
+        application { module(config()) }
+        for (names in listOf("""{"a":1}""", """[1,2]""", """["ok",{"bad":1}]""", """null""", """"string"""")) {
+            val resp = client.post("/api/selector/subscriptions/import") {
+                setBody("""{"names":$names,"text":${Json.encodeToString(subscription)}}""")
+            }
+            assertTrue(
+                resp.status == HttpStatusCode.BadRequest,
+                "names=$names → ${resp.status} ${resp.bodyAsText().take(100)}（应为 400）",
+            )
+        }
+    }
+
+    @Test
+    fun `a request field shaped like an object is a bad request not a server error`() = testApplication {
+        application { module(config()) }
+        for (body in listOf(
+            """{"url":{"a":1}}""",
+            """{"url":[1,2]}""",
+            """{"url":null}""",
+            """{"text":123}""",
+            """{"url":true}""",
+        )) {
+            val resp = client.post("/api/selector/subscriptions/preview") {
+                setBody(body)
+            }
+            assertEquals(
+                HttpStatusCode.BadRequest,
+                resp.status,
+                "$body → ${resp.status} ${resp.bodyAsText().take(120)}",
+            )
+        }
+    }
+
     @Test
     fun `subscription preview lists candidates and explains dropped entries`() = testApplication {
         application { module(config()) }

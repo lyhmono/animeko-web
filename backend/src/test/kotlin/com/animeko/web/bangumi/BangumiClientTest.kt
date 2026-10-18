@@ -19,8 +19,13 @@ class BangumiStubFetcher(
     private val postRoutes: Map<String, String> = emptyMap(),
     private val failingGetPrefixes: Set<String> = emptySet(),
     private val notFoundPrefixes: Set<String> = emptySet(),
+    // 模拟「镜像回了 302，目标是内网元数据地址」
+    private val redirectPrefixes: Set<String> = emptySet(),
 ) : Fetcher {
     val requests = mutableListOf<String>()
+
+    /** 元数据链路必须逐调用关掉自动跳转（这条链路没有 UrlGuard 兜着），记录实际传参 */
+    val getFollowFlags = mutableListOf<Boolean>()
 
     override suspend fun fetch(
         url: String,
@@ -28,6 +33,14 @@ class BangumiStubFetcher(
         followRedirects: Boolean,
     ): HttpResult {
         requests.add("GET $url")
+        getFollowFlags.add(followRedirects)
+        if (redirectPrefixes.any { url.startsWith(it) }) {
+            return HttpResult(
+                302,
+                mapOf("location" to listOf("http://169.254.169.254/latest/meta-data/")),
+                ByteArray(0),
+            )
+        }
         if (failingGetPrefixes.any { url.startsWith(it) }) throw IllegalStateException("boom")
         if (notFoundPrefixes.any { url.startsWith(it) }) {
             return HttpResult(404, mapOf("content-type" to listOf("text/plain")), "not found".toByteArray())
@@ -118,6 +131,38 @@ class BangumiClientTest {
         // total=4 而单页只有 2 条：旧实现固定单次请求，长篇番剧第 200 集之后会整段丢失
         assertEquals(4, eps.size)
         assertEquals(2, fetcher.requests.count { it.contains("/v0/episodes") })
+    }
+
+    /**
+     * 元数据链路是唯一没有逐跳 UrlGuard 的出站路径（代理与抓取都有），
+     * 所以它必须自己拒绝跟随重定向：否则一个运营者配置的社区镜像
+     * 就能把这台服务器（VPS 上常常与云元数据地址同网段可达）的请求引过去。
+     */
+    @Test
+    fun `every metadata GET refuses auto-redirects`() = runTest {
+        val fetcher = BangumiStubFetcher(
+            getRoutes = mapOf(
+                "https://api.bgm.tv/v0/subjects/328609" to subjectResponse,
+                "https://api.bgm.tv/v0/episodes?subject_id=328609&limit=200&offset=0" to episodesPage1,
+                "https://api.bgm.tv/v0/episodes?subject_id=328609&limit=200&offset=2" to episodesPage2,
+            ),
+        )
+        BangumiClient(fetcher, listOf("https://api.bgm.tv")).subject(328609)
+        assertTrue(fetcher.getFollowFlags.isNotEmpty(), "打桩没被 GET 到，用例失去意义")
+        assertTrue(
+            fetcher.getFollowFlags.all { it == false },
+            "存在未显式关闭自动跳转的 GET：${fetcher.getFollowFlags}",
+        )
+    }
+
+    @Test
+    fun `a redirect from a base is reported as a base-url problem`() = runTest {
+        val fetcher = BangumiStubFetcher(redirectPrefixes = setOf("https://api.bgm.tv/v0/subjects"))
+        val client = BangumiClient(fetcher, listOf("https://api.bgm.tv"))
+        val e = assertFailsWith<UpstreamException> { client.subject(328609) }
+        // 只报「返回 302」会被当成网络抖动；要给出可执行的下一步
+        assertTrue(e.message!!.contains("ANIMEKO_BANGUMI_BASE_URLS"), e.message ?: "no message")
+        assertEquals(0, fetcher.getFollowFlags.count { it }, "302 之后不该再有第二跳请求")
     }
 
     @Test

@@ -2,6 +2,7 @@ package com.animeko.web.bangumi
 
 import com.animeko.web.http.Fetcher
 import com.animeko.web.http.HttpResult
+import com.animeko.web.http.JsonGuard
 import com.animeko.web.http.UpstreamException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.Channel
@@ -118,7 +119,7 @@ class BangumiClient(
         val subject = withFallback { base ->
             decode(
                 text("$base/v0/subjects/$id") {
-                    fetcher.fetch("$base/v0/subjects/$id?responseGroup=large", headers())
+                    fetcher.fetch("$base/v0/subjects/$id?responseGroup=large", headers(), followRedirects = false)
                 },
                 BgmSubject.serializer(),
                 "Bangumi 条目",
@@ -140,7 +141,7 @@ class BangumiClient(
         while (collected.size < MAX_EPISODES) {
             val pageUrl = "$base/v0/episodes?subject_id=$id&limit=$EPISODES_PAGE&offset=$offset"
             val resp = decode(
-                text(pageUrl) { fetcher.fetch(pageUrl, headers()) },
+                text(pageUrl) { fetcher.fetch(pageUrl, headers(), followRedirects = false) },
                 BgmEpisodesResponse.serializer(),
                 "Bangumi 剧集列表",
             )
@@ -161,6 +162,12 @@ class BangumiClient(
             when {
                 result.status == 404 -> throw SubjectNotFoundException(source)
                 result.status in 200..299 -> result.text
+                // 3xx 单独说清楚：这一路刻意不自动跳转（见 search() 上的注释），
+                // 只报「返回 302」会让人以为是网络问题，而实际要做的是把 base 改成跳转后的地址。
+                result.status in 300..399 -> throw UpstreamException(
+                    "上游 $source 返回 ${result.status}（Bangumi 请求不自动跟随重定向："+
+                        "请把 ANIMEKO_BANGUMI_BASE_URLS 配成重定向后的最终地址）",
+                )
                 else -> throw UpstreamException("上游 $source 返回 ${result.status}")
             }
         } catch (e: SubjectNotFoundException) {
@@ -178,6 +185,9 @@ class BangumiClient(
 
     private fun <T> decode(text: String, serializer: KSerializer<T>, source: String): T =
         try {
+            // 镜像是第三方：递归解析被深度炸弹打穿栈时抛的是 StackOverflowError，
+            // 下面的 `catch (e: Exception)` 接不住，会一路变成 500
+            JsonGuard.requireShallow(text)
             json.decodeFromString(serializer, text)
         } catch (e: Exception) {
             throw UpstreamException("$source 返回的不是预期 JSON")

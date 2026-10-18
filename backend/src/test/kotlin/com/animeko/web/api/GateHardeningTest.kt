@@ -32,8 +32,9 @@ import kotlin.test.assertTrue
  */
 class GateHardeningTest {
 
-    private fun config(user: String? = "me", password: String? = "pw") = AppConfig(
+    private fun config(user: String? = "me", password: String? = "pw", port: Int = 8080) = AppConfig(
         authEnabled = true,
+        port = port,
         authUser = user,
         authPassword = password,
         dataDir = Files.createTempDirectory("animeko-gate"),
@@ -184,6 +185,83 @@ class GateHardeningTest {
         val blocked = client.get("/api/selector/sources") { header(HttpHeaders.Authorization, basic) }
         assertEquals(HttpStatusCode.TooManyRequests, blocked.status)
         assertTrue(blocked.headers[HttpHeaders.RetryAfter]?.isNotBlank() == true, "429 要给 Retry-After")
+    }
+
+    /**
+     * 成功认证不能把别人的失败计数清零。
+     *
+     * 浏览器对 Basic 凭据是按域缓存、自动附带的，而限速键在直连部署下就是来源 IP
+     * （反代忘了配 ANIMEKO_TRUSTED_PROXY_HOPS 时，全站所有客户端共用同一个键）。
+     * 于是原先的 `if (ok) limiter.onSuccess(key)` 等于：受害者每发一次正常请求，
+     * 攻击者的失败计数就被抹一次 —— 只要受害者还在用这个页面，爆破就没有上限。
+     * 这条防线在共享出口 IP（CGNAT、公司网络）下会整体失效，而且是静默失效。
+     */
+    /**
+     * 「同一台机器的另一个端口」在浏览器眼里是**同站**（SameSite 不看端口，会话 Cookie 照样发），
+     * 所以端口比较是这一格唯一的防线。服务跑在默认端口上时 Host 头通常不带端口，
+     * 原先那行 `?: return false` 把「拿不到端口」一律当成信息不足放行，
+     * 等于让本机任意另一个端口的页面都能写这个账号的数据。
+     * 现在用本进程的监听端口把这个岔路分开：默认端口 → 照常比；非默认端口且 Host 被抹掉端口
+     * （前置反代的典型形态）→ 不比，避免把正常同源请求全部误杀。
+     */
+    @Test
+    fun `host header without a port still gets the port check on the default port`() = testApplication {
+        application { module(config(port = 80)) }
+        val crossPort = client.put("/api/data") {
+            header(HttpHeaders.Authorization, basic)
+            header(HttpHeaders.Host, "127.0.0.1")
+            header(HttpHeaders.Origin, "http://127.0.0.1:9999")
+            setBody("""{"favorites":[]}""")
+        }
+        assertEquals(
+            HttpStatusCode.Forbidden, crossPort.status,
+            "80 端口上的服务，Host 不带端口也要比端口：同机异端口是同站，SameSite 挡不住",
+        )
+        val samePort = client.put("/api/data") {
+            header(HttpHeaders.Authorization, basic)
+            header(HttpHeaders.Host, "127.0.0.1")
+            header(HttpHeaders.Origin, "http://127.0.0.1")
+            setBody("""{"favorites":[]}""")
+        }
+        assertEquals(HttpStatusCode.OK, samePort.status, samePort.bodyAsText())
+    }
+
+    /** 反向对照：非默认端口 + Host 被反代抹掉端口时不许误杀（那会逼用户去开 ALLOW_CROSS_ORIGIN） */
+    @Test
+    fun `a proxy that strips the port does not lock every write out`() = testApplication {
+        application { module(config(port = 8080)) }
+        val viaProxy = client.put("/api/data") {
+            header(HttpHeaders.Authorization, basic)
+            header(HttpHeaders.Host, "127.0.0.1")
+            header(HttpHeaders.Origin, "https://127.0.0.1")
+            setBody("""{"favorites":[]}""")
+        }
+        assertEquals(
+            HttpStatusCode.OK, viaProxy.status,
+            "端口信息确实不可得时应当放行，否则唯一的自救办法就是拆掉整道 CSRF 防线：" + viaProxy.bodyAsText(),
+        )
+    }
+
+    @Test
+    fun `a legitimate success does not reset the attacker's counter`() = testApplication {
+        application { module(config()) }
+        repeat(7) { i ->
+            val r = client.get("/api/selector/sources") { header(HttpHeaders.Authorization, guess(i)) }
+            assertEquals(HttpStatusCode.Unauthorized, r.status, "第 ${i + 1} 次猜测不该先被限流")
+        }
+        // 受害者：带着缓存的 Basic 凭据正常访问一次，成功
+        val victim = client.get("/api/selector/sources") { header(HttpHeaders.Authorization, basic) }
+        assertEquals(HttpStatusCode.OK, victim.status)
+        // 攻击者继续猜。blocked() 是在验证凭据**之前**判的，所以第 8 次仍是 401、第 9 次才 429；
+        // 关键是这条曲线不能被一次成功认证重置回 0。
+        val eighth = client.get("/api/selector/sources") { header(HttpHeaders.Authorization, guess(8)) }
+        assertEquals(HttpStatusCode.Unauthorized, eighth.status, "第 8 次到界，但响应发生在记账之后")
+        val ninth = client.get("/api/selector/sources") { header(HttpHeaders.Authorization, guess(9)) }
+        assertEquals(
+            HttpStatusCode.TooManyRequests,
+            ninth.status,
+            "一次成功认证把失败计数清零了——共享出口 IP 下在线爆破不再有上限",
+        )
     }
 
     @Test
