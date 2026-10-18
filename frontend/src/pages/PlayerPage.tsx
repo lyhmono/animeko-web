@@ -168,6 +168,14 @@ export default function PlayerPage() {
     if (!url) return
     setSrc(`/api/proxy?${new URLSearchParams({ url }).toString()}`)
     setError('')
+    // 手动换地址是本页**唯一不整页跳转**的换片路径（其余走 location.assign，组件重挂）。
+    // 所以两份状态必须在这里自己清掉，否则会跟着带到新视频上：
+    //  - startAt：用户点过「继续播放」再改用手动地址时，新视频会被定位到上一部的秒数；
+    //    短片会被定位到结尾之后，表现就是「画面不动」；
+    //  - next / nextCountdown：连播还指着刚刚失败的那条线路，播完会自动跳回它。
+    setStartAt(0)
+    setResumeTime(null)
+    setNextCountdown(null)
     addRecent({
       source: 'manual',
       playUrl: url,
@@ -183,6 +191,7 @@ export default function PlayerPage() {
         const next = new URLSearchParams(prev)
         next.set('source', 'manual')
         next.set('play', url)
+        next.delete('next')
         return next
       },
       { replace: true },

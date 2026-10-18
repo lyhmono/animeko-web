@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import Poster from '../components/Poster'
 import { api, errMsg } from '../api'
@@ -30,6 +30,21 @@ export default function SubjectPage() {
   const [sources, setSources] = useState<StoredSource[]>([])
   const [flow, setFlow] = useState<PlayFlow | null>(null)
   const [faved, setFaved] = useState(false)
+  /**
+   * 自动匹配的世代号。
+   *
+   * autoMatch 要等两次**第三方站点**的抓取（搜索 + 取剧集，慢的能到几十秒），
+   * 而它的成功分支直接 window.location.assign 整页跳进播放页。
+   * 原先只有失败分支带 `f ? … : f` 的判空（弹窗关了就不写状态），成功分支没有：
+   * 用户点了「取消」或已经切到别的集、甚至离开了本页，那条在飞的匹配照样会把他
+   * 扔进某一集里 —— 而且很可能是刚才那集，不是他现在想看的。
+   * 关闭弹窗 / 换条目 / 卸载时世代+1，回不来的一律作废。
+   */
+  const matchGenRef = useRef(0)
+  const closeFlow = useCallback(() => {
+    matchGenRef.current++
+    setFlow(null)
+  }, [])
 
   useEffect(() => {
     // cancelled 守卫：切换条目时旧请求的响应不能覆盖新条目的数据
@@ -38,29 +53,35 @@ export default function SubjectPage() {
     setError('')
     setSubject(null)
     setFaved(false)
+    // 换条目也要作废上一轮的自动匹配并收起弹窗：
+    // 否则在 A 条目发起的匹配会在用户切到 B 条目之后把用户带进 A 的某一集
+    matchGenRef.current++
+    setFlow(null)
     if (!subjectId) {
       setError('无效的条目 ID')
-      return
+    } else {
+      setFaved(isFavorite(subjectId))
+      api
+        .bangumiSubject(subjectId)
+        .then((s) => {
+          if (!cancelled) setSubject(s)
+        })
+        .catch((e) => {
+          if (!cancelled) setError(errMsg(e))
+        })
+      api
+        .sources()
+        .then((list) => {
+          if (!cancelled) setSources(list.filter((s) => s.enabled))
+        })
+        .catch(() => {
+          if (!cancelled) setSources([])
+        })
     }
-    setFaved(isFavorite(subjectId))
-    api
-      .bangumiSubject(subjectId)
-      .then((s) => {
-        if (!cancelled) setSubject(s)
-      })
-      .catch((e) => {
-        if (!cancelled) setError(errMsg(e))
-      })
-    api
-      .sources()
-      .then((list) => {
-        if (!cancelled) setSources(list.filter((s) => s.enabled))
-      })
-      .catch(() => {
-        if (!cancelled) setSources([])
-      })
     return () => {
       cancelled = true
+      // 卸载后那条在飞的匹配同样不许再跳转（它做的是整页 location.assign）
+      matchGenRef.current++
     }
   }, [subjectId])
 
@@ -128,9 +149,14 @@ export default function SubjectPage() {
     async (sourceName: string, ep: BgmEpisode) => {
       if (!subject) return
       const animeName = subject.name_cn || subject.name
+      const gen = ++matchGenRef.current
+      // 每次写状态与跳转前都要确认这一轮还是「当前这一轮」：
+      // 失败分支原来用 `f ? … : f` 只是「弹窗没了就不写」，并不能阻止成功分支跳转
+      const alive = () => gen === matchGenRef.current
       setFlow((f) => (f ? { ...f, pickingSource: false, matching: true, matchError: '', matchedSource: sourceName } : f))
       try {
         const hits = await api.sourceSearch(sourceName, animeName)
+        if (!alive()) return
         if (hits.length === 0) {
           setFlow((f) =>
             f ? { ...f, matching: false, matchError: `数据源「${sourceName}」未找到「${animeName}」` } : f,
@@ -138,6 +164,7 @@ export default function SubjectPage() {
           return
         }
         const result = await api.sourceEpisodes(sourceName, hits[0].url)
+        if (!alive()) return
         const want = ep.sort ?? 1
         const matched =
           result.episodes.find((e) => e.sortNum === want) ??
@@ -160,6 +187,9 @@ export default function SubjectPage() {
           f ? { ...f, matching: false, pickingEpisodes: result, matchedSource: sourceName } : f,
         )
       } catch (e) {
+        // 这里也必须判 alive：用户取消后**又开了一个新的选集弹窗**时，
+        // 上一轮的失败会把错误写进这一轮的弹窗里
+        if (!alive()) return
         setFlow((f) => (f ? { ...f, matching: false, matchError: errMsg(e) } : f))
       }
     },
@@ -255,7 +285,7 @@ export default function SubjectPage() {
       </div>
 
       {flow && (
-        <div className="modal-mask" onClick={() => setFlow(null)}>
+        <div className="modal-mask" onClick={closeFlow}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             {flow.pickingSource && (
               <>
@@ -295,7 +325,7 @@ export default function SubjectPage() {
                   ))}
                 </div>
                 <div className="modal-actions">
-                  <button className="btn btn-secondary" onClick={() => setFlow(null)}>
+                  <button className="btn btn-secondary" onClick={closeFlow}>
                     取消
                   </button>
                 </div>
@@ -317,7 +347,7 @@ export default function SubjectPage() {
                   >
                     重试
                   </button>
-                  <button className="btn" onClick={() => setFlow(null)}>
+                  <button className="btn" onClick={closeFlow}>
                     关闭
                   </button>
                 </div>
@@ -355,7 +385,7 @@ export default function SubjectPage() {
                   ))}
                 </div>
                 <div className="modal-actions">
-                  <button className="btn btn-secondary" onClick={() => setFlow(null)}>
+                  <button className="btn btn-secondary" onClick={closeFlow}>
                     取消
                   </button>
                 </div>

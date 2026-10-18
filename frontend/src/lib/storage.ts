@@ -132,12 +132,56 @@ export async function flushUserData(): Promise<void> {
   await round
 }
 
+/**
+ * 本轮真正发出去的**值**（按引用记）。
+ *
+ * 为什么需要：api.saveData 在调用那一刻就把 doc 序列化成了请求体，之后的改动
+ * 只存在于内存里，不在这份请求体中。成功回来若无条件把这些键从 pendingKeys 删掉，
+ * 「await 期间点的那两下」就被当成已同步 —— 界面显示收藏了两部，刷新后少一部。
+ * 只有值仍然是发出去那个引用的键，才真的可以清掉。
+ * （所有写入路径都是整体替换 `doc[key] = next`，所以引用比较足以判断「变过」。）
+ */
+interface Round {
+  keys: string[]
+  progressKeys: string[]
+  sentValues: Map<string, unknown>
+  sentProgress: Map<string, unknown>
+}
+
+function snapshotValues(round: Round): void {
+  for (const key of round.keys) round.sentValues.set(key, doc[key])
+  const progress = asMap(doc.progress)
+  for (const entry of round.progressKeys) round.sentProgress.set(entry, progress[entry])
+}
+
+/** 发出去之后又被改过的顶层键 */
+function changedKeys(round: Round): string[] {
+  return round.keys.filter((key) => {
+    if (key === 'progress') {
+      const progress = asMap(doc.progress)
+      return round.progressKeys.some((entry) => progress[entry] !== round.sentProgress.get(entry))
+    }
+    return doc[key] !== round.sentValues.get(key)
+  })
+}
+
+/** 还欠着服务端一次写入：排一轮延迟推送（有在途请求时由 flushUserData 排队） */
+function scheduleFollowUp(delay = DEBOUNCE_MS): void {
+  if (timer) clearTimeout(timer)
+  timer = setTimeout(() => void flushUserData(), delay)
+}
+
 async function pushOnce(): Promise<void> {
   let attempt = 0
   while (pendingKeys.size > 0 && attempt < 3) {
     attempt++
-    const keys = [...pendingKeys]
-    const progressKeys = [...pendingProgressKeys]
+    const round: Round = {
+      keys: [...pendingKeys],
+      progressKeys: [...pendingProgressKeys],
+      sentValues: new Map(),
+      sentProgress: new Map(),
+    }
+    snapshotValues(round)
     setSync({  status: 'saving', kind: null, error: ''  })
     try {
       const saved = await api.saveData(doc, baseEtag)
@@ -147,13 +191,19 @@ async function pushOnce(): Promise<void> {
       sizeNote = saved.bytes > 0 && saved.bytes >= DOC_SOFT_LIMIT
         ? `个人数据已有 ${(saved.bytes / 1024).toFixed(0)}KB，接近服务端 512KB 上限，建议清理不再看的收藏与历史`
         : ''
-      // 只清这一轮带出去的键：await 期间新产生的改动必须留给下一轮
-      keys.forEach((k) => pendingKeys.delete(k))
-      progressKeys.forEach((k) => pendingProgressKeys.delete(k))
+      // 只清「发出去之后没再被动过」的键：await 期间新产生的改动必须留给下一轮
+      const changed = changedKeys(round)
+      const changedProgress = changed.includes('progress')
+      round.keys.forEach((k) => { if (!changed.includes(k)) pendingKeys.delete(k) })
+      round.progressKeys.forEach((k) => {
+        if (asMap(doc.progress)[k] === round.sentProgress.get(k)) pendingProgressKeys.delete(k)
+      })
       setSync({  status: 'ready', kind: null, error: ''  })
+      // 确实有改动没被这份请求体带走 → 自己排下一轮，而不是等用户再点一次
+      if (changed.length > 0 || changedProgress) scheduleFollowUp()
     } catch (e) {
       if (isApiError(e, 409, ERR_DATA_STALE)) {
-        const merged = await mergeWithServer(keys, progressKeys)
+        const merged = await mergeWithServer(round.keys, round.progressKeys)
         if (merged) continue // 换好基准，重试这一次写
         setSync({  status: 'error', kind: 'save', error: '本机改动与服务端冲突且无法合并，请刷新页面重试'  })
         return
@@ -161,10 +211,7 @@ async function pushOnce(): Promise<void> {
       // 超上限、格式错这类不会自己变好，别把浏览器变成打服务端的循环
       const fatal = isApiError(e, 400) || isApiError(e, 413)
       setSync({ status: 'error', kind: 'save', error: `保存失败：${errMsg(e)}` })
-      if (!fatal) {
-        if (timer) clearTimeout(timer)
-        timer = setTimeout(() => void flushUserData(), RETRY_MS)
-      }
+      if (!fatal) scheduleFollowUp(RETRY_MS)
       return
     }
   }

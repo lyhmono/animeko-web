@@ -64,6 +64,8 @@ export default function VideoPlayer({
   const [rate, setRate] = useState(1)
   const [error, setError] = useState<string | null>(null)
   const [fullscreen, setFullscreen] = useState(false)
+  const [autoplayBlocked, setAutoplayBlocked] = useState(false)
+  const autoplayTriedRef = useRef(false)
 
   // 用 ref 持有最新回调：父组件每次渲染都会传入新的回调引用，
   // 若把回调列入 effect 依赖，timeupdate → 父组件重渲染 → 回调引用变化 →
@@ -88,6 +90,9 @@ export default function VideoPlayer({
     setError(null)
     // 换源（切集）后要重新允许定位一次，否则第二集的断点续播永远不生效
     startAtAppliedRef.current = false
+    // 同样要重新允许自动开播一次：连播是整页跳转，新视频不该要求再点一下
+    autoplayTriedRef.current = false
+    setAutoplayBlocked(false)
 
     if (isDirectPlayable(src)) {
       video.src = src
@@ -149,8 +154,23 @@ export default function VideoPlayer({
       onProgressRef.current?.(video.currentTime, video.duration || 0)
     }
     const onMeta = () => setDuration(video.duration || 0)
-    const onPlay = () => setPlaying(true)
+    const onPlay = () => {
+      setPlaying(true)
+      setAutoplayBlocked(false)
+    }
     const onPause = () => setPlaying(false)
+    // 媒体就绪时自己开始播。以前整条链路上只有 togglePlay 会调 play()，
+    // 也就是说**从不自动开播**：而控件是自己画的（controls={false}，没有原生大播放键），
+    // 于是「加载完停在画面上」和「坏了」看起来一模一样，连播每集都要再点一次。
+    // 浏览器可能拒绝（无用户手势），那种情况显式给一个居中的播放按钮，别让用户猜。
+    const onCanPlay = () => {
+      const v = videoRef.current
+      // 没有 src（hls.js 还没 attach 上）时不记「已尝试」，否则这一次空转会吃掉整集的自动开播
+      if (!v || autoplayTriedRef.current || !v.src) return
+      autoplayTriedRef.current = true
+      // 断点续播的定位与这里并行没问题：currentTime 在播放中同样可以赋值
+      v.play().catch(() => setAutoplayBlocked(true))
+    }
     const onEnd = () => {
       setPlaying(false)
       onEndedRef.current?.()
@@ -171,6 +191,7 @@ export default function VideoPlayer({
     video.addEventListener('durationchange', onMeta)
     video.addEventListener('play', onPlay)
     video.addEventListener('pause', onPause)
+    video.addEventListener('canplay', onCanPlay)
     video.addEventListener('ended', onEnd)
     video.addEventListener('error', onMediaError)
     document.addEventListener('fullscreenchange', onFs)
@@ -180,6 +201,7 @@ export default function VideoPlayer({
       video.removeEventListener('durationchange', onMeta)
       video.removeEventListener('play', onPlay)
       video.removeEventListener('pause', onPause)
+      video.removeEventListener('canplay', onCanPlay)
       video.removeEventListener('ended', onEnd)
       video.removeEventListener('error', onMediaError)
       document.removeEventListener('fullscreenchange', onFs)
@@ -298,6 +320,12 @@ export default function VideoPlayer({
   return (
     <div ref={containerRef} className="video-shell">
       <video ref={videoRef} playsInline controls={false} onClick={togglePlay} />
+      {autoplayBlocked && !error && (
+        <button type="button" className="video-bigplay" onClick={togglePlay}>
+          <IconPlay size={44} />
+          <span>浏览器不允许自动播放，点这里开始</span>
+        </button>
+      )}
       {error && (
         <div
           style={{

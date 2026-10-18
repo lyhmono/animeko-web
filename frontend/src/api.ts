@@ -96,7 +96,9 @@ export const api = {
    * 一定要 ETag：PUT 是整份覆盖，没有基准的话，另一个标签页/设备的改动会被静默吃掉。
    */
   loadDataWithEtag: async (): Promise<{ doc: UserData; etag: string }> => {
-    const resp = await send('/api/data')
+    // no-store 两头都要写：服务端已经发了这个 Cache-Control，但老镜像还没重建时，
+    // 浏览器自己的启发式缓存仍可能把上一个账号的收藏喂回来。
+    const resp = await send('/api/data', { cache: 'no-store' })
     const text = await resp.text()
     let doc: UserData = {}
     if (text.trim()) {
