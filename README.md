@@ -124,18 +124,21 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 
 ### 配置写错时会拒绝启动
 
-从某一次审计起，配置解析改成**失败关闭**：认不出来的值不再悄悄回落到默认值，而是打印一条
-带变量名的错误后退出。原因是这类静默回落恰好落在安全属性上——`ANIMEKO_AUTH_ENABLED=TRUE`
+配置解析是**失败关闭**的：认不出来的值不会悄悄回落到默认值，而是打印一条带变量名的错误后
+退出（实测第一行就是 `Exception in thread "main" java.lang.IllegalStateException: ANIMEKO_...`，
+退出码 1）。原因是这类静默回落恰好落在安全属性上——`ANIMEKO_AUTH_ENABLED=TRUE`
 （大写）以前会被当成「没配」，鉴权因此被推导为关闭，运维以为上了锁，实际得到一台敞开的主机。
 
 会拒绝启动的几种写法：
 
 - `ANIMEKO_AUTH_ENABLED` / `ANIMEKO_COOKIE_SECURE` / `ANIMEKO_ALLOW_PRIVATE_TARGETS` /
-  `ANIMEKO_ALLOW_CROSS_ORIGIN` 填了 true/false 之外的东西（`1`、`yes`、`on`、`0`、`no`、`off` 都接受，大小写不限）
+  `ANIMEKO_ALLOW_CROSS_ORIGIN` 填了布尔之外的东西。接受 `true`/`false`（大小写不限），
+  以及 `1`/`0`、`yes`/`no`、`on`/`off`、`y`/`n`、`t`/`f`；其它一律拒绝，不做「猜你想写什么」
 - **只配了 `ANIMEKO_AUTH_USER` 或只配了 `ANIMEKO_AUTH_PASSWORD`**：账号口令必须成对，
   否则谁也登录不进来，而鉴权又会被「没有完整凭据」推导为关闭。要关掉登录页请显式写
   `ANIMEKO_AUTH_ENABLED=false`（前提是前面已有反代鉴权）
-- `ANIMEKO_PORT` 不是 1–65535 的整数；各类 `*_TIMEOUT_MS` 不是正数
+- `ANIMEKO_PORT` 不是 1–65535 的整数；各类 `*_TIMEOUT_MS` 不是正数或超过上限
+  （抓取与元数据类 600000，视频代理 3600000——写成 1e15 的请求不是「永不超时」，是把连接钉死）
 - `ANIMEKO_TRUSTED_PROXY_HOPS` 不是 0–8 的整数（越界不再夹取：夹到 8 会让限速键取错位置）
 
 容器因此可能进入重启循环。看到 `IllegalStateException: ANIMEKO_...` 就是配置的问题，
