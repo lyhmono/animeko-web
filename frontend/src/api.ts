@@ -4,6 +4,7 @@ import type {
   BgmChannelKind,
   BgmProbeResult,
   BgmSubject,
+  BgmSubjectPage,
   EpisodesResult,
   VideoSource,
   StoredSource,
@@ -136,6 +137,9 @@ export const api = {
   searchBangumi: (q: string, signal?: AbortSignal) =>
     request<BgmSubject[]>(`/api/bangumi/search?q=${encodeURIComponent(q)}`, { signal }),
   bangumiSubject: (id: number) => request<BgmSubject>(`/api/bangumi/subjects/${id}`),
+  /** 排行榜（发现页）。镜像同样支持该端点，因为它走的是 /v0/subjects */
+  bangumiRanking: (offset: number, limit = 24, signal?: AbortSignal) =>
+    request<BgmSubjectPage>(`/api/bangumi/ranking?offset=${offset}&limit=${limit}`, { signal }),
   /** 每日放送表。镜像部署下会上游 502，调用方按可选功能处理（拉不到就不显示） */
   bangumiCalendar: (signal?: AbortSignal) =>
     request<BgmCalendarDay[]>(`/api/bangumi/calendar`, { signal }),

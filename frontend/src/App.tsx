@@ -23,6 +23,7 @@ const SourceDetailPage = lazy(() => import('./pages/SourceDetailPage'))
 const PlayerPage = lazy(() => import('./pages/PlayerPage'))
 const SourcesPage = lazy(() => import('./pages/SourcesPage'))
 const FavoritesPage = lazy(() => import('./pages/FavoritesPage'))
+const DiscoverPage = lazy(() => import('./pages/DiscoverPage'))
 const SettingsPage = lazy(() => import('./pages/SettingsPage'))
 const NotFoundPage = lazy(() => import('./pages/NotFoundPage'))
 
@@ -122,6 +123,7 @@ export default function App() {
             <Route path="/source/:name" element={<SourceDetailPage />} />
             <Route path="/play" element={<PlayerPage />} />
             <Route path="/sources" element={<SourcesPage />} />
+            <Route path="/discover" element={<DiscoverPage />} />
             <Route path="/favorites" element={<FavoritesPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<NotFoundPage />} />

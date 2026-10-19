@@ -54,6 +54,14 @@ export interface BgmCalendarItem {
   eps?: number | null
 }
 
+/** Bangumi 分页结果（排行榜与搜索同形状） */
+export interface BgmSubjectPage {
+  total: number
+  data: BgmSubject[]
+  limit: number
+  offset: number
+}
+
 /** Bangumi 通道（与后端 BgmChannel 枚举字面量一致） */
 export type BgmChannelKind = 'AUTO' | 'OFFICIAL' | 'MIRROR' | 'CUSTOM'
 

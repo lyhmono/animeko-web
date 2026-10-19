@@ -11,6 +11,7 @@ import {
 } from '../lib/storage'
 import { rememberedUser } from '../lib/auth'
 import {
+  IconCompass,
   IconHeart,
   IconHome,
   IconLayers,
@@ -103,6 +104,10 @@ export default function Layout() {
           <NavLink to="/sources" title="数据源">
             <IconLayers size={16} className="nav-icon" />
             <span className="nav-text">数据源</span>
+          </NavLink>
+          <NavLink to="/discover" title="发现">
+            <IconCompass size={16} className="nav-icon" />
+            <span className="nav-text">发现</span>
           </NavLink>
           <NavLink to="/favorites" title="收藏">
             <IconHeart size={16} className="nav-icon" />

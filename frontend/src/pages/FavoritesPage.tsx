@@ -1,19 +1,45 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
+  FAV_STATUS_LABEL,
   listFavorites,
   listSourceFavorites,
+  setFavoriteStatus,
   toggleFavorite,
   toggleSourceFavorite,
+  type FavStatus,
   type FavoriteSubject,
   type SourceFavorite,
 } from '../lib/storage'
 import Poster from '../components/Poster'
 import { IconHeart, IconSearch, IconTrash } from '../lib/icons'
 
+const STATUS_ORDER: FavStatus[] = ['watching', 'wish', 'onhold', 'done']
+
+/**
+ * 追番收藏页。
+ *
+ * 按状态分组而不是平铺一个列表：追番的真实状态是「在看的几部 + 想看的几十部 +
+ * 看过的更多」，平铺时找正在追的那部要在几十张卡里扫。默认落在「在看」，
+ * 没有在看的就落到「全部」——大多数时候用户要找的就是正在追的。
+ */
 export default function FavoritesPage() {
   const [favorites, setFavorites] = useState<FavoriteSubject[]>(listFavorites)
   const [sourceFavs, setSourceFavs] = useState<SourceFavorite[]>(listSourceFavorites)
+  const [filter, setFilter] = useState<FavStatus | 'all'>(() =>
+    listFavorites().some((f) => f.status === 'watching') ? 'watching' : 'all',
+  )
+
+  const counts = useMemo(() => {
+    const map: Record<FavStatus, number> = { wish: 0, watching: 0, done: 0, onhold: 0 }
+    for (const f of favorites) map[f.status] += 1
+    return map
+  }, [favorites])
+
+  const visible = useMemo(
+    () => (filter === 'all' ? favorites : favorites.filter((f) => f.status === filter)),
+    [favorites, filter],
+  )
 
   const removeSource = useCallback((item: SourceFavorite) => {
     toggleSourceFavorite(item)
@@ -24,6 +50,11 @@ export default function FavoritesPage() {
     const list = listFavorites()
     const target = list.find((f) => f.id === id)
     if (target) toggleFavorite(target)
+    setFavorites(listFavorites())
+  }, [])
+
+  const changeStatus = useCallback((id: number, status: FavStatus) => {
+    setFavoriteStatus(id, status)
     setFavorites(listFavorites())
   }, [])
 
@@ -44,34 +75,79 @@ export default function FavoritesPage() {
           ，在条目页点击「收藏」即可加入追番列表。
         </div>
       ) : (
-        <div className="fav-grid">
-          {favorites.map((f) => (
-            <div className="fav-card" key={f.id}>
-              <Link to={`/subject/${f.id}`} aria-label={f.name_cn || f.name}>
-                <Poster className="cover" src={f.cover} alt={f.name_cn || f.name} />
-              </Link>
+        <>
+          <div className="fav-tabs" role="tablist" aria-label="按追番状态筛选">
+            <button
+              className={`fav-tab${filter === 'all' ? ' active' : ''}`}
+              onClick={() => setFilter('all')}
+              role="tab"
+              aria-selected={filter === 'all'}
+            >
+              全部 <span className="count">{favorites.length}</span>
+            </button>
+            {STATUS_ORDER.map((s) => (
               <button
-                className="fav-remove"
-                onClick={() => remove(f.id)}
-                title="取消收藏"
-                aria-label="取消收藏"
+                key={s}
+                className={`fav-tab${filter === s ? ' active' : ''}${counts[s] === 0 ? ' empty' : ''}`}
+                onClick={() => setFilter(s)}
+                role="tab"
+                aria-selected={filter === s}
               >
-                <IconTrash size={14} />
+                {FAV_STATUS_LABEL[s]} <span className="count">{counts[s]}</span>
               </button>
-              <div className="info">
-                <Link to={`/subject/${f.id}`}>
-                  <div className="title">{f.name_cn || f.name}</div>
-                </Link>
-                <div className="meta">
-                  <span>{f.date || '—'}</span>
-                  {f.score != null && (
-                    <span style={{ color: 'var(--warn)', fontWeight: 600 }}>{f.score.toFixed(1)}</span>
-                  )}
-                </div>
-              </div>
+            ))}
+          </div>
+
+          {visible.length === 0 ? (
+            <div className="empty" style={{ padding: '22px 0' }}>
+              这一档还没有番剧。用卡片里的下拉框把某一部挪进来即可。
             </div>
-          ))}
-        </div>
+          ) : (
+            <div className="fav-grid">
+              {visible.map((f) => (
+                <div className="fav-card" key={f.id}>
+                  <Link to={`/subject/${f.id}`} aria-label={f.name_cn || f.name}>
+                    <Poster className="cover" src={f.cover} alt={f.name_cn || f.name} />
+                  </Link>
+                  <button
+                    className="fav-remove"
+                    onClick={() => remove(f.id)}
+                    title="取消收藏"
+                    aria-label="取消收藏"
+                  >
+                    <IconTrash size={14} />
+                  </button>
+                  <div className="info">
+                    <Link to={`/subject/${f.id}`}>
+                      <div className="title">{f.name_cn || f.name}</div>
+                    </Link>
+                    <div className="meta">
+                      <span>{f.date || '—'}</span>
+                      {f.score != null && (
+                        <span style={{ color: 'var(--warn)', fontWeight: 600 }}>
+                          {f.score.toFixed(1)}
+                        </span>
+                      )}
+                    </div>
+                    <select
+                      className={`fav-status status-${f.status}`}
+                      value={f.status}
+                      onChange={(e) => changeStatus(f.id, e.target.value as FavStatus)}
+                      aria-label={`${f.name_cn || f.name} 的追番状态`}
+                      title="追番状态"
+                    >
+                      {STATUS_ORDER.map((s) => (
+                        <option key={s} value={s}>
+                          {FAV_STATUS_LABEL[s]}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
       )}
 
       <div style={{ marginTop: 24 }}>

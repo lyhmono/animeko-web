@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
 import Hls from 'hls.js'
 import { isDirectPlayable } from '../api'
+import { getPlayerPrefs, savePlayerPrefs } from '../lib/storage'
 import {
   IconBrightness,
   IconFullscreen,
@@ -73,9 +74,11 @@ export default function VideoPlayer({
   const [playing, setPlaying] = useState(false)
   const [current, setCurrent] = useState(0)
   const [duration, setDuration] = useState(0)
-  const [volume, setVolume] = useState(1)
-  const [muted, setMuted] = useState(false)
-  const [rate, setRate] = useState(1)
+  const [volume, setVolume] = useState(() => getPlayerPrefs().volume)
+  const [muted, setMuted] = useState(() => getPlayerPrefs().muted)
+  const [rate, setRate] = useState(() => getPlayerPrefs().rate)
+  /** 播放器偏好落盘的去抖定时器（音量拖动会连发几十次变化） */
+  const prefsTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const [error, setError] = useState<string | null>(null)
   const [fullscreen, setFullscreen] = useState(false)
   const [autoplayBlocked, setAutoplayBlocked] = useState(false)
@@ -305,6 +308,14 @@ export default function VideoPlayer({
     const video = videoRef.current
     if (video) video.playbackRate = rate
   }, [rate])
+
+  // 把音量/静音/倍速记到本地：下次打开沿用上次的设置。
+  // 去抖 400ms —— 拖音量条时这里会被连续触发几十次，每次都写 localStorage
+  // 虽然不慢，但没必要；而卸载时**不清**定时器，否则最后那一下调整会丢。
+  useEffect(() => {
+    if (prefsTimerRef.current) clearTimeout(prefsTimerRef.current)
+    prefsTimerRef.current = setTimeout(() => savePlayerPrefs({ volume, muted, rate }), 400)
+  }, [volume, muted, rate])
 
   const togglePlay = () => {
     const video = videoRef.current

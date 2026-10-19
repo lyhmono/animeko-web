@@ -26,6 +26,8 @@ export default function SourcesPage() {
   const [subImporting, setSubImporting] = useState(false)
   // 关键词按数据源名分别保存：共用一个 state 会让所有输入框互相覆盖
   const [testKeyword, setTestKeyword] = useState<Record<string, string>>({})
+  /** 批量健康检查进行中（按钮文案与禁用） */
+  const [checking, setChecking] = useState(false)
   const [testResult, setTestResult] = useState<Record<string, string>>({})
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
   const [pendingToggles, setPendingToggles] = useState<Record<string, boolean>>({})
@@ -146,6 +148,42 @@ export default function SourcesPage() {
     }
   }
 
+  /**
+   * 一键检查所有启用源。
+   *
+   * 为什么值得做：十几个源里通常挂着两三个死源，而单个「测试」要逐条点、
+   * 每条还得自己敲关键词 —— 实际没人会去点，于是死源一直留在搜索链路里
+   * 拖慢每一次搜索（它们各自要等到超时才失败）。
+   * 并发压到 3：与搜索页同一条理由，浏览器对同源只有 6 条连接，
+   * 全占满会让页面自己的其它请求排队。
+   */
+  const checkAll = async () => {
+    const targets = sources.filter((s) => s.enabled).map((s) => s.arguments.name)
+    if (targets.length === 0) return
+    setChecking(true)
+    setTestResult((r) => {
+      const next = { ...r }
+      for (const n of targets) next[n] = '检查中…'
+      return next
+    })
+    let cursor = 0
+    const worker = async () => {
+      while (cursor < targets.length) {
+        const name = targets[cursor++]
+        try {
+          // 用一个几乎必定有结果的宽泛词：目的是「这个源还能不能用」，
+          // 空结果会被误判成死源，所以不用「测试」这种精确词
+          const hits = await api.sourceSearch(name, '动画')
+          setTestResult((r) => ({ ...r, [name]: `✓ 可用（${hits.length} 个结果）` }))
+        } catch (e) {
+          setTestResult((r) => ({ ...r, [name]: `✗ 失败：${errMsg(e)}` }))
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(3, targets.length) }, worker))
+    setChecking(false)
+  }
+
   const toggle = async (name: string, enabled: boolean) => {
     setError('')
     setPendingToggles((p) => ({ ...p, [name]: true }))
@@ -181,6 +219,14 @@ export default function SourcesPage() {
     <div>
       <h2 className="section-title">
         数据源管理 <span className="count">{sources.length} 个</span>
+        <button
+          className="airing-filter"
+          onClick={() => void checkAll()}
+          disabled={checking || sources.filter((s) => s.enabled).length === 0}
+          title="对每个已启用的源跑一次搜索，标出不能用的"
+        >
+          {checking ? '检查中…' : '检查可用性'}
+        </button>
       </h2>
       <p style={{ color: 'var(--text-secondary)', fontSize: 13, marginBottom: 16 }}>
         直接导入 <b>animeko</b> 的 Selector 数据源配置 JSON（factoryId: web-selector，version: 2）。

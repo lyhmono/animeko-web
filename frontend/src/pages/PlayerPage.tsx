@@ -2,7 +2,13 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { api, errMsg, UNAUTHORIZED_EVENT } from '../api'
 import VideoPlayer from '../components/VideoPlayer'
-import { addRecent, clearProgress, getProgress, setProgress } from '../lib/storage'
+import {
+  addRecent,
+  clearProgress,
+  getProgress,
+  setProgress,
+  setSubjectProgress,
+} from '../lib/storage'
 import { IconCheck, IconClock, IconKeyboard, IconNext } from '../lib/icons'
 
 /** 下一集信息（连播用），通过 URL 参数传递 */
@@ -49,6 +55,8 @@ export default function PlayerPage() {
   const title = params.get('title') ?? ''
   const animeName = params.get('anime') ?? ''
   const ep = params.get('ep') ?? ''
+  /** 从条目页进来时带的 Bangumi 条目 id：用来回写「看到第几话」 */
+  const subjectId = Number(params.get('subject') ?? '') || 0
   const nextInfo = useMemo(() => parseNext(params.get('next')), [params])
 
   const [src, setSrc] = useState('')
@@ -138,6 +146,9 @@ export default function PlayerPage() {
     if (last == null || Math.abs(time - last) >= 4) {
       lastWriteRef.current = time
       setProgress({ source, playUrl, title, time, duration, ts: Date.now() })
+      // 同步记一笔条目级进度：条目页据此显示「看到第 X 话」并标出已看过的集。
+      // 只在有 subject 参数（从条目页进入）时写，从数据源页直接进来没有条目 id。
+      if (subjectId > 0) setSubjectProgress(subjectId, Number(ep) || 0)
     }
   }
 

@@ -259,6 +259,14 @@ fun Application.configureApiRoutes(
             call.respond(bangumi.calendar())
         }
 
+        // 排行榜（发现页用）。limit/offset 直接来自查询串，必须夹紧：
+        // 上游 limit 上限 50，而 offset 不设界等于允许任何人让服务器去翻一万页。
+        get("/api/bangumi/ranking") {
+            val limit = (call.request.queryParameters["limit"]?.toIntOrNull() ?: 24).coerceIn(1, 50)
+            val offset = (call.request.queryParameters["offset"]?.toIntOrNull() ?: 0).coerceIn(0, 5000)
+            call.respond(bangumi.ranking(limit = limit, offset = offset))
+        }
+
         // ---- Bangumi 通道（设置页：官方/镜像/自定义/自动）----
         get("/api/bangumi/channel") {
             val st = bangumi.channelState()

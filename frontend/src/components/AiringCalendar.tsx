@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import Poster from './Poster'
 import { api } from '../api'
+import { favoriteIdSet } from '../lib/storage'
+import { IconHeartFilled } from '../lib/icons'
 import type { BgmCalendarDay } from '../types'
 
 /**
@@ -19,6 +21,14 @@ import type { BgmCalendarDay } from '../types'
 export default function AiringCalendar() {
   const [days, setDays] = useState<BgmCalendarDay[] | null>(null)
   const [selected, setSelected] = useState<number>(-1)
+  /** 只看已收藏：放送表的真正价值是「我追的今天更新了吗」，不是资讯墙 */
+  const [onlyFav, setOnlyFav] = useState(false)
+  const [favIds, setFavIds] = useState<Set<number>>(() => favoriteIdSet())
+
+  // 收藏可能在别处被改（条目页点收藏 → 返回首页），回到本页时重读一次
+  useEffect(() => {
+    setFavIds(favoriteIdSet())
+  }, [days])
 
   useEffect(() => {
     const ctrl = new AbortController()
@@ -56,6 +66,18 @@ export default function AiringCalendar() {
     [days, selected],
   )
 
+  /** 当前这一天的条目（按「只看我追的」过滤后） */
+  const items = useMemo(() => {
+    const list = current?.items ?? []
+    return onlyFav ? list.filter((i) => favIds.has(i.id)) : list
+  }, [current, onlyFav, favIds])
+
+  /** 整周里有多少部是已收藏的 —— 为 0 时「只看我追的」没有意义，直接禁用 */
+  const favCountInWeek = useMemo(() => {
+    if (!days) return 0
+    return days.reduce((n, d) => n + d.items.filter((i) => favIds.has(i.id)).length, 0)
+  }, [days, favIds])
+
   // 失败（空数组）整块不渲染 —— 包括标题和骨架。骨架屏从「每日放送」标题下
   // 突然消失比一开始就没有更扎眼，首页会跳一下版。
   if (days !== null && days.length === 0) return null
@@ -81,28 +103,63 @@ export default function AiringCalendar() {
       <h2 className="section-title">
         每日放送
         <span className="count">Bangumi 放送表</span>
+        <button
+          className={`airing-filter${onlyFav ? ' active' : ''}`}
+          onClick={() => setOnlyFav((v) => !v)}
+          disabled={favCountInWeek === 0}
+          aria-pressed={onlyFav}
+          title={
+            favCountInWeek === 0
+              ? '本周放送里没有你收藏的番剧'
+              : `本周有 ${favCountInWeek} 部已收藏`
+          }
+        >
+          <IconHeartFilled size={12} />
+          只看我追的{favCountInWeek > 0 ? `（${favCountInWeek}）` : ''}
+        </button>
       </h2>
       <div className="airing-tabs" role="tablist" aria-label="选择星期">
-        {days.map((d, i) => (
-          <button
-            key={d.weekday.id}
-            className={`airing-tab${i === selected ? ' active' : ''}${d.items.length === 0 ? ' empty' : ''}`}
-            onClick={() => setSelected(i)}
-            role="tab"
-            aria-selected={i === selected}
-            title={d.items.length > 0 ? `${d.items.length} 部放送` : '无放送'}
-          >
-            {d.weekday.cn || d.weekday.en || `周${i + 1}`}
-          </button>
-        ))}
+        {days.map((d, i) => {
+          const favOnDay = d.items.filter((it) => favIds.has(it.id)).length
+          const dim = onlyFav ? favOnDay === 0 : d.items.length === 0
+          return (
+            <button
+              key={d.weekday.id}
+              className={`airing-tab${i === selected ? ' active' : ''}${dim ? ' empty' : ''}`}
+              onClick={() => setSelected(i)}
+              role="tab"
+              aria-selected={i === selected}
+              title={
+                onlyFav
+                  ? favOnDay > 0
+                    ? `追的番 ${favOnDay} 部`
+                    : '这天没有你追的番'
+                  : d.items.length > 0
+                    ? `${d.items.length} 部放送`
+                    : '无放送'
+              }
+            >
+              {d.weekday.cn || d.weekday.en || `周${i + 1}`}
+            </button>
+          )
+        })}
       </div>
-      {current && current.items.length === 0 && <div className="empty">这一天没有放送安排</div>}
+      {items.length === 0 && (
+        <div className="empty">
+          {onlyFav ? '这一天没有你收藏的番剧在放送。' : '这一天没有放送安排'}
+        </div>
+      )}
       <div className="result-grid">
-        {(current?.items ?? []).map((item) => {
+        {items.map((item) => {
           const title = item.name_cn || item.name
           const score = item.rating?.score ?? item.score
           return (
             <Link key={item.id} className="subject-card" to={`/subject/${item.id}`}>
+              {favIds.has(item.id) && (
+                <span className="fav-badge" title="已收藏">
+                  <IconHeartFilled size={13} />
+                </span>
+              )}
               <Poster
                 className="cover"
                 src={item.images?.large ?? item.images?.common ?? ''}

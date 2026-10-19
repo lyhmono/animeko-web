@@ -286,6 +286,22 @@ class BangumiClient(
     }
 
     /**
+     * 排行榜（按 rank 升序 = 评分榜）。发现页用：用户不知道看什么时，
+     * 「高分动画」比「让他想关键词」自然得多。
+     *
+     * 复用 [BgmSearchResponse] 作为响应模型：这个端点的返回结构与搜索完全一致
+     * （total/data/limit/offset），没必要为同一形状再建一个类。
+     */
+    suspend fun ranking(limit: Int = 24, offset: Int = 0): BgmSearchResponse = withFallback { base ->
+        val path = "/v0/subjects?type=$TYPE_ANIME&sort=rank&limit=$limit&offset=$offset"
+        decode(
+            text("$base$path") { fetcher.fetch("$base$path", headers(), followRedirects = false) },
+            BgmSearchResponse.serializer(),
+            "Bangumi 排行榜",
+        )
+    }
+
+    /**
      * 每日放送表（周一到周日）。
      *
      * 注意这是**官方端点**：社区镜像（bgmapi.anibt.net）只镜像了搜索/条目/剧集，

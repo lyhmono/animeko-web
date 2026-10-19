@@ -1,20 +1,14 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import AiringCalendar from '../components/AiringCalendar'
+import ContinueWatching from '../components/ContinueWatching'
 import { api } from '../api'
 import type { StoredSource } from '../types'
-import {
-  addSearchHistory,
-  clearSearchHistory,
-  listRecent,
-  listSearchHistory,
-  type RecentItem,
-} from '../lib/storage'
+import { addSearchHistory, clearSearchHistory, listSearchHistory } from '../lib/storage'
 import {
   IconClock,
   IconHistory,
   IconLayers,
-  IconPlay,
   IconSearch,
   IconSettings,
   IconTrash,
@@ -27,7 +21,6 @@ export default function HomePage() {
   // 区分「检测中」与「连接失败」：null=检测中，true/false=健康检查结果
   const [apiReachable, setApiReachable] = useState<boolean | null>(null)
   const [history, setHistory] = useState<string[]>([])
-  const [recent, setRecent] = useState<RecentItem[]>([])
   const navigate = useNavigate()
 
   useEffect(() => {
@@ -43,7 +36,6 @@ export default function HomePage() {
       })
     api.sources().then(setSources).catch(() => setSources([]))
     setHistory(listSearchHistory())
-    setRecent(listRecent())
   }, [])
 
   const enabledCount = sources.filter((s) => s.enabled).length
@@ -92,6 +84,9 @@ export default function HomePage() {
         </div>
       </section>
 
+      {/* 继续观看：比「每日放送」更贴近当下的动作 —— 上次没看完的那集就在眼前 */}
+      <ContinueWatching />
+
       {/* 每日放送：首页的主体内容。拉不到（镜像不镜像该端点）时组件自行隐藏 */}
       <AiringCalendar />
 
@@ -118,41 +113,6 @@ export default function HomePage() {
               <IconTrash size={13} />
               清除
             </button>
-          </div>
-        </>
-      )}
-
-      {recent.length > 0 && (
-        <>
-          <h2 className="section-title">
-            <IconPlay size={16} />
-            最近观看
-          </h2>
-          <div className="recent-grid">
-            {recent.map((r) => (
-              <Link
-                key={`${r.source}:${r.playUrl}`}
-                className="recent-card"
-                to={`/play?${new URLSearchParams({
-                  source: r.source,
-                  play: r.playUrl,
-                  title: r.title,
-                  anime: r.anime,
-                  ep: r.ep,
-                }).toString()}`}
-              >
-                <span className="recent-icon">
-                  <IconPlay size={15} />
-                </span>
-                <span className="recent-info">
-                  <span className="recent-title">{r.title}</span>
-                  <span className="recent-meta">
-                    {r.anime}
-                    {r.ep ? ` · 第${r.ep}话` : ''}
-                  </span>
-                </span>
-              </Link>
-            ))}
           </div>
         </>
       )}

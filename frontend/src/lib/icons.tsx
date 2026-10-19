@@ -300,3 +300,22 @@ export function IconRefresh({ size, ...rest }: IconProps) {
     </Svg>
   )
 }
+
+/** 星标（排行榜条目） */
+export function IconStar({ size, ...rest }: IconProps) {
+  return (
+    <Svg size={size} {...rest}>
+      <path d="M12 3.5l2.7 5.5 6 .9-4.35 4.25 1.03 6L12 17.3l-5.38 2.85 1.03-6L3.3 9.9l6-.9z" />
+    </Svg>
+  )
+}
+
+/** 罗盘（发现页导航） */
+export function IconCompass({ size, ...rest }: IconProps) {
+  return (
+    <Svg size={size} {...rest}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M15.8 8.2l-2.3 5.6-5.6 2.3 2.3-5.6z" />
+    </Svg>
+  )
+}

@@ -3,7 +3,7 @@ import { Link, useParams } from 'react-router-dom'
 import Poster from '../components/Poster'
 import { api, errMsg } from '../api'
 import type { BgmEpisode, BgmSubject, EpisodesResult, StoredSource } from '../types'
-import { isFavorite, toggleFavorite } from '../lib/storage'
+import { getSubjectProgress, isFavorite, toggleFavorite } from '../lib/storage'
 import { IconHeart, IconHeartFilled } from '../lib/icons'
 
 /** 播放弹窗状态 */
@@ -30,6 +30,8 @@ export default function SubjectPage() {
   const [sources, setSources] = useState<StoredSource[]>([])
   const [flow, setFlow] = useState<PlayFlow | null>(null)
   const [faved, setFaved] = useState(false)
+  /** 「看到第几话」：由播放页在保存进度时回写（见 lib/storage 的 subjectProgress） */
+  const [watchedEp, setWatchedEp] = useState(0)
   /**
    * 自动匹配的世代号。
    *
@@ -53,6 +55,7 @@ export default function SubjectPage() {
     setError('')
     setSubject(null)
     setFaved(false)
+    setWatchedEp(0)
     // 换条目也要作废上一轮的自动匹配并收起弹窗：
     // 否则在 A 条目发起的匹配会在用户切到 B 条目之后把用户带进 A 的某一集
     matchGenRef.current++
@@ -61,6 +64,7 @@ export default function SubjectPage() {
       setError('无效的条目 ID')
     } else {
       setFaved(isFavorite(subjectId))
+      setWatchedEp(getSubjectProgress(subjectId)?.ep ?? 0)
       api
         .bangumiSubject(subjectId)
         .then((s) => {
@@ -116,6 +120,8 @@ export default function SubjectPage() {
         title: `${animeName} ${epLabel}`,
         anime: animeName,
         ep: String(epSort),
+        // 带上条目 id：播放页据此回写「看到第几话」，条目页才能标出进度
+        subject: String(subjectId),
       })
       if (next) params.set('next', JSON.stringify(next))
       window.location.assign(`/play?${params.toString()}`)
@@ -238,6 +244,9 @@ export default function SubjectPage() {
             )}
             {subject.date && <span>放送 {subject.date}</span>}
             <span>共 {episodes.length} 话</span>
+            {watchedEp > 0 && (
+              <span style={{ color: 'var(--accent)' }}>看到第 {watchedEp} 话</span>
+            )}
           </div>
           <button className={`fav-btn ${faved ? 'active' : ''}`} onClick={onToggleFav}>
             {faved ? <IconHeartFilled size={15} /> : <IconHeart size={15} />}
@@ -260,7 +269,10 @@ export default function SubjectPage() {
       )}
       <div className="episode-list">
         {episodes.map((ep) => (
-          <div className="episode-row" key={ep.id}>
+          <div
+            className={`episode-row${watchedEp > 0 && ep.sort != null && ep.sort <= watchedEp ? ' watched' : ''}`}
+            key={ep.id}
+          >
             <span className="ep-sort">{ep.sort ?? '-'}</span>
             <span className="ep-title">{ep.name_cn || ep.name || `第${ep.sort}话`}</span>
             {ep.airdate && <span className="ep-date">{ep.airdate}</span>}
@@ -314,6 +326,7 @@ export default function SubjectPage() {
                               title: `${subject.name_cn || subject.name} ${flow.episode.name_cn || flow.episode.name}`,
                               anime: subject.name_cn || subject.name,
                               ep: String(flow.episode.sort ?? 1),
+                              subject: String(subjectId),
                             })
                             window.location.assign(`/play?${params.toString()}`)
                           }}
