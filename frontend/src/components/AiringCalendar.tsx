@@ -103,7 +103,9 @@ export default function AiringCalendar() {
         <button
           className={`airing-filter${onlyFav ? ' active' : ''}`}
           onClick={() => setOnlyFav((v) => !v)}
-          disabled={favCountInWeek === 0}
+          // 已开启时永远可点：否则「开着筛选 + 收藏被清空」会让按钮变成
+          // disabled 的 active 状态，用户既看不到东西也关不掉筛选
+          disabled={favCountInWeek === 0 && !onlyFav}
           aria-pressed={onlyFav}
           title={
             favCountInWeek === 0

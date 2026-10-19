@@ -58,6 +58,21 @@ interface GestureToast {
   level: number
 }
 
+/**
+ * 倍速档位。单一来源：偏好恢复时的吸附与菜单渲染都必须用这一份 ——
+ * 两处各写一份数组时，存了一个不在档位里的值（如 1.75）会出现
+ * 「播放速率确实变了，但菜单里一项都不高亮」的怪状态。
+ */
+const RATES = [0.5, 0.75, 1, 1.25, 1.5, 2] as const
+
+/** 把任意速率吸附到最近的档位 */
+function snapRate(value: number): number {
+  return RATES.reduce(
+    (best, r) => (Math.abs(r - value) < Math.abs(best - value) ? r : best),
+    RATES[0] as number,
+  )
+}
+
 export default function VideoPlayer({
   src,
   startAt,
@@ -78,7 +93,7 @@ export default function VideoPlayer({
   const [initialPrefs] = useState(getPlayerPrefs)
   const [volume, setVolume] = useState(initialPrefs.volume)
   const [muted, setMuted] = useState(initialPrefs.muted)
-  const [rate, setRate] = useState(initialPrefs.rate)
+  const [rate, setRate] = useState(() => snapRate(initialPrefs.rate))
   /** 播放器偏好落盘的去抖定时器（音量拖动会连发几十次变化） */
   const prefsTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const [error, setError] = useState<string | null>(null)
@@ -660,7 +675,7 @@ export default function VideoPlayer({
             </button>
             {rateOpen && (
               <div className="rate-menu" role="menu">
-                {[0.5, 0.75, 1, 1.25, 1.5, 2].map((r) => (
+                {RATES.map((r) => (
                   <button
                     key={r}
                     className={`rate-item${r === rate ? ' active' : ''}`}
