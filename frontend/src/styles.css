@@ -284,6 +284,10 @@ textarea::placeholder {
 
   .nav-tabs {
     position: fixed;
+    /* top: auto 必须显式写：桌面上有 top: 10px，这里不覆盖的话
+       「同时有 top 和 bottom、又没有 height」会让元素被拉伸到整个视口
+       （实测 834px 高，底栏变成一个盖住全屏的透明层）。 */
+    top: auto;
     left: 0;
     right: 0;
     bottom: 0;

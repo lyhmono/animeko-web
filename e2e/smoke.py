@@ -139,13 +139,23 @@ def main() -> int:
             if cards.count() > 0:
                 expect(cards.first).to_be_visible(timeout=25000)
                 return
-            status = page.evaluate(
-                "async () => { const r = await fetch('/api/bangumi/ranking'); return r.status; }"
+            # 接口 200 但 data 为空，同样是「上游没给数据」而不是我们的 bug：
+            # bgmapi 镜像在 CI 的出口 IP 上既会返 5xx，也会返 200 + 空数组
+            # （实测两种都出现过）。只有「接口明确返回了条目、页面却没渲染」才算失败。
+            body = page.evaluate(
+                """async () => {
+                  const r = await fetch('/api/bangumi/ranking');
+                  if (!r.ok) return { status: r.status, count: -1 };
+                  const j = await r.json();
+                  return { status: r.status, count: (j.data || []).length };
+                }"""
             )
-            if status >= 500:
-                print(f"    (上游不可用 HTTP {status}，排行榜为空属预期)")
+            if body["count"] <= 0:
+                print(f"    (上游未返回数据：HTTP {body['status']}、{body['count']} 条，空榜属预期)")
                 return
-            raise AssertionError(f"接口正常({status})但排行榜没有任何卡片")
+            raise AssertionError(
+                f"接口返回 {body['count']} 条条目，但页面一张卡片都没渲染（真 bug）"
+            )
 
         check("排行榜有结果", ranking_ok, page)
 
@@ -177,27 +187,41 @@ def main() -> int:
         )
 
         def nav_at_bottom() -> None:
-            box = m.get_by_test_id("nav-tabs").bounding_box()
-            if box is None:
-                raise AssertionError("nav-tabs 没有布局盒")
-            bottom = box["y"] + box["height"]
-            # 容差 40px：底部还有 env(safe-area-inset-bottom)，模拟器里是 0 但真机可能吃掉一截
-            if abs(bottom - 844) > 40:
-                raise AssertionError(f"导航底边 {bottom:.0f} 离视口底 844 太远")
+            # 用 getBoundingClientRect 而不是 bounding_box：后者在 fixed 元素上
+            # 返回的 now 是布局盒（可能被 flex 拉满），rect 才是相对视口的真实位置
+            r = m.get_by_test_id("nav-tabs").evaluate(
+                "(el) => { const b = el.getBoundingClientRect(); return {top: b.top, bottom: b.bottom}; }"
+            )
+            # 容差 40px：底部还有 env(safe-area-inset-bottom)，模拟器是 0 但真机可能吃掉一截
+            if abs(r["bottom"] - 844) > 40:
+                raise AssertionError(f"导航底边 {r['bottom']:.0f} 离视口底 844 太远")
 
         check("手机端导航贴底", nav_at_bottom, m)
 
         def main_not_covered() -> None:
-            box = m.get_by_test_id("nav-tabs").bounding_box()
-            if box is None:
-                raise AssertionError("nav-tabs 没有布局盒")
+            """底栏的实际占位高度要和 main 的底部内边距比。
+
+            不能用 bounding_box().height：底栏是 position:fixed 且 left/right:0，
+            在某些布局下（父级是 flex column）它的盒子高度会被拉成整个视口，
+            实测拿到过 834px —— 那样比出来的结论完全没意义。
+            改用量 scrollHeight：内容实际占的高度，这才是「会挡住多少内容」。
+            """
+            bar_h = float(
+                m.get_by_test_id("nav-tabs").evaluate(
+                    "(el) => el.getBoundingClientRect().height"
+                )
+            )
+            # 底栏不该高过 200px：超过说明它被拉伸成整屏了（曾经真的发生过 ——
+            # 桌面规则里的 top:10px 没在移动端被覆盖，top+bottom 同时存在把元素拉满）
+            if bar_h > 200:
+                raise AssertionError(f"底栏高度 {bar_h:.0f}px 异常，疑似被拉伸成整屏")
             pad = float(
                 m.get_by_test_id("main").evaluate(
                     "(el) => parseFloat(getComputedStyle(el).paddingBottom)"
                 )
             )
-            if pad < box["height"]:
-                raise AssertionError(f"main 底部内边距 {pad}px < 底栏高度 {box['height']:.0f}px")
+            if pad < bar_h:
+                raise AssertionError(f"main 底部内边距 {pad}px < 底栏内容高度 {bar_h:.0f}px")
 
         check("内容为底栏留出空间", main_not_covered, m)
 
