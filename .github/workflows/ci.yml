@@ -56,34 +56,54 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Smoke test (start container, hit health endpoint)
+      - name: Smoke test (container + frontend assets)
         run: |
           set -euo pipefail
-          # 用匿名卷挂 /data：验证非 root 用户能写数据目录
+          # /data 用 tmpfs 并指定 uid/gid：entrypoint 会 chown 后降权到 app(10001)，
+          # 这样能同时验证「非 root 用户可写数据目录」
           docker run -d --name animeko-ci \
             -p 18080:8080 \
             --tmpfs /data:rw,uid=10001,gid=10001 \
             animeko-web:ci
 
-          # JVM 冷启动 + 首次建数据文件，给足 60 秒；失败时把日志打出来再退出
           for i in $(seq 1 60); do
             if curl -fsS http://127.0.0.1:18080/api/health >/tmp/health.json 2>/dev/null; then
-              echo "health OK after ${i}s"
-              cat /tmp/health.json
-              exit 0
+              echo "health OK after ${i}s: $(cat /tmp/health.json)"
+              break
             fi
-            # 容器已经退出就不用再等了，直接报错
             if [ "$(docker inspect -f '{{.State.Running}}' animeko-ci)" != "true" ]; then
               echo "::error::容器启动后退出了"
+              docker logs animeko-ci
+              exit 1
+            fi
+            if [ "$i" = "60" ]; then
+              echo "::error::60 秒内 /api/health 没有就绪"
               docker logs animeko-ci
               exit 1
             fi
             sleep 1
           done
 
-          echo "::error::60 秒内 /api/health 没有就绪"
-          docker logs animeko-ci
-          exit 1
+          # 前端产物：health 只能证明后端活着。dist 没落位时它照样 200，
+          # 而用户打开是一张白页 —— 这种故障从 CI 里最看不出来，所以必须单独验。
+          curl -fsS http://127.0.0.1:18080/ -o /tmp/index.html
+          if ! grep -q 'id="root"' /tmp/index.html; then
+            echo "::error::首页返回的不是前端 HTML（dist 没落位？）"
+            head -c 400 /tmp/index.html; echo
+            docker logs animeko-ci
+            exit 1
+          fi
+
+          # 再取一个真实的 JS 产物：index.html 里引用了、但服务器 404 的话，
+          # 页面同样是白的（典型原因：COPY 了 dist 但只拷了 index.html）
+          ASSET=$(grep -oE 'src="/[^"]+\.js"' /tmp/index.html | head -1 | sed 's/src="//; s/"$//')
+          if [ -z "$ASSET" ]; then
+            echo "::error::首页没有引用任何 JS 产物"
+            head -c 400 /tmp/index.html; echo
+            exit 1
+          fi
+          curl -fsS "http://127.0.0.1:18080${ASSET}" -o /tmp/app.js
+          echo "frontend OK: ${ASSET} ($(wc -c < /tmp/app.js) bytes)"
 
       - name: Container logs on failure
         if: failure()

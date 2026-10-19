@@ -200,10 +200,6 @@ class BangumiClient(
      * 校验放在写入前，非法直接拒绝（IllegalArgumentException → 400）。
      */
     fun setChannel(next: BgmChannelConfig): BgmChannelConfig {
-        // 换通道 = 换一批候选，旧的「记住的赢家」不再适用：清掉，下一轮重新竞速选出。
-        // （withFallback 里有 preferred in list 的兜底，这里显式清是为了语义清楚，
-        //  不让一个已经不属于任何通道的地址留在字段里）
-        preferredBase = null
         if (next.channel == BgmChannel.CUSTOM) {
             val urls = next.customUrls.map { it.trim().removeSuffix("/") }.filter { it.isNotBlank() }
             require(urls.isNotEmpty()) { "自定义通道至少需要一个 Bangumi API 地址" }
@@ -226,12 +222,18 @@ class BangumiClient(
                     }
             }
             val saved = next.copy(customUrls = urls)
+            // 校验通过才清「记住的赢家」：被拒的配置不该有任何副作用 ——
+            // 否则填错一次地址就把当前通道的缓存赢家也清了，下一次请求白跑一轮竞速
+            preferredBase = null
             channel = saved
             channelStore?.save(saved)
             return saved
         }
         // 非 CUSTOM 时把 customUrls 清空存盘，避免留下「看起来还配着」的困惑
         val saved = next.copy(customUrls = emptyList())
+        // 换通道 = 换一批候选，旧的赢家不再适用（withFallback 里还有 preferred in list
+        // 的兜底，这里显式清是为了不让一个已不属于任何通道的地址留在字段里）
+        preferredBase = null
         channel = saved
         channelStore?.save(saved)
         return saved
