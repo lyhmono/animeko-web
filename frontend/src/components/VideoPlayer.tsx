@@ -416,6 +416,11 @@ export default function VideoPlayer({
     lastTap: 0,
     seekBase: 0,
     lastTapLeft: false,
+    // 音量/亮度的**起始快照**：move 里必须从快照值加累计位移算，
+    // 不能从「上一帧更新后的值」减「从起点累计的位移」——那是双重重算，
+    // 音量会以两倍速跳、亮度会沿二次曲线爆掉（快照和 seekBase 一个道理）
+    startVolume: 1,
+    startBrightness: 1,
   })
 
   const applyBrightness = (level: number) => {
@@ -438,6 +443,8 @@ export default function VideoPlayer({
     g.mode = 'none'
     g.moved = false
     g.seekBase = videoRef.current?.currentTime ?? 0
+    g.startVolume = muted ? 0 : volume
+    g.startBrightness = brightnessRef.current
   }
 
   const onPointerMove = (e: ReactPointerEvent<HTMLVideoElement>) => {
@@ -461,11 +468,12 @@ export default function VideoPlayer({
       if (videoRef.current) videoRef.current.currentTime = target
       showToast({ kind: 'seek', text: `${formatTime(target)} / ${formatTime(duration)}`, level: duration ? target / duration : 0 })
     } else if (g.mode === 'brightness') {
-      const level = Math.round((brightnessRef.current - g.dy / 300) * 100) / 100
+      // 从起始快照算：上滑（dy<0）提亮，量程 300px 对应满幅
+      const level = Math.round((g.startBrightness - g.dy / 300) * 100) / 100
       applyBrightness(level)
       showToast({ kind: 'brightness', text: `亮度 ${Math.round(level * 100)}%`, level: Math.min(1, level / 1.5) })
     } else {
-      const next = Math.round((Math.max(0, muted ? 0 : volume) - g.dy / 300) * 100) / 100
+      const next = Math.round((g.startVolume - g.dy / 300) * 100) / 100
       setVolume(Math.min(1, Math.max(0, next)))
       setMuted(next <= 0)
       showToast({ kind: 'volume', text: `音量 ${Math.round(next * 100)}%`, level: next })
