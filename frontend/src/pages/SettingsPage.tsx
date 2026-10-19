@@ -4,6 +4,7 @@ import BangumiChannelCard from '../components/BangumiChannelCard'
 import {
   exportUserData,
   flushUserData,
+  isUserDataLoaded,
   getSyncState,
   importUserData,
   getTheme,
@@ -62,7 +63,13 @@ export default function SettingsPage() {
   }, [])
 
   const doExport = () => {
-    const text = exportUserData()
+    let text: string
+    try {
+      text = exportUserData()
+    } catch (e) {
+      setBackupMsg(`导出失败：${e instanceof Error ? e.message : '未知错误'}`)
+      return
+    }
     const blob = new Blob([text], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -76,6 +83,12 @@ export default function SettingsPage() {
 
   const doImport = async (file: File | undefined) => {
     if (!file) return
+    // 上限只是防呆：备份是纯文本，几千条收藏也就几百 KB。
+    // 没有上限时选错一个大文件会把主线程卡在 JSON.parse 上。
+    if (file.size > 10 * 1024 * 1024) {
+      setBackupMsg('导入失败：文件超过 10MB，多半不是备份文件')
+      return
+    }
     setBackupMsg('导入中…')
     try {
       const summary = importUserData(await file.text())
@@ -157,10 +170,18 @@ export default function SettingsPage() {
           所以选错文件也不会把现有数据冲掉。
         </div>
         <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 12 }}>
-          <button className="btn btn-secondary btn-sm" onClick={doExport}>
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={doExport}
+            disabled={!isUserDataLoaded()}
+            title={isUserDataLoaded() ? '' : '个人数据还没读到，先点页脚的「重新读取」'}
+          >
             导出备份
           </button>
-          <label className="btn btn-secondary btn-sm" style={{ cursor: 'pointer' }}>
+          <label
+            className="btn btn-secondary btn-sm"
+            style={{ cursor: isUserDataLoaded() ? 'pointer' : 'not-allowed', opacity: isUserDataLoaded() ? 1 : 0.5 }}
+          >
             导入备份
             <input
               type="file"

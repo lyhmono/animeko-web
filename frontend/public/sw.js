@@ -21,6 +21,13 @@
  *    立即接管会让「还开着的老页面」去请求已经被删掉的旧 chunk，
  *    正好制造第 3 条要避免的那种白屏。
  */
+/**
+ * 缓存版本。改动缓存策略时**手动**改这里，activate 会清掉所有旧版本缓存。
+ * 注意：assets 缓存会随部署累积（新部署产生新哈希文件名，旧文件不再被引用
+ * 但仍在缓存里，一次部署约 300KB）。这是刻意接受的取舍 —— 换来的是弱网下
+ * 二次打开直接命中本地，而清理需要解析 index.html 才知道哪些还在用，
+ * 复杂度和出错面都不划算。真需要腾空间时把这里 +1 即可全清。
+ */
 const VERSION = 'v1'
 const SHELL_CACHE = `animeko-shell-${VERSION}`
 const ASSET_CACHE = `animeko-assets-${VERSION}`
@@ -59,6 +66,9 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(req.url)
   if (url.origin !== self.location.origin) return
   if (url.pathname.startsWith('/api/')) return
+  // sw.js 自身不进缓存：浏览器的更新检查会绕过 SW，但页面里若有 fetch('/sw.js')
+  // 就会命中缓存拿到旧副本，一点好处都没有
+  if (url.pathname === '/sw.js') return
 
   if (req.mode === 'navigate') {
     event.respondWith(networkFirstNavigation(req))

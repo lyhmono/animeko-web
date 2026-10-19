@@ -711,8 +711,16 @@ export interface ImportSummary {
   recent: number
 }
 
+/** 个人数据是否已经从服务器读到。导出/导入都要看它，理由见下面两个函数的守卫。 */
+export function isUserDataLoaded(): boolean {
+  return loaded
+}
+
 /** 导出整份个人数据。格式化输出，便于人工查看与 diff。 */
 export function exportUserData(): string {
+  // 读取失败时应用仍可用（浏览与搜索不需要同步），但 doc 是空的。
+  // 此时导出的是一份 {}，用户却会以为备份成功 —— 那比不给备份更糟。
+  if (!loaded) throw new Error('个人数据还没从服务器读到，现在导出只会得到一份空备份')
   return JSON.stringify(doc, null, 2)
 }
 
@@ -734,6 +742,9 @@ function numOr(value: unknown, fallback: number): number {
  * 文件不合法时抛错，由调用方展示。
  */
 export function importUserData(text: string): ImportSummary {
+  // 未加载时写进去的改动既不会被推送（scheduleFlush 在 !loaded 时直接返回），
+  // 还会被随后一次成功的 loadUserData 整份覆盖 —— 而界面已经显示「已合并」。
+  if (!loaded) throw new Error('个人数据还没从服务器读到，现在导入会被随后的加载覆盖')
   let parsed: unknown
   try {
     parsed = JSON.parse(text)
