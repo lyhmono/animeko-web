@@ -78,7 +78,7 @@ export default function Layout() {
   return (
     <div className={`app${isPlayer ? ' app-player' : ''}`}>
       <nav className="nav">
-        <NavLink to="/" className="nav-logo">
+        <NavLink to="/" data-testid="nav-logo" className="nav-logo">
           <span className="dot" />
           Animeko Web
         </NavLink>
@@ -102,24 +102,24 @@ export default function Layout() {
         <div className="nav-links">
           {/* 分两组：桌面都排在顶栏；手机上 nav-tabs 变成底部 tab bar，
               nav-actions 留在顶栏。这样底部只有 5 个导航项，不会挤成一条。 */}
-          <div className="nav-tabs">
-            <NavLink to="/" end title="首页">
+          <div className="nav-tabs" data-testid="nav-tabs">
+            <NavLink to="/" end title="首页" data-testid="nav-home">
               <IconHome size={16} className="nav-icon" />
               <span className="nav-text">首页</span>
             </NavLink>
-            <NavLink to="/sources" title="数据源">
+            <NavLink to="/sources" data-testid="nav-sources" title="数据源">
               <IconLayers size={16} className="nav-icon" />
               <span className="nav-text">数据源</span>
             </NavLink>
-            <NavLink to="/discover" title="发现">
+            <NavLink to="/discover" data-testid="nav-discover" title="发现">
               <IconCompass size={16} className="nav-icon" />
               <span className="nav-text">发现</span>
             </NavLink>
-            <NavLink to="/favorites" title="收藏">
+            <NavLink to="/favorites" data-testid="nav-favorites" title="收藏">
               <IconHeart size={16} className="nav-icon" />
               <span className="nav-text">收藏</span>
             </NavLink>
-            <NavLink to="/settings" title="设置">
+            <NavLink to="/settings" data-testid="nav-settings" title="设置">
               <IconSettings size={16} className="nav-icon" />
               <span className="nav-text">设置</span>
             </NavLink>
@@ -144,7 +144,7 @@ export default function Layout() {
           </div>
         </div>
       </nav>
-      <main className="main">
+      <main className="main" data-testid="main">
         {/* 页面级错误边界：App 顶层那个会把导航一起替换掉，
             一个页面崩了用户就得整页刷新才能去别处。这层让崩溃只影响内容区。 */}
         <ErrorBoundary>

@@ -122,6 +122,24 @@ jobs:
           grep -q 'animeko-shell' /tmp/sw.js || { echo "::error::sw.js 内容不对"; exit 1; }
           echo "PWA assets OK"
 
+      - name: Playwright smoke (real browser)
+        # 复用上面那个还在跑的容器：镜像是同一个，不用重建。
+        # 这一层验的是「浏览器里真的渲染出来了」，前面几步做不到：
+        # 组件没挂载、类名写错、媒体查询失效时，静态资源全是 200。
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet -r e2e/requirements.txt
+          python3 -m playwright install --with-deps chromium
+          python3 e2e/smoke.py http://127.0.0.1:18080
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-screenshots
+          path: e2e/**/*.png
+          if-no-files-found: ignore
+
       - name: Container logs on failure
         if: failure()
         run: docker logs animeko-ci || true

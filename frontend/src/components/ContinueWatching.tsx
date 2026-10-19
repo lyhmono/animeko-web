@@ -33,7 +33,7 @@ export default function ContinueWatching() {
   if (items.length === 0) return null
 
   return (
-    <section className="continue">
+    <section className="continue" data-testid="continue-watching">
       <h2 className="section-title">
         <IconPlay size={17} />
         继续观看

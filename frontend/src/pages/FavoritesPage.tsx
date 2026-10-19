@@ -76,7 +76,7 @@ export default function FavoritesPage() {
         </div>
       ) : (
         <>
-          <div className="fav-tabs" role="tablist" aria-label="按追番状态筛选">
+          <div className="fav-tabs" role="tablist" aria-label="按追番状态筛选" data-testid="fav-tabs">
             <button
               className={`fav-tab${filter === 'all' ? ' active' : ''}`}
               onClick={() => setFilter('all')}

@@ -160,7 +160,7 @@ export default function SettingsPage() {
         )}
       </div>
 
-      <div className="settings-group card">
+      <div className="settings-group card" data-testid="backup-card">
         <h3>数据备份</h3>
         <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.8 }}>
           收藏、观看进度、搜索历史都只存在这台服务器上。<b>容器一删就没了</b>，
@@ -172,6 +172,7 @@ export default function SettingsPage() {
         <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 12 }}>
           <button
             className="btn btn-secondary btn-sm"
+            data-testid="backup-export"
             onClick={doExport}
             disabled={!isUserDataLoaded()}
             title={isUserDataLoaded() ? '' : '个人数据还没读到，先点页脚的「重新读取」'}

@@ -82,7 +82,7 @@ export default function AiringCalendar() {
     // 加载中先不占高度：服务端有 12 秒预算，但多数情况 1~3 秒就回来。
     // 给骨架是为了让首屏不空着，而骨架出现/消失都在同一个位置，不会推动下方内容。
     return (
-      <section className="airing">
+      <section className="airing" data-testid="airing-calendar">
         <div className="result-grid">
           {Array.from({ length: 6 }).map((_, i) => (
             <div className="skeleton-card" key={i}>
@@ -96,7 +96,7 @@ export default function AiringCalendar() {
   }
 
   return (
-    <section className="airing">
+    <section className="airing" data-testid="airing-calendar">
       <h2 className="section-title">
         每日放送
         <span className="count">Bangumi 放送表</span>
