@@ -229,25 +229,32 @@ class BangumiClient(
         // 不解析响应体，避免把「能连上」和「字段变了」混为一谈。
         val core = runCatching {
             fetcher.fetch("$base/v0/subjects/$PROBE_SUBJECT_ID", headers(), followRedirects = false).status
-        }.getOrNull()
-        val coreOk = core != null && core in 200..299
-        // 放送表探针：只在核心可用时才值得问（否则已经知道整体不通了）
-        val calendarStatus = if (!coreOk) {
+        }
+        val coreOk = core.getOrNull()?.let { it in 200..299 } == true
+        // 放送表探针：只在核心可用时才值得问（否则已经知道整体不通了）。
+        // 注意保留「没问到」（异常/超时）与「问了但 404」的区别：
+        // 前者是这个地址慢或抖，后者才是它真的没有这个端点。混成一个 null
+        // 会把超时报成「不提供每日放送」，方向就指错了。
+        val calendarProbe = if (!coreOk) {
             null
         } else {
             runCatching {
                 fetcher.fetch("$base/v0/calendar", headers(), followRedirects = false).status
-            }.getOrNull()
+            }
         }
+        val calendarStatus = calendarProbe?.getOrNull()
         val calendarOk = calendarStatus != null && calendarStatus in 200..299
         val elapsed = System.currentTimeMillis() - started
 
         val detail = when {
-            !coreOk && core == null -> "连接失败"
-            !coreOk -> "搜索端点返回 HTTP $core"
+            !coreOk && core.exceptionOrNull() != null ->
+                "连接失败：${core.exceptionOrNull()?.message?.take(60) ?: "网络错误"}"
+            !coreOk -> "搜索端点返回 HTTP ${core.getOrNull()}"
             calendarOk -> "可用（含每日放送）"
-            calendarStatus == 404 || calendarStatus == null -> "搜索可用，但不提供每日放送"
-            else -> "搜索可用；每日放送返回 HTTP $calendarStatus"
+            calendarStatus == 404 -> "搜索可用，但不提供每日放送"
+            calendarStatus != null -> "搜索可用；每日放送返回 HTTP $calendarStatus"
+            // 核心通、放送这次没问到：别断言「不支持」，如实说是探测失败
+            else -> "搜索可用；每日放送探测失败（超时或网络错误），可重试"
         }
         return BgmProbeResult(
             base = base,
