@@ -301,7 +301,11 @@ class BangumiClient(
         // 连接层静默丢包，实测 8 秒仍无响应）。给自己一个更短的预算：
         // 超时就放弃整块放送表 —— 首页的主体是搜索，不该被一个锦上添花的区块拖住。
         return withTimeoutOrNull(CALENDAR_BUDGET_MS) {
-            raceAll(candidates, rememberWinner = false) { base ->
+            // 注意不能写成 raceAll(candidates, rememberWinner = false) { … }：
+            // 具名实参之后不能再跟尾随 lambda，Kotlin 会把它当成传给下一个
+            // 形参的位置实参，于是报 "No value passed for parameter 'block'"。
+            // 显式传 lambda 就没有歧义了。
+            raceAll(candidates, block = { base ->
                 // 不能复用普通的 text()：它把 404 解释成「条目不存在」
                 // （那是 /v0/subjects/{id} 的语义）。放送表上的 404 只有一个含义 ——
                 // 这个地址没有该端点。分开处理，日志与前端提示才不会指错方向。
@@ -314,7 +318,7 @@ class BangumiClient(
                     else ->
                         throw UpstreamException("每日放送请求返回 HTTP ${result.status}（$base）")
                 }
-            }
+            }, rememberWinner = false)
         } ?: throw UpstreamException("每日放送获取超时（${CALENDAR_BUDGET_MS / 1000} 秒），可稍后刷新")
     }
 
