@@ -203,22 +203,25 @@ class BangumiClient(
         if (next.channel == BgmChannel.CUSTOM) {
             val urls = next.customUrls.map { it.trim().removeSuffix("/") }.filter { it.isNotBlank() }
             require(urls.isNotEmpty()) { "自定义通道至少需要一个 Bangumi API 地址" }
-            urls.forEach {
-                require(it.startsWith("http://") || it.startsWith("https://")) {
-                    "地址必须以 http/https 开头：$it"
+            // 形参必须显式命名成 url：下面 onFailure 的 lambda 参数是 Throwable
+            // 且默认名也叫 it，会**遮蔽**外层 forEach 的 it —— 之前写成 $it 时，
+            // 拼进错误消息的是 Blocked 异常原文（含「主机名 -> 内网 IP」映射），
+            // 等于把想藏起来的拓扑信息直接回给了客户端。
+            urls.forEach { url ->
+                require(url.startsWith("http://") || url.startsWith("https://")) {
+                    "地址必须以 http/https 开头：$url"
                 }
-                val uri = runCatching { java.net.URI(it) }.getOrNull()
-                    ?: throw IllegalArgumentException("地址不合法：$it")
-                require(uri.host != null) { "地址无法解析出主机名：$it" }
+                val uri = runCatching { java.net.URI(url) }.getOrNull()
+                    ?: throw IllegalArgumentException("地址不合法：$url")
+                require(uri.host != null) { "地址无法解析出主机名：$url" }
                 // 内网/保留地址一律拒绝：这个地址会被服务端拿去发请求，
                 // 不拦就等于给了任何能打开设置页的人一个 SSRF 跳板
                 // （默认部署 ANIMEKO_AUTH_ENABLED 是关的）。
-                runCatching { UrlGuard.requireAllowed("$it/v0/calendar", allowPrivateTargets) }
+                runCatching { UrlGuard.requireAllowed("$url/v0/calendar", allowPrivateTargets) }
                     .onFailure {
-                        // 不能把 Blocked 的原文透出去：它带着「主机名 -> 内网 IP」的映射，
-                        // 对任何能打开设置页的人都是网络拓扑泄露（Main.kt 里 Blocked
-                        // 的 StatusPages 处理也是只记日志、只回一句通用原因）
-                        throw IllegalArgumentException("地址不被允许：$it（仅支持公网 http/https 地址）")
+                        // 只回一句通用原因，不透出 Blocked 原文（Main.kt 里 Blocked 的
+                        // StatusPages 处理也是只记日志、只回通用文案）
+                        throw IllegalArgumentException("地址不被允许：$url（仅支持公网 http/https 地址）")
                     }
             }
             val saved = next.copy(customUrls = urls)
