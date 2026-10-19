@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
+import ErrorBoundary from './ErrorBoundary'
 import {
   getSyncState,
   onSyncChange,
@@ -136,7 +137,11 @@ export default function Layout() {
         </div>
       </nav>
       <main className="main">
-        <Outlet />
+        {/* 页面级错误边界：App 顶层那个会把导航一起替换掉，
+            一个页面崩了用户就得整页刷新才能去别处。这层让崩溃只影响内容区。 */}
+        <ErrorBoundary>
+          <Outlet />
+        </ErrorBoundary>
       </main>
       <footer className="footer">
         <span className="footer-left">
