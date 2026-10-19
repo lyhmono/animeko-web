@@ -100,30 +100,6 @@ export default function Layout() {
           />
         </form>
         <div className="nav-links">
-          {/* 分两组：桌面都排在顶栏；手机上 nav-tabs 变成底部 tab bar，
-              nav-actions 留在顶栏。这样底部只有 5 个导航项，不会挤成一条。 */}
-          <div className="nav-tabs" data-testid="nav-tabs">
-            <NavLink to="/" end title="首页" data-testid="nav-home">
-              <IconHome size={16} className="nav-icon" />
-              <span className="nav-text">首页</span>
-            </NavLink>
-            <NavLink to="/sources" data-testid="nav-sources" title="数据源">
-              <IconLayers size={16} className="nav-icon" />
-              <span className="nav-text">数据源</span>
-            </NavLink>
-            <NavLink to="/discover" data-testid="nav-discover" title="发现">
-              <IconCompass size={16} className="nav-icon" />
-              <span className="nav-text">发现</span>
-            </NavLink>
-            <NavLink to="/favorites" data-testid="nav-favorites" title="收藏">
-              <IconHeart size={16} className="nav-icon" />
-              <span className="nav-text">收藏</span>
-            </NavLink>
-            <NavLink to="/settings" data-testid="nav-settings" title="设置">
-              <IconSettings size={16} className="nav-icon" />
-              <span className="nav-text">设置</span>
-            </NavLink>
-          </div>
           <div className="nav-actions">
           <button
             className="theme-toggle"
@@ -144,6 +120,39 @@ export default function Layout() {
           </div>
         </div>
       </nav>
+
+      {/*
+        导航项必须放在 <nav> **外面**。桌面端它们由 .nav-tabs 的 flex 布局排在顶栏；
+        手机端它们变成 position: fixed 的底部 tab。
+        之所以不能留在 <nav> 里：.nav 有 backdrop-filter，而 backdrop-filter
+        （和 transform / filter / will-change 一样）会让该元素成为其内部
+        position: fixed 后代的**包含块** —— fixed 就不再相对视口，而是相对
+        这根顶栏定位，实测底栏跑到 y=97 压在顶栏下面。
+        只有移出这个祖先，fixed 才真的是相对视口。
+      */}
+      <div className="nav-tabs" data-testid="nav-tabs">
+        <NavLink to="/" end title="首页" data-testid="nav-home">
+          <IconHome size={16} className="nav-icon" />
+          <span className="nav-text">首页</span>
+        </NavLink>
+        <NavLink to="/sources" data-testid="nav-sources" title="数据源">
+          <IconLayers size={16} className="nav-icon" />
+          <span className="nav-text">数据源</span>
+        </NavLink>
+        <NavLink to="/discover" data-testid="nav-discover" title="发现">
+          <IconCompass size={16} className="nav-icon" />
+          <span className="nav-text">发现</span>
+        </NavLink>
+        <NavLink to="/favorites" data-testid="nav-favorites" title="收藏">
+          <IconHeart size={16} className="nav-icon" />
+          <span className="nav-text">收藏</span>
+        </NavLink>
+        <NavLink to="/settings" data-testid="nav-settings" title="设置">
+          <IconSettings size={16} className="nav-icon" />
+          <span className="nav-text">设置</span>
+        </NavLink>
+      </div>
+
       <main className="main" data-testid="main">
         {/* 页面级错误边界：App 顶层那个会把导航一起替换掉，
             一个页面崩了用户就得整页刷新才能去别处。这层让崩溃只影响内容区。 */}

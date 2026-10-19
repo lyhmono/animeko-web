@@ -177,6 +177,8 @@ textarea::placeholder {
    ============================================================ */
 
 .app {
+  /* nav-tabs 用 absolute 定位回顶栏（桌面端），它需要一个定位参照 */
+  position: relative;
   /* dvh 跟随移动端浏览器地址栏收放；不支持的旧浏览器回退 vh */
   min-height: 100vh;
   min-height: 100dvh;
@@ -217,13 +219,22 @@ textarea::placeholder {
   box-shadow: 0 0 10px var(--accent);
 }
 
-.nav-links {
+/*
+ * nav-tabs 是 .app 的直接子元素（原因见 Layout.tsx 里的注释：.nav 的
+ * backdrop-filter 会成为 fixed 后代的包含块）。桌面端这里用手动定位把它
+ * 摆回顶栏：右边缘留出两个 36px 按钮 + 间距（= 96px），垂直居中于 56px 顶栏。
+ */
+.nav-tabs {
+  position: absolute;
+  top: 10px;
+  right: 96px;
   display: flex;
-  gap: 2px;
-  margin-left: auto;
   align-items: center;
+  gap: 2px;
+  z-index: 101;
 }
 
+.nav-tabs a,
 .nav-links a {
   padding: 7px 13px;
   border-radius: var(--radius-sm);
@@ -235,22 +246,23 @@ textarea::placeholder {
   gap: 6px;
 }
 
+.nav-tabs a:hover,
 .nav-links a:hover {
   color: var(--text);
   background: var(--bg-hover);
 }
 
+.nav-tabs a.active,
 .nav-links a.active {
   color: var(--accent);
   background: var(--accent-dim);
 }
 
+.nav-tabs .nav-icon,
 .nav-links .nav-icon {
   display: none;
 }
 
-/* 两组：导航项与操作按钮。桌面都排在顶栏里，间距与原来一致。 */
-.nav-tabs,
 .nav-actions {
   display: flex;
   align-items: center;
@@ -261,12 +273,12 @@ textarea::placeholder {
   /* 手机：导航项下沉成底部 tab bar，操作按钮留在顶栏。
      理由：5 个图标挤在顶栏里点按目标只有 16px，还和搜索框抢空间；
      底部 tab 是手机上唯一不需要"够"的位置。 */
-  .nav-links .nav-icon {
+  .nav-tabs .nav-icon {
     display: inline-flex;
   }
 
   /* 底部 tab 需要文字：纯图标在底部反而更难认 */
-  .nav-links .nav-tabs .nav-text {
+  .nav-tabs .nav-text {
     display: inline;
   }
 
@@ -300,11 +312,6 @@ textarea::placeholder {
   .nav-tabs a:hover,
   .nav-tabs a.active {
     background: transparent;
-  }
-
-  /* 内容与页脚都要给固定底栏让出高度，否则最后一屏内容被压住 */
-  .main {
-    padding-bottom: calc(80px + env(safe-area-inset-bottom));
   }
 
   .footer {
@@ -2806,5 +2813,25 @@ select:hover:not(:focus) {
 
   .nav-logo {
     flex: 1 1 auto;
+  }
+}
+
+/* ---- 手机端为固定底栏让出高度 ----
+   必须放在文件末尾：.main / .footer 的基础规则在这个文件里更靠后，
+   写在前面会被同优先级的基础规则覆盖（这正是第一版 80px 没生效的原因，
+   E2E 量出来 main 的 padding-bottom 只有 48px）。 */
+@media (max-width: 720px) {
+  .main {
+    padding-bottom: calc(80px + env(safe-area-inset-bottom));
+  }
+
+  .footer {
+    padding-bottom: calc(72px + env(safe-area-inset-bottom));
+  }
+
+  /* 播放页底栏已隐藏，不需要再让高度 */
+  .app-player .main,
+  .app-player .footer {
+    padding-bottom: 0;
   }
 }
