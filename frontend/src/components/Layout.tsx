@@ -44,6 +44,8 @@ export default function Layout() {
   const location = useLocation()
   // 顶栏搜索框：之前搜索框只在首页，进到 /search 之后想换个关键词必须回首页，
   // 而浏览器地址栏里就是搜索结果 —— 实测用户会以为「不能改搜索词」。
+  // 播放页要隐藏手机端的底部 tab：它固定在视口底部，会正好压住进度条与手势区
+  const isPlayer = location.pathname === '/play'
   const [term, setTerm] = useState(() => new URLSearchParams(location.search).get('q') ?? '')
   useEffect(() => {
     setTerm(new URLSearchParams(location.search).get('q') ?? '')
@@ -74,7 +76,7 @@ export default function Layout() {
   }
 
   return (
-    <div className="app">
+    <div className={`app${isPlayer ? ' app-player' : ''}`}>
       <nav className="nav">
         <NavLink to="/" className="nav-logo">
           <span className="dot" />
@@ -98,26 +100,31 @@ export default function Layout() {
           />
         </form>
         <div className="nav-links">
-          <NavLink to="/" end title="首页">
-            <IconHome size={16} className="nav-icon" />
-            <span className="nav-text">首页</span>
-          </NavLink>
-          <NavLink to="/sources" title="数据源">
-            <IconLayers size={16} className="nav-icon" />
-            <span className="nav-text">数据源</span>
-          </NavLink>
-          <NavLink to="/discover" title="发现">
-            <IconCompass size={16} className="nav-icon" />
-            <span className="nav-text">发现</span>
-          </NavLink>
-          <NavLink to="/favorites" title="收藏">
-            <IconHeart size={16} className="nav-icon" />
-            <span className="nav-text">收藏</span>
-          </NavLink>
-          <NavLink to="/settings" title="设置">
-            <IconSettings size={16} className="nav-icon" />
-            <span className="nav-text">设置</span>
-          </NavLink>
+          {/* 分两组：桌面都排在顶栏；手机上 nav-tabs 变成底部 tab bar，
+              nav-actions 留在顶栏。这样底部只有 5 个导航项，不会挤成一条。 */}
+          <div className="nav-tabs">
+            <NavLink to="/" end title="首页">
+              <IconHome size={16} className="nav-icon" />
+              <span className="nav-text">首页</span>
+            </NavLink>
+            <NavLink to="/sources" title="数据源">
+              <IconLayers size={16} className="nav-icon" />
+              <span className="nav-text">数据源</span>
+            </NavLink>
+            <NavLink to="/discover" title="发现">
+              <IconCompass size={16} className="nav-icon" />
+              <span className="nav-text">发现</span>
+            </NavLink>
+            <NavLink to="/favorites" title="收藏">
+              <IconHeart size={16} className="nav-icon" />
+              <span className="nav-text">收藏</span>
+            </NavLink>
+            <NavLink to="/settings" title="设置">
+              <IconSettings size={16} className="nav-icon" />
+              <span className="nav-text">设置</span>
+            </NavLink>
+          </div>
+          <div className="nav-actions">
           <button
             className="theme-toggle"
             onClick={toggleTheme}
@@ -134,6 +141,7 @@ export default function Layout() {
           >
             <IconLogout size={17} />
           </button>
+          </div>
         </div>
       </nav>
       <main className="main">

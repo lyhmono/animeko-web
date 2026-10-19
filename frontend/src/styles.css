@@ -249,13 +249,76 @@ textarea::placeholder {
   display: none;
 }
 
+/* 两组：导航项与操作按钮。桌面都排在顶栏里，间距与原来一致。 */
+.nav-tabs,
+.nav-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
 @media (max-width: 720px) {
+  /* 手机：导航项下沉成底部 tab bar，操作按钮留在顶栏。
+     理由：5 个图标挤在顶栏里点按目标只有 16px，还和搜索框抢空间；
+     底部 tab 是手机上唯一不需要"够"的位置。 */
   .nav-links .nav-icon {
     display: inline-flex;
   }
 
-  .nav-links .nav-text {
+  /* 底部 tab 需要文字：纯图标在底部反而更难认 */
+  .nav-links .nav-tabs .nav-text {
+    display: inline;
+  }
+
+  .nav-tabs {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 90;
+    justify-content: space-around;
+    gap: 0;
+    /* env(safe-area-inset-bottom)：iPhone 手势条 / 刘海屏底部安全区，
+       不加的话 tab 会被系统手势区盖住一半 */
+    padding: 4px 4px calc(4px + env(safe-area-inset-bottom));
+    background: var(--nav-bg);
+    backdrop-filter: blur(14px) saturate(1.4);
+    border-top: 1px solid var(--border);
+  }
+
+  .nav-tabs a {
+    flex: 1;
+    flex-direction: column;
+    gap: 3px;
+    padding: 7px 2px;
+    font-size: 10.5px;
+    border-radius: var(--radius-sm);
+    /* 底部 tab 不用色块表示选中（会像按钮），靠颜色区分 */
+    background: transparent;
+  }
+
+  .nav-tabs a:hover,
+  .nav-tabs a.active {
+    background: transparent;
+  }
+
+  /* 内容与页脚都要给固定底栏让出高度，否则最后一屏内容被压住 */
+  .main {
+    padding-bottom: calc(80px + env(safe-area-inset-bottom));
+  }
+
+  .footer {
+    padding-bottom: calc(72px + env(safe-area-inset-bottom));
+  }
+
+  /* 播放页：底栏会压住进度条与手势区，整条隐藏并撤掉内容避让 */
+  .app-player .nav-tabs {
     display: none;
+  }
+
+  .app-player .main,
+  .app-player .footer {
+    padding-bottom: 0;
   }
 }
 

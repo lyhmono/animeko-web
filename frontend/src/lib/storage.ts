@@ -496,6 +496,27 @@ export interface FavoriteSubject {
   status: FavStatus
 }
 
+/**
+ * 单条收藏的归一化。抽成独立函数是因为它有两个调用方：
+ * 读文档（listFavorites）与导入备份（importUserData）——
+ * 备份文件同样可能来自旧版本或被手工改过，两边必须用同一套规则。
+ */
+function toFavorite(raw: unknown): FavoriteSubject | null {
+  const f = raw as Partial<FavoriteSubject> | null
+  if (!f || typeof f.id !== 'number') return null
+  return {
+    id: f.id,
+    name: String(f.name ?? ''),
+    name_cn: String(f.name_cn ?? ''),
+    cover: String(f.cover ?? ''),
+    date: String(f.date ?? ''),
+    score: typeof f.score === 'number' ? f.score : null,
+    ts: typeof f.ts === 'number' ? f.ts : 0,
+    // 未知值一律落到「想看」：宁可归错一档，也不让一条收藏因为脏字段从列表里消失
+    status: isFavStatus(f.status) ? f.status : 'wish',
+  }
+}
+
 export function listFavorites(): FavoriteSubject[] {
   const list = readJson<FavoriteSubject[]>('favorites', [])
   if (!Array.isArray(list)) return []
@@ -503,18 +524,8 @@ export function listFavorites(): FavoriteSubject[] {
   // 只校验 id 的话，score 是字符串就会让 FavoritesPage 抛 toFixed is not a function，
   // 而唯一的错误边界在 <Routes> 之上，于是整站变成错误页。
   return list
-    .filter((f) => f && typeof f.id === 'number')
-    .map((f) => ({
-      id: f.id,
-      name: String(f.name ?? ''),
-      name_cn: String(f.name_cn ?? ''),
-      cover: String(f.cover ?? ''),
-      date: String(f.date ?? ''),
-      score: typeof f.score === 'number' ? f.score : null,
-      ts: typeof f.ts === 'number' ? f.ts : 0,
-      // 未知值一律落到「想看」：宁可归错一档，也不让一条收藏因为脏字段从列表里消失
-      status: isFavStatus(f.status) ? f.status : 'wish',
-    }))
+    .map(toFavorite)
+    .filter((f): f is FavoriteSubject => f !== null)
     .sort((a, b) => b.ts - a.ts)
 }
 
@@ -688,4 +699,146 @@ export function markUserDataStale(): void {
   doc = {}
   baseEtag = ''
   setSync({  status: 'ready', kind: null, error: ''  })
+}
+
+// ---------- 备份导出 / 导入 ----------
+
+export interface ImportSummary {
+  favorites: number
+  subjectProgress: number
+  progress: number
+  searchHistory: number
+  recent: number
+}
+
+/** 导出整份个人数据。格式化输出，便于人工查看与 diff。 */
+export function exportUserData(): string {
+  return JSON.stringify(doc, null, 2)
+}
+
+function numOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+}
+
+/**
+ * 导入备份。语义是**合并**而不是覆盖，理由：覆盖一旦选错文件就是不可逆的数据丢失，
+ * 而合并最坏情况只是「多了几条本来就在的」。
+ *
+ * 各类数据的合并规则：
+ *  - 收藏：按 Bangumi id 去重，同 id 保留**本地**版本（本地可能刚改过状态）
+ *  - 条目进度：取更大的集号（进度只前进不后退）
+ *  - 每集进度：按 (源, 播放地址) 取 ts 更新的一条
+ *  - 搜索历史 / 最近观看：并集去重，仍受各自上限约束
+ *
+ * 返回各类实际新增的条数，UI 用来说明「带进来了什么」。
+ * 文件不合法时抛错，由调用方展示。
+ */
+export function importUserData(text: string): ImportSummary {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new Error('不是合法的 JSON 文件')
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('备份文件格式不对：顶层应该是一个对象')
+  }
+  const incoming = parsed as Record<string, unknown>
+  const summary: ImportSummary = {
+    favorites: 0,
+    subjectProgress: 0,
+    progress: 0,
+    searchHistory: 0,
+    recent: 0,
+  }
+
+  if (Array.isArray(incoming.favorites)) {
+    const local = listFavorites()
+    const ids = new Set(local.map((f) => f.id))
+    const added: FavoriteSubject[] = []
+    for (const raw of incoming.favorites) {
+      const fav = toFavorite(raw)
+      if (!fav || ids.has(fav.id)) continue
+      ids.add(fav.id)
+      added.push(fav)
+    }
+    if (added.length > 0) {
+      writeJson('favorites', [...added, ...local])
+      summary.favorites = added.length
+    }
+  }
+
+  if (incoming.subjectProgress && typeof incoming.subjectProgress === 'object' && !Array.isArray(incoming.subjectProgress)) {
+    const local = asMap(readJson<Record<string, unknown>>('subjectProgress', {}))
+    const merged: Record<string, unknown> = { ...local }
+    for (const [id, raw] of Object.entries(incoming.subjectProgress as Record<string, unknown>)) {
+      const ep = numOr(asMap(raw).ep, 0)
+      if (!(ep > 0)) continue
+      if (ep <= numOr(asMap(merged[id]).ep, 0)) continue
+      merged[id] = { ep, ts: numOr(asMap(raw).ts, Date.now()) }
+      summary.subjectProgress += 1
+    }
+    if (summary.subjectProgress > 0) writeJson('subjectProgress', merged)
+  }
+
+  if (incoming.progress && typeof incoming.progress === 'object' && !Array.isArray(incoming.progress)) {
+    const merged: Record<string, unknown> = { ...progressMap() }
+    for (const [key, raw] of Object.entries(incoming.progress as Record<string, unknown>)) {
+      const entry = asMap(raw)
+      const time = numOr(entry.time, 0)
+      if (!(time > 0)) continue
+      // 同一个播放地址上，取进度更新的一条
+      if (numOr(entry.ts, 0) <= numOr(asMap(merged[key]).ts, -1)) continue
+      merged[key] = entry
+      summary.progress += 1
+    }
+    if (summary.progress > 0) {
+      doc.progress = merged
+      // 批量导入要把每个条目都记进待写集合：冲突合并时按 progressKeys 判断
+      // 「哪些是我改的」，漏记会导致这次导入在 409 重试时被服务端版本盖掉
+      for (const key of Object.keys(merged)) pendingProgressKeys.add(key)
+      scheduleFlush('progress')
+    }
+  }
+
+  if (Array.isArray(incoming.searchHistory)) {
+    const merged = [...listSearchHistory()]
+    for (const raw of incoming.searchHistory) {
+      if (typeof raw !== 'string') continue
+      const keyword = raw.trim()
+      if (!keyword || merged.includes(keyword)) continue
+      merged.push(keyword)
+      summary.searchHistory += 1
+    }
+    if (summary.searchHistory > 0) writeJson('searchHistory', merged.slice(0, HISTORY_LIMIT))
+  }
+
+  if (Array.isArray(incoming.recent)) {
+    const local = listRecent(999)
+    const keyOf = (r: RecentItem) => `${r.source}:${r.playUrl}`
+    const seen = new Set(local.map(keyOf))
+    const merged = [...local]
+    for (const raw of incoming.recent) {
+      const r = raw as Partial<RecentItem> | null
+      if (!r || typeof r.playUrl !== 'string' || !r.playUrl.startsWith('http')) continue
+      const item: RecentItem = {
+        source: String(r.source ?? ''),
+        playUrl: r.playUrl,
+        title: String(r.title ?? ''),
+        anime: String(r.anime ?? ''),
+        ep: String(r.ep ?? ''),
+        ts: numOr(r.ts, 0),
+      }
+      if (seen.has(keyOf(item))) continue
+      seen.add(keyOf(item))
+      merged.push(item)
+      summary.recent += 1
+    }
+    if (summary.recent > 0) {
+      merged.sort((a, b) => b.ts - a.ts)
+      writeJson('recent', merged.slice(0, RECENT_LIMIT))
+    }
+  }
+
+  return summary
 }

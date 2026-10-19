@@ -20,6 +20,7 @@ import com.animeko.web.selector.SelectorRepository
 import com.animeko.web.selector.SelectorSourceArguments
 import com.animeko.web.selector.SubscriptionService
 import io.ktor.http.ContentType
+import io.ktor.http.content.LocalFileContent
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
@@ -545,10 +546,20 @@ fun Application.configureStaticFrontend(cfg: AppConfig) {
                         rel.startsWith("assets/") ->
                             call.response.header(HttpHeaders.CacheControl, "public, max-age=31536000, immutable")
                         // 入口文档（含直接访问 /index.html）必须每次回源：
-                        // 缓存住它就等于缓存住一批重新部署后已不存在的 chunk 文件名
-                        file == index -> call.response.header(HttpHeaders.CacheControl, "no-cache")
+                        // 缓存住它就等于缓存住一批重新部署后已不存在的 chunk 文件名。
+                        // sw.js 同理、且更要紧：浏览器发现 SW 文件有变化才会装新版本，
+                        // 而它判断依据是响应本身 —— 缓存住就等于让更新永远装不上。
+                        // manifest 一起带上，改图标/改名后要能立刻生效。
+                        file == index || rel == "sw.js" || rel == "manifest.webmanifest" ->
+                            call.response.header(HttpHeaders.CacheControl, "no-cache")
                     }
-                    call.respondFile(file)
+                    if (rel == "manifest.webmanifest") {
+                        // Ktor 的扩展名映射不认识 .webmanifest，会落到 octet-stream，
+                        // 部分浏览器会因此直接忽略这份 manifest。显式给正确类型。
+                        call.respond(LocalFileContent(file, ContentType.parse("application/manifest+json")))
+                    } else {
+                        call.respondFile(file)
+                    }
                 }
                 // 缺失的静态资源必须 404，不能回退 index.html：
                 // 那等于把 HTML 当 JS/CSS 返回（200 + text/html），浏览器报模块 MIME 错误；

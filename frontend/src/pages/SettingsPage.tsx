@@ -2,8 +2,10 @@ import { useEffect, useState } from 'react'
 import { api, errMsg } from '../api'
 import BangumiChannelCard from '../components/BangumiChannelCard'
 import {
+  exportUserData,
   flushUserData,
   getSyncState,
+  importUserData,
   getTheme,
   onSyncChange,
   setTheme,
@@ -22,6 +24,8 @@ export default function SettingsPage() {
   const [theme, setThemeState] = useState<Theme>(getTheme)
   const [sync, setSync] = useState<SyncState>(getSyncState)
   const [saving, setSaving] = useState(false)
+  /** 备份/恢复的结果提示（成功与失败共用一条，避免两套状态） */
+  const [backupMsg, setBackupMsg] = useState('')
 
   useEffect(() => onSyncChange(setSync), [])
 
@@ -56,6 +60,39 @@ export default function SettingsPage() {
     window.addEventListener('animeko-theme-change', onThemeChange)
     return () => window.removeEventListener('animeko-theme-change', onThemeChange)
   }, [])
+
+  const doExport = () => {
+    const text = exportUserData()
+    const blob = new Blob([text], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `animeko-backup-${new Date().toISOString().slice(0, 10)}.json`
+    a.click()
+    // 立刻 revoke 会让部分浏览器来不及取数据，延后一拍再释放
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+    setBackupMsg(`已导出 ${(text.length / 1024).toFixed(1)} KB`)
+  }
+
+  const doImport = async (file: File | undefined) => {
+    if (!file) return
+    setBackupMsg('导入中…')
+    try {
+      const summary = importUserData(await file.text())
+      // 立刻推给服务器：去抖那 400ms 里关掉页面就等于没导入
+      await flushUserData()
+      const parts = [
+        summary.favorites > 0 ? `收藏 ${summary.favorites} 部` : '',
+        summary.subjectProgress > 0 ? `条目进度 ${summary.subjectProgress} 条` : '',
+        summary.progress > 0 ? `播放进度 ${summary.progress} 条` : '',
+        summary.searchHistory > 0 ? `搜索历史 ${summary.searchHistory} 条` : '',
+        summary.recent > 0 ? `最近观看 ${summary.recent} 条` : '',
+      ].filter(Boolean)
+      setBackupMsg(parts.length > 0 ? `已合并：${parts.join('、')}` : '备份里没有比本地更新的数据')
+    } catch (e) {
+      setBackupMsg(`导入失败：${e instanceof Error ? e.message : '未知错误'}`)
+    }
+  }
 
   const applyTheme = (t: Theme) => {
     setTheme(t)
@@ -106,6 +143,47 @@ export default function SettingsPage() {
             登录未启用：任何能连到这台机器的人都能读取你的数据源与个人数据。
             设置 <code>ANIMEKO_AUTH_USER</code> 与 <code>ANIMEKO_AUTH_PASSWORD</code>（或
             <code>ANIMEKO_AUTH_TOKEN</code>）后重启即可启用登录页。
+          </div>
+        )}
+      </div>
+
+      <div className="settings-group card">
+        <h3>数据备份</h3>
+        <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.8 }}>
+          收藏、观看进度、搜索历史都只存在这台服务器上。<b>容器一删就没了</b>，
+          建议偶尔导出一份放到别处。
+          <br />
+          导入是<b>合并</b>而不是覆盖：按 id / 播放地址去重，同一条保留本地版本，
+          所以选错文件也不会把现有数据冲掉。
+        </div>
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 12 }}>
+          <button className="btn btn-secondary btn-sm" onClick={doExport}>
+            导出备份
+          </button>
+          <label className="btn btn-secondary btn-sm" style={{ cursor: 'pointer' }}>
+            导入备份
+            <input
+              type="file"
+              accept=".json,application/json"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                // 先取出文件再清空 value：不清的话选同一个文件第二次不触发 change
+                const file = e.target.files?.[0]
+                e.target.value = ''
+                void doImport(file)
+              }}
+            />
+          </label>
+        </div>
+        {backupMsg && (
+          <div
+            style={{
+              marginTop: 10,
+              fontSize: 12,
+              color: backupMsg.startsWith('导入失败') ? 'var(--danger)' : 'var(--success)',
+            }}
+          >
+            {backupMsg}
           </div>
         )}
       </div>
