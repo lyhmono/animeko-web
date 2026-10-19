@@ -23,7 +23,9 @@ export default function AiringCalendar() {
   const [selected, setSelected] = useState<number>(-1)
   /** 只看已收藏：放送表的真正价值是「我追的今天更新了吗」，不是资讯墙 */
   const [onlyFav, setOnlyFav] = useState(false)
-  const [favIds, setFavIds] = useState<Set<number>>(() => favoriteIdSet())
+  // 只取值：收藏在本页不会被修改（改收藏去条目页），所以不需要 setter。
+  // 每次进首页组件都会重新挂载，这里读到的就是最新收藏。
+  const [favIds] = useState<Set<number>>(() => favoriteIdSet())
 
   useEffect(() => {
     const ctrl = new AbortController()
