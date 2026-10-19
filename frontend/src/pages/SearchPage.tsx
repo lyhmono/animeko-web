@@ -4,13 +4,32 @@ import Poster from '../components/Poster'
 import { api, errMsg } from '../api'
 import type { BgmSubject, StoredSource, SubjectHit } from '../types'
 import { addSearchHistory, favoriteIdSet } from '../lib/storage'
-import { IconHeartFilled } from '../lib/icons'
+import { IconHeartFilled, IconRefresh } from '../lib/icons'
 
 /**
  * 同时向多少个数据源发搜索请求。浏览器对同一来源只有 6 条连接，
  * 全占满之后连 /api/health 都要排队等超时（实测会让整个应用卡在启动页）。
  */
 const SOURCE_SEARCH_CONCURRENCY = 3
+
+/**
+ * 最近搜索的结果记忆。
+ *
+ * 从条目页返回搜索页时 URL 里带着 q，组件重新挂载、effect 重跑 ——
+ * 19 个源要全部重搜一遍：骨架屏重新亮起、刚看过的结果全部丢弃，
+ * 用户的感知就是「返回后又要重新搜索」。搜索结果不会秒变（番剧条目与
+ * 源站索引都是小时级变化），缓存到本次会话结束完全足够。
+ * 嫌旧就点标题旁的刷新按钮，那会跳过缓存重新拉。
+ */
+interface SearchSnapshot {
+  bgm: BgmSubject[]
+  sourceHits: Record<string, SubjectHit[]>
+  sourceErrors: Record<string, string>
+  /** 回填时用到的源名单（停用/新增后可能变化，一并记住供渲染） */
+  sourceNames: { name: string; enabled: boolean }[]
+}
+const searchCache = new Map<string, SearchSnapshot>()
+const CACHE_LIMIT = 10
 
 export default function SearchPage() {
   const [params] = useSearchParams()
@@ -23,6 +42,8 @@ export default function SearchPage() {
   const [sourceErrors, setSourceErrors] = useState<Record<string, string>>({})
   const [sourcesLoading, setSourcesLoading] = useState(!!q)
   const [favIds, setFavIds] = useState<Set<number>>(() => favoriteIdSet())
+  /** 手动刷新用：自增即强制跳过缓存重新搜索（见下方 effect 开头） */
+  const [nonce, setNonce] = useState(0)
 
   useEffect(() => {
     // cancelled 守卫：快速连续搜索时丢弃过期响应，避免旧结果覆盖新结果
@@ -41,6 +62,23 @@ export default function SearchPage() {
       setSourcesLoading(false)
       return
     }
+    // 缓存命中（典型路径：条目页 → 返回）：直接恢复上一轮的结果，
+    // 一个请求都不发。骨架屏不重来、已看到的源结果原样还在。
+    const cached = nonce === 0 ? searchCache.get(q) : undefined
+    if (cached) {
+      setBgm(cached.bgm)
+      setBgmError('')
+      setSourceHits(cached.sourceHits)
+      setSourceErrors(cached.sourceErrors)
+      setSources(
+        cached.sourceNames
+          .filter((s) => s.enabled)
+          .map((s) => ({ factoryId: 'web-selector', version: 2, enabled: true, arguments: { name: s.name } } as unknown as StoredSource)),
+      )
+      setBgmLoading(false)
+      setSourcesLoading(false)
+      return
+    }
     addSearchHistory(q)
     setFavIds(favoriteIdSet())
     // 每次搜索都重置错误与上一轮结果，避免旧结果/旧错误残留
@@ -51,10 +89,28 @@ export default function SearchPage() {
     setSourceErrors({})
     setBgmLoading(true)
     setSourcesLoading(true)
+    // effect 内的累加器：setState 的 functional update 拿不到最终值，
+    // 而缓存快照必须在「全部 worker 都回来」那一刻写入，所以本地镜像一份
+    let bgmSnapshot: BgmSubject[] = []
+    let hitsAcc: Record<string, SubjectHit[]> = {}
+    let errorsAcc: Record<string, string> = {}
+    let namesAcc: { name: string; enabled: boolean }[] = []
+    const remember = () => {
+      if (cancelled) return
+      searchCache.set(q, { bgm: bgmSnapshot, sourceHits: hitsAcc, sourceErrors: errorsAcc, sourceNames: namesAcc })
+      // 容量淘汰：搜太多个旧词之后把最旧的丢掉，别让这份缓存跟着会话无限长
+      if (searchCache.size > CACHE_LIMIT) {
+        const oldest = searchCache.keys().next().value
+        if (oldest !== undefined && oldest !== q) searchCache.delete(oldest)
+      }
+    }
     api
       .searchBangumi(q, ctrl.signal)
       .then((r) => {
-        if (!cancelled) setBgm(r)
+        if (!cancelled) {
+          bgmSnapshot = r
+          setBgm(r)
+        }
       })
       .catch((e) => {
         if (!cancelled) setBgmError(errMsg(e))
@@ -68,6 +124,7 @@ export default function SearchPage() {
       .then(async (list) => {
         if (cancelled) return
         const enabled = list.filter((s) => s.enabled)
+        namesAcc = list.map((s) => ({ name: s.arguments.name, enabled: s.enabled }))
         setSources(enabled)
         // 逐个回填，不能等 Promise.all 一次性 set：十几个源里有几个是死的，
         // 每个要等到超时才回来。攒齐再渲染的结果是「明明有结果的源
@@ -83,9 +140,15 @@ export default function SearchPage() {
             const name = s.arguments.name
             try {
               const hits = await api.sourceSearch(name, q, ctrl.signal)
-              if (!cancelled) setSourceHits((prev) => ({ ...prev, [name]: hits }))
+              if (!cancelled) {
+                hitsAcc = { ...hitsAcc, [name]: hits }
+                setSourceHits(hitsAcc)
+              }
             } catch (e) {
-              if (!cancelled) setSourceErrors((prev) => ({ ...prev, [name]: errMsg(e) }))
+              if (!cancelled) {
+                errorsAcc = { ...errorsAcc, [name]: errMsg(e) }
+                setSourceErrors(errorsAcc)
+              }
             }
           }
         }
@@ -99,12 +162,13 @@ export default function SearchPage() {
       })
       .finally(() => {
         if (!cancelled) setSourcesLoading(false)
+        remember()
       })
     return () => {
       cancelled = true
       ctrl.abort()
     }
-  }, [q])
+  }, [q, nonce])
 
   const sourceDetailHref = (source: string, name: string, url: string, cover: string) =>
     `/source/${encodeURIComponent(source)}?url=${encodeURIComponent(url)}&title=${encodeURIComponent(name)}&cover=${encodeURIComponent(cover)}`
@@ -166,6 +230,19 @@ export default function SearchPage() {
     <div>
       <h2 className="section-title">
         搜索「{q}」
+        {!!q && (
+          <button
+            className="btn-icon"
+            title="重新搜索（跳过记忆的结果）"
+            aria-label="重新搜索"
+            onClick={() => {
+              searchCache.delete(q)
+              setNonce((n) => n + 1)
+            }}
+          >
+            <IconRefresh />
+          </button>
+        )}
       </h2>
       {!q && <div className="empty">输入关键词后开始搜索</div>}
 

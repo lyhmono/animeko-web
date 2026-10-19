@@ -290,3 +290,13 @@ export function IconGauge({ size, ...rest }: IconProps) {
     </Svg>
   )
 }
+
+/** 刷新（搜索结果跳过记忆重新拉取） */
+export function IconRefresh({ size, ...rest }: IconProps) {
+  return (
+    <Svg size={size} {...rest}>
+      <path d="M20 12a8 8 0 1 1-2.34-5.66" />
+      <path d="M20 4v4h-4" />
+    </Svg>
+  )
+}
