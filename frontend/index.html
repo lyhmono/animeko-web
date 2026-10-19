@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="theme-color" content="#0f1115" />
+    <meta name="theme-color" content="#0b0c0f" />
     <title>Animeko Web · 自托管追番与播放</title>
     <meta name="description" content="单人自托管的番剧检索、追番收藏与播放服务，数据保存在自己的服务器上。" />
   </head>
@@ -17,7 +17,7 @@
         var t = localStorage.getItem('animeko-web:theme') === 'light' ? 'light' : 'dark'
         document.documentElement.dataset.theme = t
         var m = document.querySelector('meta[name="theme-color"]')
-        if (m) m.setAttribute('content', t === 'light' ? '#f5f6fa' : '#0f1115')
+        if (m) m.setAttribute('content', t === 'light' ? '#f6f3ec' : '#0b0c0f')
       } catch (e) {}
     </script>
     <script type="module" src="/src/main.tsx"></script>

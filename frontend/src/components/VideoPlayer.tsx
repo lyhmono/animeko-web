@@ -1,12 +1,15 @@
-import { useEffect, useRef, useState, type RefObject } from 'react'
+import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
 import Hls from 'hls.js'
 import { isDirectPlayable } from '../api'
 import {
+  IconBrightness,
   IconFullscreen,
   IconFullscreenExit,
+  IconGauge,
   IconMute,
   IconNext,
   IconPause,
+  IconPip,
   IconPlay,
   IconPrev,
   IconVolume,
@@ -19,6 +22,8 @@ interface Props {
   startAt?: number
   /** 全屏目标容器；播放页传入包含控制条的舞台，缺省时全屏本组件 */
   fullscreenTarget?: RefObject<HTMLElement | null>
+  /** 影院模式：舞台外框压暗，让放映区成为唯一视觉焦点 */
+  theater?: boolean
   onPrevEpisode?: () => void
   onNextEpisode?: () => void
   onProgress?: (time: number, duration: number) => void
@@ -44,10 +49,19 @@ function isTypingTarget(target: EventTarget | null): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable
 }
 
+/** 中央浮层提示的三种形状：跳转秒数 / 亮度 / 音量 */
+interface GestureToast {
+  kind: 'seek' | 'brightness' | 'volume'
+  text: string
+  /** 0..1，用于亮度/音量指示条的填充比例 */
+  level: number
+}
+
 export default function VideoPlayer({
   src,
   startAt,
   fullscreenTarget,
+  theater = false,
   onPrevEpisode,
   onNextEpisode,
   onProgress,
@@ -66,6 +80,22 @@ export default function VideoPlayer({
   const [fullscreen, setFullscreen] = useState(false)
   const [autoplayBlocked, setAutoplayBlocked] = useState(false)
   const autoplayTriedRef = useRef(false)
+
+  // ---- 影院化控制层的新增状态 ----
+  /** 控制条是否可见：播放中 3 秒无操作自动隐藏，暂停/悬停时常驻 */
+  const [controlsVisible, setControlsVisible] = useState(true)
+  const hideTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  /** 上游缓冲中（waiting）：转圈提示，别让「卡住」和「暂停」看起来一样 */
+  const [buffering, setBuffering] = useState(false)
+  /** 已缓冲到的秒数（video.buffered 末段），画在进度条底层 */
+  const [bufferedEnd, setBufferedEnd] = useState(0)
+  /** 手势/双击的中央浮层提示，1.2 秒后自动消退 */
+  const [gestureToast, setGestureToast] = useState<GestureToast | null>(null)
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  /** 亮度滤镜值（1 = 原样），手势调节时临时压暗/提亮画面 */
+  const brightnessRef = useRef(1)
+  /** 倍速菜单开合（自绘 popover 取代原生 select 的视觉） */
+  const [rateOpen, setRateOpen] = useState(false)
 
   // 用 ref 持有最新回调：父组件每次渲染都会传入新的回调引用，
   // 若把回调列入 effect 依赖，timeupdate → 父组件重渲染 → 回调引用变化 →
@@ -93,6 +123,10 @@ export default function VideoPlayer({
     // 同样要重新允许自动开播一次：连播是整页跳转，新视频不该要求再点一下
     autoplayTriedRef.current = false
     setAutoplayBlocked(false)
+    // 亮度滤镜和倍速一样是「这一部的观看设置」而不是全局设置：手势调暗后切集，
+    // 不重置的话用户没再碰亮度，下一集画面却压着暗（filter 在 style 特性上，
+    // removeAttribute('src') 清不掉它，只能显式抹）
+    applyBrightness(1)
 
     if (isDirectPlayable(src)) {
       video.src = src
@@ -145,6 +179,49 @@ export default function VideoPlayer({
     return () => video.removeEventListener('loadedmetadata', apply)
   }, [startAt, src])
 
+  // ---------- 影院化控制层 ----------
+
+  const showToast = (toast: GestureToast) => {
+    setGestureToast(toast)
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+    toastTimerRef.current = setTimeout(() => setGestureToast(null), 1200)
+  }
+
+  /** 显露控制条并（播放中）安排一次自动隐藏 */
+  const revealControls = useCallback(() => {
+    setControlsVisible(true)
+    if (hideTimerRef.current) clearTimeout(hideTimerRef.current)
+    hideTimerRef.current = setTimeout(() => {
+      // 暂停时不隐藏：暂停是「正在操作」的状态，把控制条收起来只会逼用户再晃一次鼠标
+      if (!videoRef.current?.paused) setControlsVisible(false)
+    }, 3000)
+  }, [])
+
+  useEffect(() => {
+    revealControls()
+    return () => {
+      if (hideTimerRef.current) clearTimeout(hideTimerRef.current)
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+    }
+  }, [revealControls])
+
+  // 缓冲进度：轮询 video.buffered（hls.js 不会把它同步到 DOM 事件上，
+  // 而 progress 事件只在当前播放位置推进时触发，seek 到未缓冲处就看不出差距）
+  useEffect(() => {
+    const tick = () => {
+      const video = videoRef.current
+      if (!video) return
+      let end = 0
+      for (let i = 0; i < video.buffered.length; i++) {
+        if (video.buffered.start(i) <= video.currentTime) end = Math.max(end, video.buffered.end(i))
+      }
+      setBufferedEnd(end)
+    }
+    const id = setInterval(tick, 1000)
+    tick()
+    return () => clearInterval(id)
+  }, [])
+
   // 事件绑定（只绑一次，回调经 ref 读取最新版本）
   useEffect(() => {
     const video = videoRef.current
@@ -157,6 +234,7 @@ export default function VideoPlayer({
     const onPlay = () => {
       setPlaying(true)
       setAutoplayBlocked(false)
+      setBuffering(false)
     }
     const onPause = () => setPlaying(false)
     // 媒体就绪时自己开始播。以前整条链路上只有 togglePlay 会调 play()，
@@ -175,6 +253,9 @@ export default function VideoPlayer({
       setPlaying(false)
       onEndedRef.current?.()
     }
+    // 上游缓冲中：真正的等待和「暂停中」界面必须区分开
+    const onWaiting = () => setBuffering(true)
+    const onPlaying = () => setBuffering(false)
     // 直链（mp4/webm）路径没有 hls.js 的 ERROR 事件可订阅，
     // 代理 403/404 时以前什么都不会发生：画面黑屏、也没有错误提示。
     const onMediaError = () => {
@@ -194,6 +275,8 @@ export default function VideoPlayer({
     video.addEventListener('canplay', onCanPlay)
     video.addEventListener('ended', onEnd)
     video.addEventListener('error', onMediaError)
+    video.addEventListener('waiting', onWaiting)
+    video.addEventListener('playing', onPlaying)
     document.addEventListener('fullscreenchange', onFs)
     return () => {
       video.removeEventListener('timeupdate', onTime)
@@ -204,6 +287,8 @@ export default function VideoPlayer({
       video.removeEventListener('canplay', onCanPlay)
       video.removeEventListener('ended', onEnd)
       video.removeEventListener('error', onMediaError)
+      video.removeEventListener('waiting', onWaiting)
+      video.removeEventListener('playing', onPlaying)
       document.removeEventListener('fullscreenchange', onFs)
     }
   }, [])
@@ -317,101 +402,274 @@ export default function VideoPlayer({
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
+  // ---- 手势：单击显隐控制条、左右滑进度、左半屏亮度、右半屏音量 ----
+  // 用 Pointer Events 一处覆盖鼠标+触摸；拖动与单击按位移阈值区分，
+  // 否则「划一下进度」会紧接着触发一次暂停。
+  const gestureRef = useRef({
+    active: false,
+    x0: 0,
+    y0: 0,
+    dx: 0,
+    dy: 0,
+    mode: 'none' as 'none' | 'seek' | 'brightness' | 'volume',
+    moved: false,
+    lastTap: 0,
+    seekBase: 0,
+    lastTapLeft: false,
+  })
+
+  const applyBrightness = (level: number) => {
+    const clamped = Math.round(Math.min(1.5, Math.max(0.3, level)) * 100) / 100
+    brightnessRef.current = clamped
+    const video = videoRef.current
+    if (video) video.style.filter = clamped === 1 ? '' : `brightness(${clamped})`
+  }
+
+  const onPointerDown = (e: ReactPointerEvent<HTMLVideoElement>) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return
+    // 摸到画面就收起倍速菜单：它浮在控制条上方，不收的话会一直挡着进度条
+    if (rateOpen) setRateOpen(false)
+    const g = gestureRef.current
+    g.active = true
+    g.x0 = e.clientX
+    g.y0 = e.clientY
+    g.dx = 0
+    g.dy = 0
+    g.mode = 'none'
+    g.moved = false
+    g.seekBase = videoRef.current?.currentTime ?? 0
+  }
+
+  const onPointerMove = (e: ReactPointerEvent<HTMLVideoElement>) => {
+    const g = gestureRef.current
+    if (!g.active) return
+    g.dx = e.clientX - g.x0
+    g.dy = e.clientY - g.y0
+    if (g.mode === 'none') {
+      if (Math.abs(g.dx) < 10 && Math.abs(g.dy) < 10) return
+      g.moved = true
+      // 先在轨迹更长的轴上定向，再按落点分左右半屏（竖向手势）
+      if (Math.abs(g.dx) > Math.abs(g.dy)) {
+        g.mode = 'seek'
+      } else {
+        const rect = e.currentTarget.getBoundingClientRect()
+        g.mode = e.clientX - rect.left < rect.width / 2 ? 'brightness' : 'volume'
+      }
+    }
+    if (g.mode === 'seek') {
+      const target = Math.max(0, Math.min(duration || Infinity, g.seekBase + g.dx / 4))
+      if (videoRef.current) videoRef.current.currentTime = target
+      showToast({ kind: 'seek', text: `${formatTime(target)} / ${formatTime(duration)}`, level: duration ? target / duration : 0 })
+    } else if (g.mode === 'brightness') {
+      const level = Math.round((brightnessRef.current - g.dy / 300) * 100) / 100
+      applyBrightness(level)
+      showToast({ kind: 'brightness', text: `亮度 ${Math.round(level * 100)}%`, level: Math.min(1, level / 1.5) })
+    } else {
+      const next = Math.round((Math.max(0, muted ? 0 : volume) - g.dy / 300) * 100) / 100
+      setVolume(Math.min(1, Math.max(0, next)))
+      setMuted(next <= 0)
+      showToast({ kind: 'volume', text: `音量 ${Math.round(next * 100)}%`, level: next })
+    }
+  }
+
+  const onPointerUp = (e: ReactPointerEvent<HTMLVideoElement>) => {
+    const g = gestureRef.current
+    if (!g.active) return
+    g.active = false
+    if (g.moved) {
+      // 拖动收尾：把最终位置同步进 React 状态，进度条不会弹回去
+      const video = videoRef.current
+      if (video) setCurrent(video.currentTime)
+      revealControls()
+      return
+    }
+    // 单击逻辑里带双击检测：300ms 内同侧屏幕的第二次点击是「快进/快退 10 秒」
+    const now = Date.now()
+    const rect = e.currentTarget.getBoundingClientRect()
+    const leftSide = e.clientX - rect.left < rect.width / 2
+    if (now - g.lastTap < 300 && leftSide === g.lastTapLeft) {
+      g.lastTap = 0
+      const video = videoRef.current
+      if (video) {
+        const delta = leftSide ? -10 : 10
+        video.currentTime = Math.max(0, Math.min(duration || Infinity, video.currentTime + delta))
+        setCurrent(video.currentTime)
+        showToast({ kind: 'seek', text: `${delta > 0 ? '+' : ''}${delta} 秒`, level: duration ? video.currentTime / duration : 0 })
+      }
+      return
+    }
+    g.lastTap = now
+    g.lastTapLeft = leftSide
+    // 单击显隐控制条；控制条收起时这次点击不透传成播放/暂停
+    if (controlsVisible) setControlsVisible(false)
+    else revealControls()
+  }
+
+  // ---- 画中画 ----
+  const togglePip = async () => {
+    const video = videoRef.current
+    if (!video || !document.pictureInPictureEnabled) return
+    try {
+      if (document.pictureInPictureElement) await document.exitPictureInPicture()
+      else await video.requestPictureInPicture()
+    } catch {
+      // 用户手势过期或浏览器策略拒绝：PiP 是增强项，静默失败即可
+    }
+  }
+
   return (
-    <div ref={containerRef} className="video-shell">
-      <video ref={videoRef} playsInline controls={false} onClick={togglePlay} />
+    <div
+      ref={containerRef}
+      className={`video-shell${theater ? ' theater' : ''}${controlsVisible ? '' : ' hide-controls'}`}
+      onPointerMove={() => controlsVisible && revealControls()}
+    >
+      <video
+        ref={videoRef}
+        playsInline
+        controls={false}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={() => {
+          gestureRef.current.active = false
+        }}
+      />
+      {buffering && !error && (
+        <div className="video-buffering" aria-label="缓冲中">
+          <span className="spinner" />
+        </div>
+      )}
+      {gestureToast && (
+        <div className={`gesture-toast ${gestureToast.kind}`} role="status">
+          {gestureToast.kind !== 'seek' && (
+            <span className="gesture-level">
+              <span className="gesture-level-fill" style={{ height: `${Math.round(gestureToast.level * 100)}%` }} />
+            </span>
+          )}
+          <span className="gesture-text">
+            {gestureToast.kind === 'brightness' && <IconBrightness size={14} />}
+            {gestureToast.kind === 'volume' && <IconVolume size={14} />}
+            {gestureToast.text}
+          </span>
+        </div>
+      )}
       {autoplayBlocked && !error && (
         <button type="button" className="video-bigplay" onClick={togglePlay}>
           <IconPlay size={44} />
           <span>浏览器不允许自动播放，点这里开始</span>
         </button>
       )}
-      {error && (
-        <div
-          style={{
-            position: 'absolute',
-            inset: 0,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            background: 'rgba(0,0,0,0.75)',
-            color: 'var(--danger)',
-            padding: 24,
-            textAlign: 'center',
-            fontSize: 14,
-          }}
-        >
-          {error}
-        </div>
-      )}
+      {error && <div className="video-error">{error}</div>}
       <div className="player-controls">
-        <button
-          className="player-btn primary"
-          onClick={togglePlay}
-          aria-label="播放/暂停"
-          title="播放/暂停（空格）"
-        >
-          {playing ? <IconPause size={16} /> : <IconPlay size={16} />}
-        </button>
-        {onPrevEpisode && (
-          <button className="player-btn" onClick={onPrevEpisode} aria-label="上一集" title="上一集">
-            <IconPrev size={16} />
+        <div className="seek-track">
+          <div
+            className="seek-buffered"
+            style={{ width: `${duration ? Math.min(100, (bufferedEnd / duration) * 100) : 0}%` }}
+          />
+          <div
+            className="seek-played"
+            style={{ width: `${duration ? Math.min(100, (current / duration) * 100) : 0}%` }}
+          />
+          <input
+            className="seek-input"
+            type="range"
+            min={0}
+            max={duration || 0}
+            step={0.1}
+            value={current}
+            onChange={(e) => seek(Number(e.target.value))}
+            aria-label="播放进度"
+          />
+        </div>
+        <div className="controls-row">
+          <button
+            className="player-btn primary"
+            onClick={togglePlay}
+            aria-label="播放/暂停"
+            title="播放/暂停（空格）"
+          >
+            {playing ? <IconPause size={16} /> : <IconPlay size={16} />}
           </button>
-        )}
-        {onNextEpisode && (
-          <button className="player-btn" onClick={onNextEpisode} aria-label="下一集" title="下一集">
-            <IconNext size={16} />
+          {onPrevEpisode && (
+            <button className="player-btn" onClick={onPrevEpisode} aria-label="上一集" title="上一集">
+              <IconPrev size={16} />
+            </button>
+          )}
+          {onNextEpisode && (
+            <button className="player-btn" onClick={onNextEpisode} aria-label="下一集" title="下一集">
+              <IconNext size={16} />
+            </button>
+          )}
+          <span className="time">{formatTime(current)}</span>
+          <span className="time-sep">/</span>
+          <span className="time total">{formatTime(duration)}</span>
+          <span className="controls-spacer" />
+          <div className="volume-group">
+            <button
+              className="player-btn"
+              onClick={() => setMuted((m) => !m)}
+              aria-label="静音"
+              title="静音（M）"
+            >
+              {muted || volume === 0 ? <IconMute size={16} /> : <IconVolume size={16} />}
+            </button>
+            <input
+              className="volume-input"
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              value={muted ? 0 : volume}
+              onChange={(e) => {
+                setVolume(Number(e.target.value))
+                setMuted(false)
+              }}
+              aria-label="音量"
+            />
+          </div>
+          <div className="rate-group">
+            <button
+              className="player-btn"
+              onClick={() => setRateOpen((v) => !v)}
+              aria-label="倍速"
+              title="播放倍速"
+              aria-expanded={rateOpen}
+            >
+              <IconGauge size={16} />
+            </button>
+            {rateOpen && (
+              <div className="rate-menu" role="menu">
+                {[0.5, 0.75, 1, 1.25, 1.5, 2].map((r) => (
+                  <button
+                    key={r}
+                    className={`rate-item${r === rate ? ' active' : ''}`}
+                    onClick={() => {
+                      setRate(r)
+                      setRateOpen(false)
+                    }}
+                    role="menuitemradio"
+                    aria-checked={r === rate}
+                  >
+                    {r === 1 ? '1.0x 标准' : `${r}x`}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          {typeof document !== 'undefined' && document.pictureInPictureEnabled && (
+            <button className="player-btn" onClick={() => void togglePip()} aria-label="画中画" title="画中画">
+              <IconPip size={16} />
+            </button>
+          )}
+          <button
+            className="player-btn"
+            onClick={toggleFullscreen}
+            aria-label="全屏"
+            title="全屏（F）"
+          >
+            {fullscreen ? <IconFullscreenExit size={16} /> : <IconFullscreen size={16} />}
           </button>
-        )}
-        <span className="time">{formatTime(current)}</span>
-        <input
-          className="seek"
-          type="range"
-          min={0}
-          max={duration || 0}
-          step={0.1}
-          value={current}
-          onChange={(e) => seek(Number(e.target.value))}
-          aria-label="播放进度"
-        />
-        <span className="time">{formatTime(duration)}</span>
-        <button
-          className="player-btn"
-          onClick={() => setMuted((m) => !m)}
-          aria-label="静音"
-          title="静音（M）"
-        >
-          {muted || volume === 0 ? <IconMute size={16} /> : <IconVolume size={16} />}
-        </button>
-        <input
-          type="range"
-          min={0}
-          max={1}
-          step={0.05}
-          value={muted ? 0 : volume}
-          onChange={(e) => {
-            setVolume(Number(e.target.value))
-            setMuted(false)
-          }}
-          style={{ width: 72 }}
-          aria-label="音量"
-        />
-        <select value={rate} onChange={(e) => setRate(Number(e.target.value))} aria-label="倍速">
-          <option value={0.5}>0.5x</option>
-          <option value={0.75}>0.75x</option>
-          <option value={1}>1.0x</option>
-          <option value={1.25}>1.25x</option>
-          <option value={1.5}>1.5x</option>
-          <option value={2}>2.0x</option>
-        </select>
-        <button
-          className="player-btn"
-          onClick={toggleFullscreen}
-          aria-label="全屏"
-          title="全屏（F）"
-        >
-          {fullscreen ? <IconFullscreenExit size={16} /> : <IconFullscreen size={16} />}
-        </button>
+        </div>
       </div>
     </div>
   )

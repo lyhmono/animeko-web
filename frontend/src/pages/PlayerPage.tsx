@@ -215,6 +215,7 @@ export default function PlayerPage() {
             src={src}
             startAt={startAt}
             fullscreenTarget={stageRef}
+            theater
             onNextEpisode={nextInfo ? gotoNext : undefined}
             onProgress={handleProgress}
             onEnded={handleEnded}
@@ -346,6 +347,24 @@ export default function PlayerPage() {
                 <span className="kbd">F</span>
               </span>
               全屏
+            </div>
+            <div className="row">
+              <span className="keys">
+                <span className="kbd">触屏</span>
+              </span>
+              左右滑进度 · 左半屏上下滑亮度 · 右半屏上下滑音量
+            </div>
+            <div className="row">
+              <span className="keys">
+                <span className="kbd">双击</span>
+              </span>
+              画面左 / 右半边快退 / 快进 10 秒
+            </div>
+            <div className="row">
+              <span className="keys">
+                <span className="kbd">单击</span>
+              </span>
+              显示 / 收起控制条（播放中会自动收起）
             </div>
           </div>
         </div>

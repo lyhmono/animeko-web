@@ -309,7 +309,7 @@ function writeProgressMap(map: Record<string, unknown>, entryKey: string): void 
 
 export type Theme = 'dark' | 'light'
 
-const THEME_COLORS: Record<Theme, string> = { dark: '#0f1115', light: '#f5f6fa' }
+const THEME_COLORS: Record<Theme, string> = { dark: '#0b0c0f', light: '#f6f3ec' }
 
 /**
  * 主题只存本机：它是「这台设备看着舒服与否」的偏好，不是收藏。

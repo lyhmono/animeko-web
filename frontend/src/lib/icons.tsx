@@ -260,3 +260,33 @@ export function IconLink({ size, ...rest }: IconProps) {
     </Svg>
   )
 }
+
+/** 画中画（Picture in Picture） */
+export function IconPip({ size, ...rest }: IconProps) {
+  return (
+    <Svg size={size} {...rest}>
+      <rect x="2" y="4" width="20" height="16" rx="2" />
+      <rect x="12" y="12" width="8" height="6" rx="1" fill="currentColor" stroke="none" />
+    </Svg>
+  )
+}
+
+/** 亮度（手势提示与快捷键卡片用） */
+export function IconBrightness({ size, ...rest }: IconProps) {
+  return (
+    <Svg size={size} {...rest}>
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+    </Svg>
+  )
+}
+
+/** 倍速（仪表盘式，与文字倍速值配套显示） */
+export function IconGauge({ size, ...rest }: IconProps) {
+  return (
+    <Svg size={size} {...rest}>
+      <path d="M12 15l4-6" />
+      <path d="M3.5 18a9 9 0 1 1 17 0" />
+    </Svg>
+  )
+}
