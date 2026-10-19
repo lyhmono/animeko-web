@@ -122,7 +122,13 @@ fun Application.module(
         cfg.bangumiTimeoutMs == cfg.requestTimeoutMs -> fetcher
         else -> JdkFetcher(timeoutMs = cfg.bangumiTimeoutMs)
     }
-    val bangumi = BangumiClient(bangumiFetcher, cfg.bangumiBaseUrls, channelStore = BgmChannelStore(cfg.bangumiChannelFile))
+    val bangumi = BangumiClient(
+        bangumiFetcher,
+        cfg.bangumiBaseUrls,
+        channelStore = BgmChannelStore(cfg.bangumiChannelFile),
+        // 通道地址会被服务端拿去发请求，内网拦截与 proxy / 订阅同一条规则
+        allowPrivateTargets = cfg.allowPrivateTargets,
+    )
     val repo = SelectorRepository(cfg.selectorsDir)
     val engine = SelectorEngine(fetcher, cfg.allowPrivateTargets)
     val sessions = proxySessions

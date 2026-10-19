@@ -1,9 +1,11 @@
 package com.animeko.web.bangumi
 
+import com.animeko.web.appLog
 import com.animeko.web.http.Fetcher
 import com.animeko.web.http.HttpResult
 import com.animeko.web.http.JsonGuard
 import com.animeko.web.http.UpstreamException
+import com.animeko.web.http.UrlGuard
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
@@ -128,12 +130,45 @@ class BangumiClient(
     baseUrls: List<String> = DEFAULT_BASE_URLS,
     private val userAgent: String = "animeko-web/0.1 (self-hosted; +https://github.com/open-ani/animeko)",
     private val channelStore: BgmChannelStore? = null,
+    /**
+     * 是否允许通道指向内网地址。与 ANIMEKO_ALLOW_PRIVATE_TARGETS 同义：
+     * 通道地址会被服务端拿去发请求，等于一个「让服务器访问任意 URL」的入口，
+     * 所以必须和 proxy / 订阅走同一条内网拦截规则。
+     */
+    private val allowPrivateTargets: Boolean = false,
 ) {
+
     /** 来自 ANIMEKO_BANGUMI_BASE_URLS（或默认值）的候选地址，AUTO 通道用的就是这一份 */
     private val envBases: List<String> = baseUrls.filter { it.isNotBlank() }.ifEmpty { DEFAULT_BASE_URLS }
 
     @Volatile
     private var channel: BgmChannelConfig = channelStore?.load() ?: BgmChannelConfig()
+
+    init {
+        // 配置文件能被手工改，绕过 setChannel 的校验。启动时再验一次：
+        // 非法就退回 AUTO 并落盘 —— 宁可让站长重新选一次，
+        // 也不能让服务端带着一个内网地址跑起来。
+        val loaded = channel
+        if (loaded.channel == BgmChannel.CUSTOM) {
+            val bad = loaded.customUrls.firstOrNull { !isAllowedChannelTarget(it) }
+            if (bad != null) {
+                appLog.warn("Bangumi 通道配置里的地址不被允许，已退回自动：{}", bad)
+                channel = BgmChannelConfig()
+                runCatching { channelStore?.save(channel) }
+            }
+        }
+    }
+
+    /**
+     * 通道地址是否允许（公网 http/https；allowPrivateTargets 时放开内网）。
+     *
+     * 只对**设置页写入**与**启动时读回的配置**做这层校验，不校验
+     * ANIMEKO_BANGUMI_BASE_URLS 里的地址：环境变量要能改容器才改得动，
+     * 那是站长本人的权限；而设置页在默认部署（鉴权关闭）下任何能连上的人都能写，
+     * 两者信任级别不同，不能一刀切。
+     */
+    private fun isAllowedChannelTarget(url: String): Boolean =
+        runCatching { UrlGuard.requireAllowed("$url/v0/calendar", allowPrivateTargets) }.isSuccess
 
     /** 当前通道实际生效的地址列表（公开给设置页展示）。每次调用重读，改完立即生效、不用重启。 */
     fun effectiveBases(): List<String> = resolveBases(channel)
@@ -176,9 +211,19 @@ class BangumiClient(
                 require(it.startsWith("http://") || it.startsWith("https://")) {
                     "地址必须以 http/https 开头：$it"
                 }
-                runCatching { java.net.URI(it) }.getOrNull()?.let { u ->
-                    require(u.host != null) { "地址无法解析出主机名：$it" }
-                } ?: throw IllegalArgumentException("地址不合法：$it")
+                val uri = runCatching { java.net.URI(it) }.getOrNull()
+                    ?: throw IllegalArgumentException("地址不合法：$it")
+                require(uri.host != null) { "地址无法解析出主机名：$it" }
+                // 内网/保留地址一律拒绝：这个地址会被服务端拿去发请求，
+                // 不拦就等于给了任何能打开设置页的人一个 SSRF 跳板
+                // （默认部署 ANIMEKO_AUTH_ENABLED 是关的）。
+                runCatching { UrlGuard.requireAllowed("$it/v0/calendar", allowPrivateTargets) }
+                    .onFailure {
+                        // 不能把 Blocked 的原文透出去：它带着「主机名 -> 内网 IP」的映射，
+                        // 对任何能打开设置页的人都是网络拓扑泄露（Main.kt 里 Blocked
+                        // 的 StatusPages 处理也是只记日志、只回一句通用原因）
+                        throw IllegalArgumentException("地址不被允许：$it（仅支持公网 http/https 地址）")
+                    }
             }
             val saved = next.copy(customUrls = urls)
             channel = saved

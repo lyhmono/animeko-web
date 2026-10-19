@@ -99,6 +99,40 @@ class BangumiChannelTest {
         }
     }
 
+    /**
+     * 安全回归：自定义通道不能指向内网。
+     *
+     * 这个地址会被服务端拿去发请求（搜索/放送/探测都走它），等于一个
+     * 「让服务器访问任意 URL」的入口；而默认部署 ANIMEKO_AUTH_ENABLED 是关的，
+     * 不拦就是给任何能打开设置页的人一个 SSRF 跳板 —— 内网端口扫描、
+     * 云元数据（169.254.169.254）都能打。
+     * proxy 与订阅早就走 UrlGuard，这条新入口当初漏了。
+     */
+    @Test
+    fun `custom channel rejects internal addresses`() {
+        val client = BangumiClient(StubFetcher(emptyMap()), channelStore = store())
+        for (bad in listOf("http://127.0.0.1:8080", "http://169.254.169.254/latest/meta-data")) {
+            assertFailsWith<IllegalArgumentException>("应拒绝内网地址：$bad") {
+                client.setChannel(BgmChannelConfig(BgmChannel.CUSTOM, listOf(bad)))
+            }
+        }
+        // 被拒之后通道应保持原样，不能半截写入
+        assertEquals(BgmChannel.AUTO, client.channelState().channel)
+    }
+
+    /** 显式允许内网时（ANIMEKO_ALLOW_PRIVATE_TARGETS=true）应放行 —— 局域网自建中转的场景 */
+    @Test
+    fun `custom channel allows internal addresses when explicitly permitted`() {
+        val client = BangumiClient(
+            StubFetcher(emptyMap()),
+            channelStore = store(),
+            allowPrivateTargets = true,
+        )
+        val saved = client.setChannel(BgmChannelConfig(BgmChannel.CUSTOM, listOf("http://127.0.0.1:8080")))
+        assertEquals(BgmChannel.CUSTOM, saved.channel)
+        assertEquals(listOf("http://127.0.0.1:8080"), client.effectiveBases())
+    }
+
     @Test
     fun `setting persists across instances via store`() {
         val store = store()
