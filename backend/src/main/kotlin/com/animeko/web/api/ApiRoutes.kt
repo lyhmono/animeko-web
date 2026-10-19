@@ -20,7 +20,6 @@ import com.animeko.web.selector.SelectorRepository
 import com.animeko.web.selector.SelectorSourceArguments
 import com.animeko.web.selector.SubscriptionService
 import io.ktor.http.ContentType
-import io.ktor.http.content.LocalFileContent
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
@@ -35,6 +34,7 @@ import io.ktor.utils.io.readAvailable
 import io.ktor.server.response.ApplicationResponse
 import io.ktor.server.response.header
 import io.ktor.server.response.respond
+import io.ktor.server.response.respondBytes
 import io.ktor.server.response.respondFile
 import io.ktor.server.response.respondOutputStream
 import io.ktor.server.response.respondText
@@ -556,7 +556,10 @@ fun Application.configureStaticFrontend(cfg: AppConfig) {
                     if (rel == "manifest.webmanifest") {
                         // Ktor 的扩展名映射不认识 .webmanifest，会落到 octet-stream，
                         // 部分浏览器会因此直接忽略这份 manifest。显式给正确类型。
-                        call.respond(LocalFileContent(file, ContentType.parse("application/manifest+json")))
+                        // 用 respondBytes 而不是 LocalFileContent：后者在这个 Ktor
+                        // 版本里不在 io.ktor.http.content 下（编译期就报 Unresolved）。
+                        // manifest 只有几百字节，读进内存没有负担。
+                        call.respondBytes(file.readBytes(), ContentType.parse("application/manifest+json"))
                     } else {
                         call.respondFile(file)
                     }
