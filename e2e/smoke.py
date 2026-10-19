@@ -136,9 +136,14 @@ def main() -> int:
             任何可操作性。但如果接口是 200 却没有卡片，那就是真 bug。
             """
             cards = page.get_by_test_id("rank-grid").locator("a")
-            if cards.count() > 0:
-                expect(cards.first).to_be_visible(timeout=25000)
+            # 必须等：rank-grid 这个容器在首帧就渲染了（items 还是空数组），
+            # 数据要等 fetch 回来。直接查 count() 会拿到 0，误判成「有数据不渲染」。
+            # 这也正是第一次跑出来的假失败 —— 断言写得太急，不是产品问题。
+            try:
+                expect(cards.first).to_be_visible(timeout=20000)
                 return
+            except Exception:  # noqa: BLE001 - 超时后要走下面的「是不是上游没数据」判断
+                pass
             # 接口 200 但 data 为空，同样是「上游没给数据」而不是我们的 bug：
             # bgmapi 镜像在 CI 的出口 IP 上既会返 5xx，也会返 200 + 空数组
             # （实测两种都出现过）。只有「接口明确返回了条目、页面却没渲染」才算失败。
