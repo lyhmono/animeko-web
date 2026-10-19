@@ -25,11 +25,6 @@ export default function AiringCalendar() {
   const [onlyFav, setOnlyFav] = useState(false)
   const [favIds, setFavIds] = useState<Set<number>>(() => favoriteIdSet())
 
-  // 收藏可能在别处被改（条目页点收藏 → 返回首页），回到本页时重读一次
-  useEffect(() => {
-    setFavIds(favoriteIdSet())
-  }, [days])
-
   useEffect(() => {
     const ctrl = new AbortController()
     api

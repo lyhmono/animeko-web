@@ -44,6 +44,9 @@ export default function ContinueWatching() {
           const pct = p && p.duration > 0 ? Math.min(100, (p.time / p.duration) * 100) : 0
           const remainMin =
             p && p.duration > 0 ? Math.max(1, Math.round((p.duration - p.time) / 60)) : null
+          // duration 未知（部分源不报总时长）时给「已看 N 分钟」：
+          // 只说「从头开始」是错的，用户明明看了 20 分钟
+          const watchedMin = p && p.duration <= 0 ? Math.max(1, Math.round(p.time / 60)) : null
           return (
             <Link
               key={`${it.source}:${it.playUrl}`}
@@ -64,9 +67,12 @@ export default function ContinueWatching() {
                 <span className="continue-meta">
                   {it.ep ? `第 ${it.ep} 话` : it.title}
                   {remainMin != null && <span className="continue-remain">还剩约 {remainMin} 分钟</span>}
+                  {watchedMin != null && (
+                    <span className="continue-remain">已看约 {watchedMin} 分钟</span>
+                  )}
                   {!p && <span className="continue-remain dim">从头开始</span>}
                 </span>
-                {p && (
+                {p && p.duration > 0 && (
                   <span className="continue-bar" aria-hidden>
                     <span className="continue-bar-fill" style={{ width: `${pct}%` }} />
                   </span>

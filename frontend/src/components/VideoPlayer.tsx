@@ -74,9 +74,11 @@ export default function VideoPlayer({
   const [playing, setPlaying] = useState(false)
   const [current, setCurrent] = useState(0)
   const [duration, setDuration] = useState(0)
-  const [volume, setVolume] = useState(() => getPlayerPrefs().volume)
-  const [muted, setMuted] = useState(() => getPlayerPrefs().muted)
-  const [rate, setRate] = useState(() => getPlayerPrefs().rate)
+  // 偏好只读一次（三个 useState 各自调一次 getPlayerPrefs 会读三遍 localStorage + 解析三遍 JSON）
+  const [initialPrefs] = useState(getPlayerPrefs)
+  const [volume, setVolume] = useState(initialPrefs.volume)
+  const [muted, setMuted] = useState(initialPrefs.muted)
+  const [rate, setRate] = useState(initialPrefs.rate)
   /** 播放器偏好落盘的去抖定时器（音量拖动会连发几十次变化） */
   const prefsTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const [error, setError] = useState<string | null>(null)

@@ -415,7 +415,20 @@ export function setSubjectProgress(subjectId: number, ep: number): void {
   const prev = map[key] as SubjectProgressEntry | undefined
   // 只前进不后退：从第 5 话回看第 2 话不该把「看到第 5 话」改小
   if (prev && typeof prev.ep === 'number' && prev.ep >= ep) return
-  writeJson('subjectProgress', { ...map, [key]: { ep, ts: Date.now() } })
+  const next = { ...map, [key]: { ep, ts: Date.now() } }
+  // 和 progress 一样要剪枝：这个键按条目增长，不剪的话迟早撞上服务端 512KB 上限，
+  // 之后每一次写入都会 400 —— 整个数据层从此写不进去，而不只是进度丢失。
+  const entries = Object.entries(next).filter(([, v]) => typeof asMap(v).ts === 'number')
+  if (entries.length > MAX_PROGRESS_ENTRIES) {
+    entries.sort((a, b) => (asMap(b[1]).ts as number) - (asMap(a[1]).ts as number))
+    const kept: Record<string, unknown> = {}
+    entries.slice(0, MAX_PROGRESS_ENTRIES).forEach(([k, v]) => {
+      kept[k] = v
+    })
+    writeJson('subjectProgress', kept)
+    return
+  }
+  writeJson('subjectProgress', next)
 }
 
 // ---------- 播放进度 ----------

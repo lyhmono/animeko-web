@@ -994,62 +994,6 @@ textarea::placeholder {
   color: var(--danger);
 }
 
-/* 最近观看 */
-.recent-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
-  gap: 10px;
-}
-
-.recent-card {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  transition: border-color 0.15s, transform 0.15s;
-  min-width: 0;
-}
-
-.recent-card:hover {
-  border-color: var(--accent);
-  transform: translateY(-1px);
-}
-
-.recent-card .recent-icon {
-  width: 34px;
-  height: 34px;
-  border-radius: var(--radius-sm);
-  background: var(--accent-dim);
-  color: var(--accent);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-
-.recent-card .recent-info {
-  min-width: 0;
-  flex: 1;
-}
-
-.recent-card .recent-title {
-  font-size: 13px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.recent-card .recent-meta {
-  font-size: 11px;
-  color: var(--text-dim);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 /* ============================================================
    搜索结果
    ============================================================ */
@@ -2661,8 +2605,7 @@ select:hover:not(:focus) {
 
 .source-item,
 .subject-card,
-.fav-card,
-.recent-card {
+.fav-card {
   transition: transform 0.12s ease, border-color 0.15s, box-shadow 0.15s, background 0.15s;
 }
 
@@ -2672,7 +2615,6 @@ select:hover:not(:focus) {
   .source-item,
   .subject-card,
   .fav-card,
-  .recent-card,
   .theme-toggle {
     transition: none;
     transform: none;
