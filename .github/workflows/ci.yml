@@ -110,7 +110,10 @@ jobs:
           grep -q '"start_url"' /tmp/manifest.json || { echo "::error::manifest 内容不对"; cat /tmp/manifest.json; exit 1; }
           # Content-Type 必须是 manifest+json：Ktor 的扩展名映射不认识 .webmanifest，
           # 不显式设置会落到 octet-stream，部分浏览器直接忽略这份 manifest
-          CT=$(curl -sSI http://127.0.0.1:18080/manifest.webmanifest | tr -d '\r' | grep -i '^content-type' || true)
+          # 用 GET + 只取头（-D - -o /dev/null），不能用 -I：
+          # -I 发的是 HEAD，而 Ktor 没装 AutoHeadResponse 插件，HEAD 打不到 GET 路由，
+          # 拿回来的是一份没有 Content-Type 的 405
+          CT=$(curl -sS -D - -o /dev/null http://127.0.0.1:18080/manifest.webmanifest | tr -d '\r' | grep -i '^content-type' || true)
           case "$CT" in
             *manifest+json*) echo "manifest OK ($CT)" ;;
             *) echo "::error::manifest 的 Content-Type 不对：$CT"; exit 1 ;;
