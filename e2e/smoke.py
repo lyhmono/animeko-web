@@ -129,24 +129,25 @@ def main() -> int:
             page,
         )
         def ranking_ok() -> None:
-            """有结果就要求可见；空网格只在上游确实不可用时才放过。
+            """有数据就必须渲染出来；空网格只在「上游确实没给数据」时放过。
 
-            排行榜页在数据为空时会显示骨架/空态，而 CI 的 IP 会被镜像拒绝。
-            强制要求有结果，会让这个测试在「外部服务抽风」时红 —— 那种红没有
-            任何可操作性。但如果接口是 200 却没有卡片，那就是真 bug。
+            这里曾经误判过两次，都记在下面，避免以后又改回去：
+            1. 先查 count() 再判断 —— rank-grid 首帧就存在（骨架屏阶段），
+               此时 count 必然是 0，等于把「还没加载完」当成「不渲染」。
+               必须先给足时间等卡片出现。
+            2. rank-grid 这个 testid 一度挂在**骨架屏**那个 div 上（写错位置），
+               而骨架屏里没有 <a>，于是数据即使渲染了也永远查不到卡片。
+               现在 testid 在真实结果网格上。
             """
             cards = page.get_by_test_id("rank-grid").locator("a")
-            # 必须等：rank-grid 这个容器在首帧就渲染了（items 还是空数组），
-            # 数据要等 fetch 回来。直接查 count() 会拿到 0，误判成「有数据不渲染」。
-            # 这也正是第一次跑出来的假失败 —— 断言写得太急，不是产品问题。
             try:
                 expect(cards.first).to_be_visible(timeout=20000)
                 return
-            except Exception:  # noqa: BLE001 - 超时后要走下面的「是不是上游没数据」判断
+            except Exception:  # noqa: BLE001 - 超时后去对账上游是否本来就没数据
                 pass
-            # 接口 200 但 data 为空，同样是「上游没给数据」而不是我们的 bug：
-            # bgmapi 镜像在 CI 的出口 IP 上既会返 5xx，也会返 200 + 空数组
-            # （实测两种都出现过）。只有「接口明确返回了条目、页面却没渲染」才算失败。
+
+            # 接口 200 + data 为空，同样是「上游没数据」而不是我们的 bug：
+            # bgmapi 镜像对 CI 出口 IP 既会返 5xx，也会返 200 + 空数组。
             body = page.evaluate(
                 """async () => {
                   const r = await fetch('/api/bangumi/ranking');

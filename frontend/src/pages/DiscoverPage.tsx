@@ -68,7 +68,7 @@ export default function DiscoverPage() {
       {error && <div className="error-box">排行榜加载失败：{error}</div>}
 
       {items.length === 0 && loading && (
-        <div className="result-grid" data-testid="rank-grid">
+        <div className="result-grid">
           {Array.from({ length: 8 }).map((_, i) => (
             <div className="skeleton-card" key={i}>
               <div className="skeleton skeleton-cover" />
@@ -78,7 +78,7 @@ export default function DiscoverPage() {
         </div>
       )}
 
-      <div className="result-grid">
+      <div className="result-grid" data-testid="rank-grid">
         {items.map((s) => {
           const title = s.name_cn || s.name
           const score = scoreOf(s)
