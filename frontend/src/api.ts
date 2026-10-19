@@ -1,4 +1,8 @@
 import type {
+  BgmCalendarDay,
+  BgmChannelInfo,
+  BgmChannelKind,
+  BgmProbeResult,
   BgmSubject,
   EpisodesResult,
   VideoSource,
@@ -132,6 +136,20 @@ export const api = {
   searchBangumi: (q: string, signal?: AbortSignal) =>
     request<BgmSubject[]>(`/api/bangumi/search?q=${encodeURIComponent(q)}`, { signal }),
   bangumiSubject: (id: number) => request<BgmSubject>(`/api/bangumi/subjects/${id}`),
+  /** 每日放送表。镜像部署下会上游 502，调用方按可选功能处理（拉不到就不显示） */
+  bangumiCalendar: (signal?: AbortSignal) =>
+    request<BgmCalendarDay[]>(`/api/bangumi/calendar`, { signal }),
+  bangumiChannel: () => request<BgmChannelInfo>('/api/bangumi/channel'),
+  setBangumiChannel: (channel: BgmChannelKind, customUrls: string[]) =>
+    request<BgmChannelInfo>('/api/bangumi/channel', {
+      method: 'PUT',
+      body: JSON.stringify({ channel, customUrls }),
+    }),
+  probeBangumiChannel: (target?: { channel: BgmChannelKind; customUrls: string[] }) =>
+    request<BgmProbeResult[]>('/api/bangumi/channel/probe', {
+      method: 'POST',
+      body: JSON.stringify(target ?? {}),
+    }),
 
   // ---- 数据源 ----
   sources: () => request<StoredSource[]>('/api/selector/sources'),

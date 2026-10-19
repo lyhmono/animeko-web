@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
+import AiringCalendar from '../components/AiringCalendar'
 import { api } from '../api'
 import type { StoredSource } from '../types'
 import {
@@ -55,7 +56,7 @@ export default function HomePage() {
   }
 
   return (
-    <div className="fade-in">
+    <div className="fade-in home">
       <section className="hero">
         <div className="hero-badge">
           <span className="badge-dot" />
@@ -90,6 +91,9 @@ export default function HomePage() {
           </Link>
         </div>
       </section>
+
+      {/* 每日放送：首页的主体内容。拉不到（镜像不镜像该端点）时组件自行隐藏 */}
+      <AiringCalendar />
 
       {history.length > 0 && (
         <>

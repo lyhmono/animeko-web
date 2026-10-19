@@ -5,6 +5,7 @@ import com.animeko.web.api.configureStaticFrontend
 import com.animeko.web.auth.LoginRateLimiter
 import com.animeko.web.auth.SessionStore
 import com.animeko.web.bangumi.BangumiClient
+import com.animeko.web.bangumi.BgmChannelStore
 import com.animeko.web.bangumi.SubjectNotFoundException
 import com.animeko.web.config.AppConfig
 import com.animeko.web.data.UserDataStore
@@ -121,7 +122,7 @@ fun Application.module(
         cfg.bangumiTimeoutMs == cfg.requestTimeoutMs -> fetcher
         else -> JdkFetcher(timeoutMs = cfg.bangumiTimeoutMs)
     }
-    val bangumi = BangumiClient(bangumiFetcher, cfg.bangumiBaseUrls)
+    val bangumi = BangumiClient(bangumiFetcher, cfg.bangumiBaseUrls, channelStore = BgmChannelStore(cfg.bangumiChannelFile))
     val repo = SelectorRepository(cfg.selectorsDir)
     val engine = SelectorEngine(fetcher, cfg.allowPrivateTargets)
     val sessions = proxySessions

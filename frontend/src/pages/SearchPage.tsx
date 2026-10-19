@@ -42,8 +42,10 @@ export default function SearchPage() {
   const [sourceErrors, setSourceErrors] = useState<Record<string, string>>({})
   const [sourcesLoading, setSourcesLoading] = useState(!!q)
   const [favIds, setFavIds] = useState<Set<number>>(() => favoriteIdSet())
-  /** 手动刷新用：自增即强制跳过缓存重新搜索（见下方 effect 开头） */
-  const [nonce, setNonce] = useState(0)
+  /** 手动刷新：先删掉这个关键词的缓存条目，再用 runId 触发 effect 重跑 ——
+   *  缓存里已经没有它，自然就走正常搜索路径。比「跳过缓存」的布尔标志干净：
+   *  少一个需要在 effect 里消费的隐式状态。 */
+  const [runId, setRunId] = useState(0)
 
   useEffect(() => {
     // cancelled 守卫：快速连续搜索时丢弃过期响应，避免旧结果覆盖新结果
@@ -64,7 +66,7 @@ export default function SearchPage() {
     }
     // 缓存命中（典型路径：条目页 → 返回）：直接恢复上一轮的结果，
     // 一个请求都不发。骨架屏不重来、已看到的源结果原样还在。
-    const cached = nonce === 0 ? searchCache.get(q) : undefined
+    const cached = searchCache.get(q)
     if (cached) {
       setBgm(cached.bgm)
       setBgmError('')
@@ -168,7 +170,7 @@ export default function SearchPage() {
       cancelled = true
       ctrl.abort()
     }
-  }, [q, nonce])
+  }, [q, runId])
 
   const sourceDetailHref = (source: string, name: string, url: string, cover: string) =>
     `/source/${encodeURIComponent(source)}?url=${encodeURIComponent(url)}&title=${encodeURIComponent(name)}&cover=${encodeURIComponent(cover)}`
@@ -236,8 +238,9 @@ export default function SearchPage() {
             title="重新搜索（跳过记忆的结果）"
             aria-label="重新搜索"
             onClick={() => {
+              // 先删缓存再触发重跑：effect 重跑时查不到缓存，自然走完整搜索路径
               searchCache.delete(q)
-              setNonce((n) => n + 1)
+              setRunId((n) => n + 1)
             }}
           >
             <IconRefresh />

@@ -126,6 +126,9 @@ data class AppConfig(
 
     val selectorsDir: Path get() = dataDir.resolve("selectors")
 
+    /** Bangumi 通道选择的持久化位置（设置页写入，重启后保留） */
+    val bangumiChannelFile: Path get() = dataDir.resolve("bangumi-channel.json")
+
     /** 个人数据（收藏/历史/进度）在服务端的落点 */
     val userDataFile: Path get() = dataDir.resolve("userdata.json")
 

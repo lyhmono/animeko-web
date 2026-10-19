@@ -37,6 +37,46 @@ export interface BgmSubject {
   eps?: BgmEpisode[] | number
 }
 
+/** 每日放送的一天（Bangumi /v0/calendar） */
+export interface BgmCalendarDay {
+  weekday: { id: number; en: string; cn: string }
+  items: BgmCalendarItem[]
+}
+
+/** 放送表里的一项：比 BgmSubject 少了 summary，eps 是「已放送集数」整数 */
+export interface BgmCalendarItem {
+  id: number
+  name: string
+  name_cn: string
+  score?: number | null
+  rating?: BgmRating | null
+  images?: BgmImages | null
+  eps?: number | null
+}
+
+/** Bangumi 通道（与后端 BgmChannel 枚举字面量一致） */
+export type BgmChannelKind = 'AUTO' | 'OFFICIAL' | 'MIRROR' | 'CUSTOM'
+
+export interface BgmChannelInfo {
+  channel: BgmChannelKind
+  customUrls: string[]
+  /** 当前实际生效的候选地址（AUTO/CUSTOM 展开后的列表），展示用 */
+  effectiveBases: string[]
+  /** 官方默认候选，展示「自动」时用的是哪几个地址 */
+  defaultBases: string[]
+  calendarSupported: boolean
+}
+
+export interface BgmProbeResult {
+  base: string
+  /** 核心能力（搜索/条目/剧集）是否可用 */
+  ok: boolean
+  latencyMs: number
+  detail: string
+  /** 每日放送端点是否可用；镜像通常是 false 而 ok 是 true */
+  calendarOk: boolean
+}
+
 export interface SubjectHit {
   name: string
   url: string

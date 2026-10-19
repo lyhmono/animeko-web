@@ -3,6 +3,7 @@ package com.animeko.web.api
 import com.animeko.web.auth.LoginRateLimiter
 import com.animeko.web.auth.SessionStore
 import com.animeko.web.bangumi.BangumiClient
+import com.animeko.web.bangumi.BgmChannelResponse
 import com.animeko.web.config.AppConfig
 import com.animeko.web.appLog
 import com.animeko.web.data.UserDataStore
@@ -250,6 +251,77 @@ fun Application.configureApiRoutes(
             } else {
                 call.respond(bangumi.search(q))
             }
+        }
+
+        // 每日放送表（首页用）。镜像不支持该端点时会 502 —— 前端把它当
+        // 可选项：拉不到就整块隐藏，不影响页面其他部分。
+        get("/api/bangumi/calendar") {
+            call.respond(bangumi.calendar())
+        }
+
+        // ---- Bangumi 通道（设置页：官方/镜像/自定义/自动）----
+        get("/api/bangumi/channel") {
+            val st = bangumi.channelState()
+            call.respond(
+                BgmChannelResponse(
+                    channel = st.channel,
+                    customUrls = st.customUrls,
+                    effectiveBases = bangumi.effectiveBases(),
+                    calendarSupported = bangumi.calendarSupported,
+                ),
+            )
+        }
+
+        // 保存通道选择。写接口天然被根 intercept 的 CSRF 检查覆盖，
+        // 鉴权开启时也要求凭据 —— 只有站长能改全局上游。
+        put("/api/bangumi/channel") {
+            val form = bodyObject(call)
+            val raw = form?.stringField("channel")?.trim()?.uppercase()
+            val channel = when (raw) {
+                null -> throw IllegalArgumentException("缺少 channel（AUTO/OFFICIAL/MIRROR/CUSTOM）")
+                "AUTO" -> com.animeko.web.bangumi.BgmChannel.AUTO
+                "OFFICIAL" -> com.animeko.web.bangumi.BgmChannel.OFFICIAL
+                "MIRROR" -> com.animeko.web.bangumi.BgmChannel.MIRROR
+                "CUSTOM" -> com.animeko.web.bangumi.BgmChannel.CUSTOM
+                else -> throw IllegalArgumentException("无法识别的 channel「$raw」，只接受 AUTO/OFFICIAL/MIRROR/CUSTOM")
+            }
+            val custom = form?.stringArrayField("customUrls").orEmpty()
+            val saved = bangumi.setChannel(com.animeko.web.bangumi.BgmChannelConfig(channel, custom))
+            call.respond(
+                BgmChannelResponse(
+                    channel = saved.channel,
+                    customUrls = saved.customUrls,
+                    effectiveBases = bangumi.effectiveBases(),
+                    calendarSupported = bangumi.calendarSupported,
+                ),
+            )
+        }
+
+        // 探测候选地址的连通性，让站长在保存前就看见「这个镜像不支持每日放送」。
+        // body 可带目标通道（探测未保存的选项）；不带则探测当前已保存的通道。
+        post("/api/bangumi/channel/probe") {
+            val text = call.receiveCappedText()
+            // 请求体只能读一次（Ktor 的 receiveChannel 不可重放），这里必须复用
+            // 已读到的 text，不能再调 bodyObject —— 那会二次 receive 拿到空内容。
+            // 解析失败统一转成 IllegalArgumentException（→ 400），
+            // 否则 SerializationException 会落到 Throwable 兜底变成 500。
+            val target = if (text.isBlank()) {
+                null
+            } else {
+                val form = runCatching { prettyJson.parseToJsonElement(text).jsonObject }.getOrNull()
+                    ?: throw IllegalArgumentException("探测请求必须是 JSON 对象")
+                form.stringField("channel")?.trim()?.uppercase()?.let { r ->
+                    val ch = when (r) {
+                        "AUTO" -> com.animeko.web.bangumi.BgmChannel.AUTO
+                        "OFFICIAL" -> com.animeko.web.bangumi.BgmChannel.OFFICIAL
+                        "MIRROR" -> com.animeko.web.bangumi.BgmChannel.MIRROR
+                        "CUSTOM" -> com.animeko.web.bangumi.BgmChannel.CUSTOM
+                        else -> throw IllegalArgumentException("无法识别的 channel「$r」")
+                    }
+                    com.animeko.web.bangumi.BgmChannelConfig(ch, form.stringArrayField("customUrls"))
+                }
+            }
+            call.respond(bangumi.probe(target))
         }
 
         get("/api/bangumi/subjects/{id}") {

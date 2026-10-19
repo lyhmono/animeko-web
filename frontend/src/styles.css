@@ -688,6 +688,148 @@ textarea::placeholder {
   flex-wrap: wrap;
 }
 
+/* ============================================================
+   设置页 Bangumi 通道卡片
+   ============================================================ */
+
+.channel-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.channel-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.channel-option:hover {
+  border-color: var(--border-strong);
+}
+
+.channel-option.active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.channel-option input[type='radio'] {
+  margin-top: 3px;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+
+.channel-option > span {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.channel-option-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.channel-option-note {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+.channel-custom {
+  width: 100%;
+  padding: 8px 10px;
+  font-family: monospace;
+  font-size: 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text);
+  resize: vertical;
+}
+
+.channel-custom:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.probe-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: baseline;
+  font-family: monospace;
+}
+
+.probe-detail {
+  color: var(--text-dim);
+  font-family: inherit;
+}
+
+/* ============================================================
+   首页每日放送（Bangumi calendar）
+   ============================================================ */
+
+/* 放送表是首页主体，hero 相应收紧：标题区让位给内容，
+   大搜索框保留（仍是这个页面的第一动作），纵向留白减半 */
+.hero.hero-compact,
+.home > .hero {
+  padding: 48px 0 28px;
+}
+
+.airing-tabs {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+  margin-bottom: 16px;
+  scrollbar-width: none;
+}
+
+.airing-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.airing-tab {
+  flex-shrink: 0;
+  padding: 7px 18px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  font-size: 13px;
+  letter-spacing: 1px;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.airing-tab:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.airing-tab.active {
+  color: var(--accent-on);
+  background: var(--accent-solid);
+  border-color: var(--accent-solid);
+  font-weight: 600;
+}
+
+/* 无放送的日子：弱化但不隐藏 —— 用户点的星期得给个反馈 */
+.airing-tab.empty:not(.active) {
+  opacity: 0.55;
+}
+
 /* 搜索历史 chips */
 .history-chips {
   display: flex;

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api, errMsg } from '../api'
+import BangumiChannelCard from '../components/BangumiChannelCard'
 import {
   flushUserData,
   getSyncState,
@@ -132,6 +133,9 @@ export default function SettingsPage() {
         </div>
       </div>
 
+      {/* 服务端持久化配置：和主题不同，它对所有访问这台服务的设备生效 */}
+      <BangumiChannelCard />
+
       <div className="settings-group card">
         <h3>服务信息</h3>
         <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 2 }}>
@@ -179,7 +183,7 @@ export default function SettingsPage() {
                 [
                   'ANIMEKO_BANGUMI_BASE_URLS',
                   'api.bgm.tv,bgmapi.anibt.net',
-                  'Bangumi API 地址列表（逗号分隔，按顺序故障转移；官方被墙时可用社区镜像）',
+                  '自动通道的候选地址（逗号分隔）；更省心的切换方式在上方「Bangumi 数据源通道」卡片',
                 ],
               ].map(([k, v, d]) => (
                 <tr key={k} style={{ borderTop: '1px solid var(--border)' }}>
