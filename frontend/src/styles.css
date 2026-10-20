@@ -231,7 +231,9 @@ textarea::placeholder {
      只给 top 不给 bottom（也不给 height），就不会被拉伸填满。 */
   position: fixed;
   top: 10px;
-  right: 96px;
+  /* 右侧要让开「两个 36px 按钮 + gap2 + nav 右内边距 20」= 约 94px，
+     留到 104 是为了任何字体/缩放下的微小差异都不至于压上 */
+  right: 104px;
   display: flex;
   align-items: center;
   gap: 2px;
@@ -247,7 +249,8 @@ textarea::placeholder {
  */
 @media (min-width: 721px) and (max-width: 1100px) {
   .nav-tabs {
-    right: 92px;
+    /* 与桌面默认保持一致：按钮组是固定尺寸，不随断点变化 */
+    right: 104px;
   }
 
   .nav-tabs .nav-icon {
@@ -291,6 +294,19 @@ textarea::placeholder {
 .nav-tabs .nav-icon,
 .nav-links .nav-icon {
   display: none;
+}
+
+/*
+ * nav-links 现在只包着操作按钮（导航项已移到 .nav-tabs）。
+ * margin-left:auto 把它推到顶栏最右 —— 这条规则一度被我改 CSS 时误删，
+ * 结果是它退回块级、撑满整行，按钮跑到 x=518（E2E 的重叠检测抓到的）。
+ */
+.nav-links {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+  align-items: center;
+  flex-shrink: 0;
 }
 
 .nav-actions {
