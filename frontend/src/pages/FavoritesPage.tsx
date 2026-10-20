@@ -1,9 +1,10 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
   FAV_STATUS_LABEL,
   listFavorites,
   listSourceFavorites,
+  onDocChange,
   setFavoriteStatus,
   toggleFavorite,
   toggleSourceFavorite,
@@ -28,6 +29,19 @@ export default function FavoritesPage() {
   const [sourceFavs, setSourceFavs] = useState<SourceFavorite[]>(listSourceFavorites)
   const [filter, setFilter] = useState<FavStatus | 'all'>(() =>
     listFavorites().some((f) => f.status === 'watching') ? 'watching' : 'all',
+  )
+
+  useEffect(
+    () =>
+      onDocChange(() => {
+        // 上面那两个 useState 抄的是**挂载那一刻**的文档。启动时读取失败 → 用户点
+        // 横幅上的「重新读取」，换掉的是整个 doc，而这个页面毫无所知 ——
+        // 于是收藏明明已经读回来了，界面上仍然是一片「还没有收藏」，
+        // 看起来就像数据没了。整份换档时重抄一遍。
+        setFavorites(listFavorites())
+        setSourceFavs(listSourceFavorites())
+      }),
+    [],
   )
 
   const counts = useMemo(() => {

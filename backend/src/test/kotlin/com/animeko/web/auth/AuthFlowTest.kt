@@ -28,12 +28,14 @@ class AuthFlowTest {
         token: String? = null,
         authEnabled: Boolean = true,
         trustedProxyHops: Int = 0,
+        cookieSecure: Boolean = false,
     ) = AppConfig(
         authEnabled = authEnabled,
         authUser = user,
         authPassword = password,
         authToken = token,
         trustedProxyHops = trustedProxyHops,
+        cookieSecure = cookieSecure,
         dataDir = Files.createTempDirectory("animeko-auth-test"),
         frontendDir = "definitely-not-exist",
     )
@@ -63,6 +65,56 @@ class AuthFlowTest {
 
         val ok = client.get("/api/selector/sources") { header(HttpHeaders.Cookie, cookieOf(resp)) }
         assertEquals(HttpStatusCode.OK, ok.status)
+    }
+
+    @Test
+    fun `https deployments get the __Host- prefix and it still authenticates`() = testApplication {
+        application { module(config(cookieSecure = true)) }
+        val resp = client.post("/api/session/login") {
+            setBody("""{"username":"me","password":"correct horse"}""")
+        }
+        val raw = resp.headers[HttpHeaders.SetCookie] ?: fail("登录必须下发会话 Cookie")
+        assertTrue(raw.startsWith("__Host-animeko_session="), "`__Host-` 前缀只在 Secure 下合法：$raw")
+        assertTrue(raw.contains("Secure"), "前缀要求 Secure，缺了浏览器会整条丢弃：$raw")
+        assertTrue(raw.contains("SameSite=Strict"), raw)
+
+        // 真正要紧的是**读侧也认这个名字**：只改写入不改读取的话，
+        // 登录返回 200 而每一次后续请求都是 401，症状是「登录页反复回弹」
+        val ok = client.get("/api/selector/sources") { header(HttpHeaders.Cookie, cookieOf(resp)) }
+        assertEquals(HttpStatusCode.OK, ok.status, "带 __Host- 会话必须能用（Cookie 头是原样名字）")
+    }
+
+    @Test
+    fun `plain http deployments must not use the host prefix`() = testApplication {
+        // `__Host-` 要求 Secure。默认部署是 http（本机 8080 或 SSH 隧道），
+        // 那时加上前缀浏览器会**整条丢弃** Set-Cookie，比不加固糟糕得多：
+        // 表现就是「口令明明对了，页面一直停在登录页」。
+        application { module(config(cookieSecure = false)) }
+        val raw = client.post("/api/session/login") {
+            setBody("""{"username":"me","password":"correct horse"}""")
+        }.headers[HttpHeaders.SetCookie].orEmpty()
+        assertTrue(raw.startsWith("animeko_session="), "http 部署必须用不带前缀的名字：$raw")
+        assertFalse(raw.contains("__Host-"), raw)
+        assertEquals(HttpStatusCode.OK, client.get("/api/selector/sources") { header(HttpHeaders.Cookie, raw.substringBefore(';')) }.status)
+    }
+
+    @Test
+    fun `logout clears both cookie names`() = testApplication {
+        // 读侧两个名字都认（升级/降级期间不断登录），所以注销也必须两个都覆盖：
+        // 只清当前那一个，另一份同名会话会在浏览器里活下来并被重新采纳
+        application { module(config(cookieSecure = true)) }
+        val login = client.post("/api/session/login") {
+            setBody("""{"username":"me","password":"correct horse"}""")
+        }
+        val cookie = cookieOf(login)
+        assertEquals(HttpStatusCode.OK, client.get("/api/selector/sources") { header(HttpHeaders.Cookie, cookie) }.status)
+        val out = client.post("/api/session/logout") { header(HttpHeaders.Cookie, cookie) }
+        val cleared = out.headers.getAll(HttpHeaders.SetCookie).orEmpty()
+        assertEquals(2, cleared.size, "两个名字都要清：$cleared")
+        assertTrue(cleared.any { it.startsWith("__Host-animeko_session=;") }, cleared.toString())
+        assertTrue(cleared.any { it.startsWith("animeko_session=;") }, cleared.toString())
+        assertTrue(cleared.all { it.contains("Max-Age=0") }, cleared.toString())
+        assertEquals(HttpStatusCode.Unauthorized, client.get("/api/selector/sources") { header(HttpHeaders.Cookie, cookie) }.status)
     }
 
     @Test
@@ -146,7 +198,7 @@ class AuthFlowTest {
     }
 
     @Test
-    fun `repeated failures get rate limited for one client`() = testApplication {
+    fun `repeated failures get rate limited but the right password is never locked out`() = testApplication {
         val limiter = LoginRateLimiter(maxAttempts = 3, windowMs = 60_000)
         application { module(config(), loginLimiter = limiter) }
         repeat(3) {
@@ -155,12 +207,36 @@ class AuthFlowTest {
                 client.post("/api/session/login") { setBody("""{"username":"me","password":"nope"}""") }.status,
             )
         }
-        // 次数用完之后，连「输对了口令」也要先等窗口过去：限速的意义就是让在线爆破没有意义
-        val blocked = client.post("/api/session/login") {
+        // 超限额之后，**猜错**不再得到 yes/no：在线爆破的速率就这么被封住
+        val blockedWrong = client.post("/api/session/login") {
+            setBody("""{"username":"me","password":"nope"}""")
+        }
+        assertEquals(HttpStatusCode.TooManyRequests, blockedWrong.status)
+        assertTrue(blockedWrong.headers[HttpHeaders.RetryAfter]?.isNotBlank() == true, "429 要给浏览器 Retry-After")
+
+        // 但**猜对的人不能被自己的正确口令挡在门外**。这一格原先是 429，理由写着
+        // 「让在线爆破没有意义」——那站不住：攻击者口令对了本来就该进去，
+        // 等 5 分钟再来一次即可，被这个决定付出的代价是零。
+        // 收代价的是机主：会话只存内存，容器一重启就必须重新走登录页，
+        // 而直连部署下限速键是来源 IP（攻击者只锁得到自己），
+        // 反代没配 ANIMEKO_TRUSTED_PROXY_HOPS 时全站共用代理那一个键 ——
+        // 任何匿名访客都能持续把机主锁在他自己家门外。
+        // 实测（8 次错口令后）：正确口令 429 Retry-After: 300，
+        // 而同一时刻同一套凭据走 Basic 打保护接口是 200，两条路径自相矛盾。
+        val blockedRight = client.post("/api/session/login") {
             setBody("""{"username":"me","password":"correct horse"}""")
         }
-        assertEquals(HttpStatusCode.TooManyRequests, blocked.status)
-        assertTrue(blocked.headers[HttpHeaders.RetryAfter]?.isNotBlank() == true, "429 要给浏览器 Retry-After")
+        assertEquals(HttpStatusCode.OK, blockedRight.status, blockedRight.bodyAsText())
+        // 这个 200 必须是真的能用（不是回了个成功却不发会话）
+        assertEquals(
+            HttpStatusCode.OK,
+            client.get("/api/selector/sources") { header(HttpHeaders.Cookie, cookieOf(blockedRight)) }.status,
+        )
+        // 成功登录清掉本客户端的账：只有「确实知道口令」的人才有能力重置计数器
+        assertEquals(
+            HttpStatusCode.Unauthorized,
+            client.post("/api/session/login") { setBody("""{"username":"me","password":"nope"}""") }.status,
+        )
     }
 
     @Test
@@ -179,10 +255,29 @@ class AuthFlowTest {
 
     @Test
     fun `login page can be served but the api stays shut`() = testApplication {
-        // 静态资源不鉴权：登录页本身必须能打开，否则用户只会看到一个空白/401
-        application { module(config()) }
+        // 静态资源不鉴权：登录页本身必须能打开，否则用户只会看到一个空白/401。
+        //
+        // 这条用例原先**没有测它的标题**：config() 把 frontendDir 指到一个不存在的目录，
+        // configureStaticFrontend 在 `if (!dir.isDirectory)` 处直接 return，
+        // 连那条 catch-all 路由都没装 —— 于是这里只断言了两个 API 状态码，
+        // 「登录页能打开」这半句一次都没请求过。现在真的摆一份 dist 出来。
+        val site = Files.createTempDirectory("animeko-login-page")
+        Files.writeString(
+            site.resolve("index.html"),
+            """<!doctype html><html><body><div id="root"></div></body></html>""",
+        )
+        application { module(config().copy(frontendDir = site.toString())) }
+        val page = client.get("/")
+        assertEquals(HttpStatusCode.OK, page.status, "鉴权开启时登录页也必须能直接打开")
+        assertTrue(page.bodyAsText().contains("id=\"root\""), page.bodyAsText().take(120))
         assertEquals(HttpStatusCode.Unauthorized, client.get("/api/bangumi/search?q=x").status)
         assertEquals(HttpStatusCode.OK, client.get("/api/health").status)
+        // 缺失的静态资源不能被 SPA 回退蒙成一份 200 的 HTML（那会让重新部署后白屏）
+        assertEquals(
+            HttpStatusCode.NotFound,
+            client.get("/assets/definitely-missing.js").status,
+            "缺失资源必须 404，而不是回退成 index.html",
+        )
     }
 
     // ---- SessionStore / LoginRateLimiter 单元行为 ----
@@ -291,17 +386,27 @@ class AuthFlowTest {
                 setBody("""{"username":"me","password":"nope"}""")
             }
         }
+        // .7 的窗口用尽：它再猜错就得不到 yes/no
         val stillBlocked = client.post("/api/session/login") {
             header(HttpHeaders.XForwardedFor, "203.0.113.7")
-            setBody("""{"username":"me","password":"correct horse"}""")
+            setBody("""{"username":"me","password":"nope"}""")
         }
         assertEquals(HttpStatusCode.TooManyRequests, stillBlocked.status)
 
         val other = client.post("/api/session/login") {
             header(HttpHeaders.XForwardedFor, "203.0.113.8")
+            // 用**错**口令问：这里要证明的是「各记各的账」，
+            // 而正确口令在哪个客户端都该是 200（上一条用例专门管这件事）
+            setBody("""{"username":"me","password":"nope"}""")
+        }
+        assertEquals(HttpStatusCode.Unauthorized, other.status, other.bodyAsText())
+
+        // 已经被限流的 .7 仍然能用正确口令进来：限速不许被拿来锁站
+        val owner = client.post("/api/session/login") {
+            header(HttpHeaders.XForwardedFor, "203.0.113.7")
             setBody("""{"username":"me","password":"correct horse"}""")
         }
-        assertEquals(HttpStatusCode.OK, other.status, other.bodyAsText())
+        assertEquals(HttpStatusCode.OK, owner.status, owner.bodyAsText())
     }
 
     @Test

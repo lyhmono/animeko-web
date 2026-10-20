@@ -72,6 +72,13 @@ class BgmChannelStore(private val file: Path) {
         }
         runCatching { Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING) }
             .recoverCatching { Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING) }
+            .onSuccess {
+                // rename 成功之后才需要固定目录项（见 syncDirOf）
+                val dir = file.parent
+                if (dir != null) runCatching {
+                    FileChannel.open(dir, StandardOpenOption.READ).use { it.force(true) }
+                }
+            }
             .onFailure {
                 runCatching { Files.deleteIfExists(tmp) }
                 throw IllegalArgumentException("保存 Bangumi 通道配置失败：${it.message ?: it::class.simpleName}")

@@ -87,6 +87,14 @@ export default function App() {
       await flushUserData()
       await signOut()
       markUserDataStale()
+      // 服务端根本没配凭据时，切到登录页是**死路**：那边只会一直回
+      // 409「服务端未配置登录凭据，无需登录」，而登录页没有任何返回入口，
+      // 用户只能强刷。这种情况直接留在站内（enter 会重新探一次会话）。
+      const after = await probeSession().catch(() => null)
+      if (after && !after.authEnabled) {
+        await enter()
+        return
+      }
       setBoot({ stage: 'login' })
     }
     window.addEventListener('animeko-sign-out', leave)
@@ -109,7 +117,15 @@ export default function App() {
       </div>
     )
   }
-  if (boot.stage === 'login') return <LoginPage onSuccess={() => void enter()} />
+  // 登录屏自己也要有兜底：它一崩，用户面对的是真正的白屏，
+  // 连"输了口令点进入"这个动作都没有
+  if (boot.stage === 'login') {
+    return (
+      <ErrorBoundary>
+        <LoginPage onSuccess={() => void enter()} />
+      </ErrorBoundary>
+    )
+  }
 
   return (
     <ErrorBoundary>

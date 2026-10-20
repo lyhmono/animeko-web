@@ -66,8 +66,32 @@ private const val HEALTH_PATH = "/api/health"
 private const val LOGIN_PATH = "/api/session/login"
 private const val LOGOUT_PATH = "/api/session/logout"
 
-/** 登录会话 Cookie 名。 */
+/**
+ * 登录会话 Cookie 名。
+ *
+ * 开了 `ANIMEKO_COOKIE_SECURE`（= 这套部署确实是 https）时改用 `__Host-` 前缀：
+ * 浏览器对带这个前缀的 Cookie 强制三条 —— 必须 Secure、不得带 Domain、Path 必须是 `/`。
+ * 于是邻居子域（`evil.example.com`，或被人抢注的子域）再也不能往这台机器上**种**一个
+ * 同名会话 Cookie（cookie tossing：攻击者用 `Domain=.example.com` 写一个
+ * `animeko_session=<他自己>` ，虽然过不了校验，但能把真用户那份顶掉，
+ * 让人反复掉线；更糟的是某些旧的「有 Cookie 就当已登录」的写法会被绕过）。
+ * 前缀把这整类可能直接取消了。
+ *
+ * **默认部署不能加前缀**：`__Host-` 要求 Secure，而本机 8080/SSH 隧道是 http，
+ * 加了浏览器会整个丢弃 Set-Cookie，症状是「登录页反复回弹」——比不加固更糟。
+ * 所以按 cookieSecure 分支，读的时候两个名字都认（升级那一刻已经登录的人不掉线，
+ * 也保证降级回去时旧 Cookie 仍然可用），注销时两个都清。
+ */
 private const val SESSION_COOKIE = "animeko_session"
+private const val HOST_PREFIXED_COOKIE = "__Host-$SESSION_COOKIE"
+
+/** 写：按当前是否 https 选名字。 */
+private fun sessionCookieName(cookieSecure: Boolean): String =
+    if (cookieSecure) HOST_PREFIXED_COOKIE else SESSION_COOKIE
+
+/** 读：两个名字都认，优先 `__Host-` 那份。 */
+private fun ApplicationCall.sessionToken(): String? =
+    cookieValue(HOST_PREFIXED_COOKIE) ?: cookieValue(SESSION_COOKIE)
 
 private const val PROXY_PATH = "/api/proxy"
 
@@ -193,17 +217,18 @@ fun Application.configureApiRoutes(
         post(LOGIN_PATH) {
             // CSRF 检查在根 intercept 里，登录接口也在它的覆盖范围内（只豁免鉴权，不豁免 CSRF）
             val clientKey = call.rateLimitKey(cfg)
-            if (limiter.blocked(clientKey)) {
-                call.response.header(HttpHeaders.RetryAfter, (limiter.windowSeconds()).toString())
-                call.respond(
-                    HttpStatusCode.TooManyRequests,
-                    mapOf("error" to "失败次数过多，请稍后再试"),
-                )
-                return@post
-            }
+            // 顺序必须与 authenticate() 那条一致：**先验证，只有猜错的人才去问限速器**。
+            // 原先是进门先 blocked()，于是超限窗口内连「输对了口令」也一律 429。
+            // 那一格挡不住攻击者（他口令对的时候本来就该进去，等窗口过后再来一次就行），
+            // 却能机主锁在自己家门外：会话只存内存，容器一重启就必须重新走登录页，
+            // 而任何人都能持续把这条路占住。直连部署下限速键是来源 IP（攻击者只锁自己），
+            // 但反代没配 ANIMEKO_TRUSTED_PROXY_HOPS 时全站共用代理那一个键 —— 实测
+            // 8 次错口令后 POST /api/session/login 带**正确**口令回 429 Retry-After: 300，
+            // 而同一时刻同一套凭据走 Authorization: Basic 打保护接口回 200：两条路径互相矛盾。
+            // 猜测速率照样被封死：超限期间的错误口令仍是 429，且不再往计数里加。
             // 请求体只能读一次：分两次 bodyField(...) 会让第二个字段永远为空，
             // 表现是「口令明明对了却提示请填写口令」。
-            val form = bodyObject(call)
+            val form = bodyObject(call, MAX_LOGIN_BODY_BYTES)
             val username = form?.stringField("username").orEmpty()
             val password = form?.stringField("password").orEmpty()
             when {
@@ -216,12 +241,20 @@ fun Application.configureApiRoutes(
                     mapOf("error" to "请填写口令"),
                 )
                 !credentialsMatch(cfg, username, password) -> {
-                    limiter.onFailure(clientKey)
-                    appLog.warn(
-                        "登录失败: user={} ip={} 累计={}",
-                        username.take(40), clientKey, limiter.attempts(clientKey),
-                    )
-                    call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "账号或口令不正确"))
+                    if (limiter.blocked(clientKey)) {
+                        call.response.header(HttpHeaders.RetryAfter, limiter.windowSeconds().toString())
+                        call.respond(
+                            HttpStatusCode.TooManyRequests,
+                            mapOf("error" to "失败次数过多，请稍后再试"),
+                        )
+                    } else {
+                        limiter.onFailure(clientKey)
+                        appLog.warn(
+                            "登录失败: user={} ip={} 累计={}",
+                            username.take(40), clientKey, limiter.attempts(clientKey),
+                        )
+                        call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "账号或口令不正确"))
+                    }
                 }
                 else -> {
                     limiter.onSuccess(clientKey)
@@ -239,8 +272,8 @@ fun Application.configureApiRoutes(
         }
 
         post(LOGOUT_PATH) {
-            call.cookieValue(SESSION_COOKIE)?.let { site.invalidate(it) }
-            call.response.setSessionCookie(cfg, "", 0)
+            call.sessionToken()?.let { site.invalidate(it) }
+            call.response.clearSessionCookie(cfg)
             call.respond(SessionStateResponse(authenticated = false))
         }
 
@@ -649,30 +682,35 @@ private fun ApplicationCall.isCrossSiteWrite(cfg: AppConfig): Boolean {
         hostHeader.substringBeforeLast(':')
     }
     if (originHost != hostName) return true
-    // 主机名相同还要比端口：只比主机的话，同一台机器上**另一个端口**跑的站点
-    // （另一个自托管服务、或被攻破的相邻 Web 应用）发出的跨站写会被当成同源放过。
-    // 实测：服务在 127.0.0.1:8240 时，Origin: http://127.0.0.1:9999 的 PUT 返回 200。
+    // 主机名相同还要比端口：同一台机器的另一个端口在浏览器眼里是**同站**
+    // （SameSite 不看端口，会话 Cookie 照样跟着发），不比端口就等于允许本机别的服务
+    // 任意写这个账号。实测：服务在 127.0.0.1:8240 时，Origin: http://127.0.0.1:9999
+    // 的 PUT 曾返回 200。
     //
-    // 反代模式（hops>=1）不比端口：那时 X-Forwarded-Host 里的端口常被改写成内部端口，
-    // 严格比会误杀正常同源请求；那种部署的边界本来就该由反代自己守住。
-    if (cfg.trustedProxyHops >= 1) return false
+    // 端口从哪来，按可信度分三档；**取不到就放行** —— 宁可漏一格，也不要把每一次
+    // 收藏都误杀成 403，那会逼用户去开 ANIMEKO_ALLOW_CROSS_ORIGIN 把整道防线拆掉。
+    //  1) Host / X-Forwarded-Host 里明写的端口：直接用。
+    //  2) hops>=1 时用 X-Forwarded-Proto 推：既然已经信任这层代理转发的 Host，
+    //     它转发的协议同样可信（https->443、http->80）。这一档以前是缺的：原写法是
+    //     「hops>=1 一律不比端口」，实测连 XFH 里明写的 8080 都被忽略，
+    //     http://public.example:3000 这种同站跨端口写照样 200，等于白送一个口子。
+    //  3) hops=0（直连）而 Host 不带端口：浏览器只对默认端口省略端口，所以只有本进程
+    //     确实监听在 80/443 时才继续比；否则说明中间有个没申报的代理（nginx 的
+    //     `proxy_set_header Host $host` 默认就抹掉端口），那时端口不可知，放行。
     val hostPortText = if (hostHeader.startsWith('[')) {
         hostHeader.substringAfterLast(']').substringAfter(':', "")
     } else {
         hostHeader.substringAfter(':', "")
     }
-    // Host 头没写端口时，不能一口咬定那是 80 —— 但也不必直接放弃比较：
-    // 「Host 不带端口」只有两种来源，而本进程的监听端口能把它们分开。
-    //  1) 真的在服务默认端口（80/443）：那 cfg.port 就是浏览器看到的外部端口，照常比较。
-    //     这一格必须比：同源判定里「同一台机器的另一个端口」是**同站**（SameSite 不看端口），
-    //     会话 Cookie 照样会跟着发过去，不比端口就等于让本机任意别的服务写这个账号的数据。
-    //  2) 前面的反代把端口抹掉了（nginx 的 `$host` 默认就不带端口）：此时 cfg.port 是内部端口
-    //     （8080 之类），拿它去比浏览器给的 443 只会一律误杀 —— 每一次收藏、每一次保存都 403，
-    //     而用户唯一的自救办法是开 ANIMEKO_ALLOW_CROSS_ORIGIN 把整道防线拆掉。
-    //     那种部署正确做法是如实填 ANIMEKO_TRUSTED_PROXY_HOPS（上面 hops>=1 就不再比端口）。
-    // 所以：拿不到端口时，只有本进程确实在默认端口上才继续比较，否则放行。
     val hostPort = hostPortText.takeIf { it.isNotBlank() }?.toIntOrNull()
-        ?: cfg.port.takeIf { it == 80 || it == 443 }
+        ?: if (cfg.trustedProxyHops >= 1) {
+            // 取最后一个值：每经过一跳可信代理就追加一次，最右那个才是我们这位代理看到的协议
+            request.headers[HttpHeaders.XForwardedProto]
+                ?.split(',')?.lastOrNull()?.trim()?.lowercase()
+                ?.let { defaultPortFor(it) }
+        } else {
+            cfg.port.takeIf { it == 80 || it == 443 }
+        }
         ?: return false
     val originPort = runCatching { URI(origin).port }.getOrNull()?.takeIf { it > 0 }
         ?: defaultPortFor(runCatching { URI(origin).scheme?.lowercase() }.getOrNull())
@@ -727,7 +765,7 @@ private fun ApplicationCall.pathSegments(): List<String> {
 }
 
 private fun ApplicationCall.hasValidSession(site: SessionStore): Boolean =
-    cookieValue(SESSION_COOKIE)?.let { site.isValid(it) } == true
+    sessionToken()?.let { site.isValid(it) } == true
 
 /**
  * 这个 401 该不该附 Basic 质询。
@@ -760,17 +798,24 @@ private fun ApplicationCall.authenticate(
 ): AuthResult {
     if (hasValidSession(site)) return AuthResult.Authorized
     val header = request.headers["Authorization"] ?: return AuthResult.Failed
+    // 顺序很重要：**先验证，只有失败了才问限速器**。
+    // 反过来（先 blocked() 再验证）会让「超限期间的正确凭据」也被拒成 429 ——
+    // 那挡不住攻击者（他手里本来就没有正确凭据），却能锁死合法用户：
+    // 限速键在直连部署下就是来源 IP，而反代没配 ANIMEKO_TRUSTED_PROXY_HOPS 时
+    // 全站共用一个键，于是任何人发 8 个错口令就能让整站在窗口期内谁都进不来，
+    // 并且可以反复续期。爆破的预算照样被限（每窗口 8 次），只是不再拿它惩罚成功。
+    val ok = headerAuthorized(cfg, site, header)
+    if (ok) return AuthResult.Authorized
     val key = rateLimitKey(cfg)
     if (limiter.blocked(key)) return AuthResult.Throttled
-    val ok = headerAuthorized(cfg, site, header)
-    // 失败要记账，**成功不注销账**。
-    // 原来这里跟着 `if (ok) limiter.onSuccess(key)`，而 key 在直连部署下就是来源 IP：
-    // 浏览器会自动附带缓存的 Basic 凭据，受害者每正常访问一次就把攻击者的失败计数清零，
-    // 只要这个 IP 上还有人活着地在用页面，在线爆破就没有上限（反代没配 hops 时全站共用一个键，
-    // 更容易触发）。登录接口那边仍然在成功时清账 —— 那是一次「确实知道口令」的、
-    // 需要口令本身才能触发的动作，两者不是一回事。
-    if (!ok) limiter.onFailure(key)
-    return if (ok) AuthResult.Authorized else AuthResult.Failed
+    // 失败要记账，**成功不注销账**（成功在几行前就 return 了）。
+    // 这里原先是 `if (ok) limiter.onSuccess(key) else limiter.onFailure(key)`，
+    // 而 key 在直连部署下就是来源 IP：浏览器会自动附带缓存的 Basic 凭据，
+    // 受害者每正常访问一次就把攻击者的失败计数清零 —— 只要这个 IP 上还有人活着，
+    // 在线爆破就没有上限（反代没配 hops 时全站共用一个键，更容易触发）。
+    // 登录接口那边仍然在成功时清账：那是「确实知道口令」才能触发的动作，性质不同。
+    limiter.onFailure(key)
+    return AuthResult.Failed
 }
 
 private fun headerAuthorized(cfg: AppConfig, site: SessionStore, header: String): Boolean {
@@ -823,7 +868,7 @@ private fun ApplicationResponse.setSessionCookie(cfg: AppConfig, value: String, 
     header(
         HttpHeaders.SetCookie,
         buildString {
-            append(SESSION_COOKIE).append('=').append(value)
+            append(sessionCookieName(cfg.cookieSecure)).append('=').append(value)
             append("; Path=/")
             append("; HttpOnly")
             append("; SameSite=Strict")
@@ -834,6 +879,24 @@ private fun ApplicationResponse.setSessionCookie(cfg: AppConfig, value: String, 
 }
 
 /** 凭据比较不走 String==（短路返回，长度/前缀可被时序探测）。 */
+/**
+ * 注销时把**两个**名字都覆盖掉。只清当前那一个会留下另一半：
+ * 站长开过 HTTPS（`__Host-` 那份）又关掉之后，旧浏览器里仍然揣着另一份同名会话，
+ * 而读侧两个名字都认 —— 「已注销」的账号会被那份复活。
+ * 多下发一条无害：不存在的那个名字浏览器直接忽略。
+ */
+private fun ApplicationResponse.clearSessionCookie(cfg: AppConfig) {
+    listOf(HOST_PREFIXED_COOKIE, SESSION_COOKIE).forEach { name ->
+        header(
+            HttpHeaders.SetCookie,
+            buildString {
+                append(name).append("=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+                if (cfg.cookieSecure) append("; Secure")
+            },
+        )
+    }
+}
+
 private fun constantTimeEquals(a: String, b: String): Boolean =
     MessageDigest.isEqual(a.toByteArray(Charsets.UTF_8), b.toByteArray(Charsets.UTF_8))
 
@@ -1015,11 +1078,20 @@ private fun readCapped(input: InputStream, maxBytes: Long): String =
  */
 private const val MAX_BODY_BYTES = 1L * 1024 * 1024
 
+/**
+ * 登录表单的体积上限，比通用上限小一个量级。
+ *
+ * 单独设一个数是上面那个顺序决定的：登录现在**先读体再判限速**（否则正确口令会被
+ * 限速挡在门外），于是每个来敲门的请求都会真的读一次体。留 1MB 等于让被限流的客户端
+ * 照旧能按请求体压带宽与堆；32KB 装得下任意长的 token，又让这件事没有可乘之处。
+ */
+private const val MAX_LOGIN_BODY_BYTES = 32L * 1024
+
 private suspend fun bodyField(call: ApplicationCall, field: String): String? =
     bodyObject(call)?.stringField(field)
 
-private suspend fun bodyObject(call: ApplicationCall): JsonObject? = try {
-    prettyJson.parseToJsonElement(call.receiveCappedText()).jsonObject
+private suspend fun bodyObject(call: ApplicationCall, maxBytes: Long = MAX_BODY_BYTES): JsonObject? = try {
+    prettyJson.parseToJsonElement(call.receiveCappedText(maxBytes)).jsonObject
 } catch (e: Exception) {
     null
 }
@@ -1074,8 +1146,10 @@ private suspend fun ApplicationCall.receiveCappedText(maxBytes: Long = MAX_BODY_
         out.write(chunk, 0, n)
     }
     val text = String(out.toByteArray(), Charsets.UTF_8)
-    // 体积上限挡不住「400KB 的一把左括号」：那种递归解析会打穿栈，
-    // 而 StackOverflowError 不是 Exception，各处 runCatching 接不住它。
+    // 体积上限挡不住「400KB 的一把左括号」：那种递归解析会打穿栈。
+    // 不能只指望下游接得住：catch (Exception) 接不住 Error，而 runCatching 接得住
+    // 却会把合法 JSON 判成坏文件搬走（两种后果都不是「这个请求被拒绝了」）。
+    // 详见 JsonGuard 的类注释。
     JsonGuard.requireShallow(text)
     return text
 }

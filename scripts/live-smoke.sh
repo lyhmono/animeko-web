@@ -65,12 +65,20 @@ require_fresh_build() {
   local artifact
   artifact=$(dirname "$(dirname "$BIN")")/lib/animeko-web-0.1.0.jar
   [ -f "$artifact" ] || artifact=$BIN
-  newer=$(find backend/src/main frontend/src frontend/index.html -newer "$artifact" -type f \
-    \( -name '*.kt' -o -name '*.ts' -o -name '*.tsx' -o -name '*.css' -o -name '*.html' \) 2>/dev/null | head -3)
+  # 比的是 jar 的输入：**只有后端**。上一版加宽这里时误把 frontend/** 也塞进来了，
+  # 于是「只改前端」也会报「jar 过期」——假警报会让人去重编一个并不过期的产物，
+  # 久而久之就有人直接绕过这道闸门，那比没有闸门更糟。前端由下面 dist 那一格管。
+  newer=$(find backend/src/main backend/build.gradle.kts backend/settings.gradle.kts \
+      -newer "$artifact" -type f \
+    \( -name '*.kt' -o -name '*.kts' -o -name '*.xml' -o -name '*.json' \) 2>/dev/null | head -3)
   [ -n "$newer" ] && stale="后端源码比 $(basename "$artifact") 新：$(printf '%s ' $newer)"
   if [ -f "$DIST/index.html" ]; then
-    newer=$(find frontend/src frontend/index.html frontend/vite.config.ts -newer "$DIST/index.html" -type f \
-      \( -name '*.ts' -o -name '*.tsx' -o -name '*.css' -o -name '*.html' \) 2>/dev/null | head -3)
+    # 前端侧清单：src 与 public 下的任何东西都会进 dist
+    newer=$(find frontend/src frontend/public frontend/index.html frontend/vite.config.ts \
+        frontend/package.json frontend/package-lock.json frontend/tsconfig.json \
+        -newer "$DIST/index.html" -type f \
+      \( -name '*.ts' -o -name '*.tsx' -o -name '*.css' -o -name '*.html' -o -name '*.js' \
+         -o -name '*.json' -o -name '*.png' -o -name '*.svg' -o -name '*.webmanifest' \) 2>/dev/null | head -3)
     [ -n "$newer" ] && stale="$stale 前端源码比 dist/index.html 新：$(printf '%s ' $newer)"
   fi
   if [ -n "$stale" ]; then
@@ -107,6 +115,14 @@ contains "Set-Cookie 有 HttpOnly" 'HttpOnly' "$HDR"
 contains "Set-Cookie 有 SameSite" 'SameSite=Strict' "$HDR"
 contains "Set-Cookie 有 Max-Age" 'Max-Age=' "$HDR"
 contains "jar 里有会话号" 'animeko_session' "$(cat "$JAR")"
+# `__Host-` 前缀只在开了 Secure（= 确实是 https）时才用：默认部署是 http，
+# 带前缀浏览器会整条丢弃 Set-Cookie，症状是「口令对了却一直在登录页」
+SCNAME=$(printf '%s' "$HDR" | tr ';' '\n' | grep -o 'Set-Cookie: *[^= ]*' | head -1 | sed 's/.*: *//')
+check "http 部署的会话 Cookie 名不带 __Host- 前缀" "animeko_session" "$SCNAME"
+# 登录接口现在先读体再判限速，所以它自己必须有一个远小于 1MB 的上限，
+# 否则被限流的客户端照样能按请求体压带宽与堆
+BIG=$(python3 -c "print('{\"username\":\"me\",\"password\":\"' + 'a'*40000 + '\"}')")
+check "登录请求体超过 32KB 被拒" "400" "$(curl -sS -o /dev/null -w '%{http_code}' -m 5 -X POST "$BASE/api/session/login" -d "$BIG")"
 contains "响应不回显口令" 'NOLEAK' "$(printf '%s' "$R$HDR" | grep -ci 's3cret-pass' | sed 's/^0$/NOLEAK/')"
 check "登录后取数据源" "200" "$(curl -sS -b "$JAR" -o /dev/null -w '%{http_code}' -m 5 "$BASE/api/selector/sources")"
 contains "登录后 health 已认证" '"authenticated":true' "$(curl -sS -b "$JAR" -m 5 "$BASE/api/health")"
@@ -120,7 +136,12 @@ contains "磁盘上有 userdata.json" '孤独摇滚' "$(cat "$A/userdata.json" 2
 contains "结构可回读" '孤独摇滚' "$(curl -sS -b "$JAR" -m 5 "$BASE/api/data")"
 check "非对象被拒" "400" "$(curl -sS -b "$JAR" -o /dev/null -w '%{http_code}' -m 5 -X PUT "$BASE/api/data" -d '[1,2]')"
 check "覆盖写" "200" "$(curl -sS -b "$JAR" -o /dev/null -w '%{http_code}' -m 5 -X PUT "$BASE/api/data" -d '{"favorites":[]}')"
-check "残留 tmp 文件" "0" "$(ls "$A" | grep -c '\.tmp$')"
+# 目录不存在时 ls 报错、grep -c 仍然输出 0：那会把「压根没查」报成「查过且干净」
+if [ -d "$A" ]; then
+  check "残留 tmp 文件" "0" "$(find "$A" -maxdepth 1 -name '*.tmp' | wc -l | tr -d ' ')"
+else
+  bad "数据目录不存在，无法检查残留临时文件" "$A"
+fi
 
 echo "== 4. 聚合订阅（真实订阅站）"
 # 可以用 SMOKE_SUB 指向别的订阅源（例如一个必然连不上或只给 0 条的假地址），
@@ -161,6 +182,12 @@ fi
 
 echo "== 5. 静态资源与缓存"
 ASSET=$(curl -sS -b "$JAR" -m 5 "$BASE/" | grep -o 'assets/index-[^"]*\.js' | head -1)
+if [ -z "$ASSET" ]; then
+  # 不守住这一格，"$BASE/$ASSET" 就退化成 "$BASE/" —— 首页回 200，于是凭空记一个 ok。
+  # 填一个必然 404 的路径，让后面几项响亮地失败，而不是被首页蒙过去
+  bad "首页没有引用任何 JS 产物（构建或托管坏了）" "$(curl -sS -m 5 "$BASE/" | head -c 160)"
+  ASSET="assets/NO-BUILD-PRESENT.js"
+fi
 check "带哈希的 JS 存在" "200" "$(curl -sS -o /dev/null -w '%{http_code}' -m 5 "$BASE/$ASSET")"
 contains "强缓存" 'immutable' "$(curl -sS -D - -o /dev/null -m 5 "$BASE/$ASSET" | tr -d '\r' | grep -i '^cache-control')"
 contains "入口不缓存" 'no-cache' "$(curl -sS -D - -o /dev/null -m 5 "$BASE/" | tr -d '\r' | grep -i '^cache-control')"
@@ -177,13 +204,22 @@ check "旧会话号不能当 Bearer 复用" "401" "$(curl -sS -o /dev/null -w '%
 check "Basic 口令依旧可用（给命令行/播放器）" "200" "$(curl -sS -o /dev/null -w '%{http_code}' -m 5 -u me:s3cret-pass "$BASE/api/selector/sources")"
 contains "会话号不进日志" 'NOLEAK' "$(grep -c "$SID" "$A/server.log" | sed 's/^0$/NOLEAK/')"
 
-echo "== 7. 限速"
+echo "== 7. 限速：猜错的人要挡住，猜对的人不能被锁在门外"
 for _ in $(seq 1 8); do
   curl -sS -o /dev/null -m 5 -X POST "$BASE/api/session/login" -d '{"username":"me","password":"bad"}'
 done
-RESP=$(curl -sS -D "$A/429.txt" -o /dev/null -w '%{http_code}' -m 5 -X POST "$BASE/api/session/login" -d '{"username":"me","password":"s3cret-pass"}')
-check "连错 8 次后正确口令也被挡" "429" "$RESP"
+# 超限期间**继续猜错**：不再给它 yes/no 的反馈
+RESP=$(curl -sS -D "$A/429.txt" -o /dev/null -w '%{http_code}' -m 5 -X POST "$BASE/api/session/login" -d '{"username":"me","password":"bad"}')
+check "连错 8 次后再猜错是 429 而不是 401" "429" "$RESP"
 contains "429 带 Retry-After" 'Retry-After' "$(tr -d '\r' < "$A/429.txt")"
+# 超限期间**猜对**必须登录成功。原先这一格也是 429，那是能把机主永久锁在自己家门外：
+# 会话只存内存，容器一重启就只能重新走登录页，而反代没申报 ANIMEKO_TRUSTED_PROXY_HOPS 时
+# 全站共用同一个限速键，任何匿名访客都能反复占住这条路。拦猜测靠的是「猜错不计入窗口」
+# 那一格（上面刚验过），不是把对的人也一起挡掉。
+check "超限期间正确口令仍可登录" "200" "$(curl -sS -o /dev/null -w '%{http_code}' -m 5 -X POST "$BASE/api/session/login" -d '{"username":"me","password":"s3cret-pass"}')"
+# 能重置计数器的只有「确实知道口令」的人：这次成功登录把账清了，
+# 于是再猜错回到 401，而不是继续吃 429（那是第 10 节在保护接口上验的同一件事）
+check "成功登录后重新计数：再猜错回到 401" "401" "$(curl -sS -o /dev/null -w '%{http_code}' -m 5 -X POST "$BASE/api/session/login" -d '{"username":"me","password":"bad"}')"
 
 echo "== 8. 文件名字符集自检（LANG 被拿掉的第二个实例）"
 start $B 18098 nolang || exit 1
@@ -217,7 +253,11 @@ echo "== 10. 免鉴权接口不能当口令预言机"
 contains "错误口令：健康检查说不" '"authenticated":false' "$(curl -sS -m5 -u me:totally-wrong "$CB/api/health")"
 contains "正确口令：健康检查也说不（只看会话 Cookie）" '"authenticated":false' "$(curl -sS -m5 -u me:s3cret-pass "$CB/api/health")"
 for i in $(seq 1 8); do curl -sS -o /dev/null -m5 -u me:guess$i "$CB/api/selector/sources"; done
-check "保护接口上的凭据猜测同样计入限速" "429" "$(curl -sS -o /dev/null -w '%{http_code}' -m5 -u me:s3cret-pass "$CB/api/selector/sources")"
+check "保护接口上的凭据猜测同样计入限速" "429" "$(curl -sS -o /dev/null -w '%{http_code}' -m5 -u me:guess9 "$CB/api/selector/sources")"
+# 超限期间**正确凭据必须还能用**。早先的顺序是先查 blocked() 再验证，于是连正确口令
+# 也吃 429：那挡不住攻击者（他没有正确口令），却能锁死合法用户 —— 限速键是来源 IP，
+# 反代没配 hops 时全站共用一把，任何人发 8 个错口令就能反复把整站挡在门外。
+check "超限期间正确凭据仍可访问（不被用来锁站）" "200" "$(curl -sS -o /dev/null -w '%{http_code}' -m5 -u me:s3cret-pass "$CB/api/selector/sources")"
 check "限速期间会话 Cookie 照常可用" "200" "$(curl -sS -b "$C/j.txt" -o /dev/null -w '%{http_code}' -m5 "$CB/api/data")"
 
 echo "== 11. 质询弹窗只给用得上它的客户端"

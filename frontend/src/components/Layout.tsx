@@ -157,7 +157,7 @@ export default function Layout() {
       <main className="main" data-testid="main">
         {/* 页面级错误边界：App 顶层那个会把导航一起替换掉，
             一个页面崩了用户就得整页刷新才能去别处。这层让崩溃只影响内容区。 */}
-        <ErrorBoundary>
+        <ErrorBoundary resetKey={location.pathname + location.search}>
           <Outlet />
         </ErrorBoundary>
       </main>

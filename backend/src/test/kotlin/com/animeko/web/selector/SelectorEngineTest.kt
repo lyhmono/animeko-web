@@ -7,6 +7,7 @@ import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -20,6 +21,8 @@ class StubFetcher(
     private val redirects: Map<String, String> = emptyMap(),
 ) : Fetcher {
     val requested = mutableListOf<String>()
+    /** 每次请求实际带出去的头（副本）：凭据会不会跟着跳转跑到第三个主机，只能从这里看 */
+    val headersSeen = mutableListOf<Pair<String, Map<String, String>>>()
 
     private fun lookup(url: String): String? = routes[url]
         ?: routes.entries.firstOrNull { (prefix, _) -> url.startsWith(prefix) }?.value
@@ -30,6 +33,7 @@ class StubFetcher(
         followRedirects: Boolean,
     ): HttpResult {
         requested.add(url)
+        headersSeen.add(url to LinkedHashMap(headers))
         redirects[url]?.let { loc ->
             return HttpResult(302, mapOf("location" to listOf(loc)), ByteArray(0))
         }
@@ -68,6 +72,71 @@ private fun fixture(name: String): String =
     }.bufferedReader().use { it.readText() }
 
 class SelectorEngineTest {
+
+    /**
+     * 配置里的正则跑在第三方页面内容上，而 JVM 正则**没有超时**。
+     * 一个 (a+)+$ 配上一个不换行的超长 token 就能让这个请求永远不返回，
+     * 几个并发搜索就把线程池占满（页面体积上限 8MB 根本不算保护）。
+     * 这里用「候选 URL 长度上限」把这条路堵住：超长的候选一律不作为正则输入。
+     */
+    @Test
+    fun `a monstrous candidate url cannot hang the config regex`() = runTest {
+        val page = """
+            <html><body><a href="https://t.test/${"a".repeat(300_000)}">x</a></body></html>
+        """.trimIndent()
+        val fetcher = StubFetcher(mapOf("$base/play/x.html" to page))
+        val cfg = config().copy(
+            matchVideo = MatchVideoConfig(
+                enableNestedUrl = true,
+                matchNestedUrl = "(a+)+$$",
+            ),
+        )
+        val started = System.nanoTime()
+        val e = assertFailsWith<com.animeko.web.selector.SelectorException> {
+            SelectorEngine(fetcher).resolveVideo(cfg, "$base/play/x.html")
+        }
+        val ms = (System.nanoTime() - started) / 1_000_000
+        assertTrue(ms < 2_000, "跑了 ${ms}ms，长候选仍然被当成正则输入")
+        assertTrue(e.message?.contains("NO_VIDEO_URL_FOUND") == true, e.message ?: "")
+    }
+
+
+    /**
+     * 源站 Cookie 不能跟着 302 跑到第三个主机。代理链路早就剥了
+     * （见 ApiRoutes 的重定向循环），抓取链路原先没有：播放页里一个跨主机的跳转，
+     * 就会把配置里的 VIP Cookie 送给跳转目标。
+     */
+    @Test
+    fun `cross host redirect does not carry the source cookie`() = runTest {
+        val page = """
+            <html><body><script>var u="https://cdn.test/hls/m.m3u8?sig=1";</script></body></html>
+        """.trimIndent()
+        val fetcher = StubFetcher(
+            routes = mapOf("https://other.test/dst.html" to page, "$base/dst.html" to page),
+            redirects = mapOf(
+                "$base/play/cross.html" to "https://other.test/dst.html",
+                "$base/play/same.html" to "$base/dst.html",
+            ),
+        )
+        val cfg = config().copy(
+            matchVideo = MatchVideoConfig(cookies = "vip=SECRET-VALUE"),
+        )
+        assertEquals(
+            "https://cdn.test/hls/m.m3u8?sig=1",
+            SelectorEngine(fetcher).resolveVideo(cfg, "$base/play/cross.html").url,
+        )
+        assertEquals(2, fetcher.headersSeen.size, "应当确实发生了两跳：${fetcher.headersSeen.map { it.first }}")
+        assertEquals("vip=SECRET-VALUE", fetcher.headersSeen[0].second["Cookie"], "第一跳应当带上源站 Cookie")
+        val second = fetcher.headersSeen[1].second
+        assertFalse("Cookie" in second, "跨主机那一跳还在带源站 Cookie：$second")
+        // Referer/UA 不含凭据且常是防盗链的必要信息，不该顺手剥掉
+        assertTrue("Referer" in second, "只应剥 Cookie，Referer 要留着：$second")
+
+        // 同主机跳转必须照旧带着 Cookie，否则真实源会整批播不动
+        fetcher.headersSeen.clear()
+        SelectorEngine(fetcher).resolveVideo(cfg, "$base/play/same.html")
+        assertEquals("vip=SECRET-VALUE", fetcher.headersSeen.last().second["Cookie"], "同主机跳转不应丢 Cookie")
+    }
 
     private val base = "https://example-site.test"
 

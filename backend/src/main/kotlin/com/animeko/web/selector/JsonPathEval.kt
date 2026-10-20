@@ -19,6 +19,21 @@ import kotlinx.serialization.json.JsonPrimitive
  */
 object JsonPathEval {
 
+    /**
+     * 单步中间结果的上限。
+     *
+     * `..key` 是递归扫描，而**连续几段就会组合爆炸**：实测深度 128 的文档配
+     * `$..a..a..a..a`，0.96 秒产出 10,668,000 个元素，再多一段就直接把进程打死
+     * （120 秒都没跑完）。128 恰好等于 JsonGuard 允许的最大深度，所以深度闸门
+     * 一点忙都帮不上——爆炸来自「扫描次数」而不是「嵌套深度」。
+     *
+     * 触发条件是社区配置里的选择器字符串（`selectNames`/`selectLinks`），而配置
+     * 可以从聚合订阅直接导入，等于让第三方文本决定本机分配多少内存。
+     * 真实的搜索页最多几百到几千条，20000 已经宽松到不可能误伤。
+     * 超限按「这个选择器扫不出东西」处理（返回 null），单条数据源失败而不是整服务。
+     */
+    private const val MAX_NODES = 20_000
+
     fun evaluate(path: String, root: JsonElement): List<JsonElement>? {
         val p = path.trim()
         if (!p.startsWith("$")) return null
@@ -34,18 +49,21 @@ object JsonPathEval {
                         val (key, next) = readKey(p, i)
                         if (key.isEmpty()) return null
                         current = current.flatMap { deepScan(it, key) }
+                        if (current.size > MAX_NODES) return null
                         i = next
                         continue
                     }
                     i++
                     if (i < p.length && p[i] == '*') {
                         current = current.flatMap { children(it) }
+                        if (current.size > MAX_NODES) return null
                         i++
                         continue
                     }
                     val (key, next) = readKey(p, i)
                     if (key.isEmpty()) return null
                     current = current.flatMap { property(it, key) }
+                    if (current.size > MAX_NODES) return null
                     i = next
                 }
 
@@ -53,6 +71,7 @@ object JsonPathEval {
                     val close = findClosingBracket(p, i) ?: return null
                     val inner = p.substring(i + 1, close).trim()
                     current = applyBracket(current, inner) ?: return null
+                    if (current.size > MAX_NODES) return null
                     i = close + 1
                 }
 
@@ -146,7 +165,11 @@ object JsonPathEval {
 
     private fun deepScan(e: JsonElement, key: String): List<JsonElement> {
         val result = ArrayList<JsonElement>()
+
         fun walk(el: JsonElement) {
+            // 上限要在**收集的过程中**就生效：一次深扫本身也可能覆盖整棵子树，
+            // 等它返回再判等于先把内存花完再道歉
+            if (result.size > MAX_NODES) return
             when (el) {
                 is JsonObject -> {
                     el[key]?.let { result.add(it) }

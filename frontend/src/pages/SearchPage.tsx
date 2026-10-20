@@ -3,7 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import Poster from '../components/Poster'
 import { api, errMsg } from '../api'
 import type { BgmSubject, StoredSource, SubjectHit } from '../types'
-import { addSearchHistory, favoriteIdSet } from '../lib/storage'
+import { addSearchHistory, favoriteIdSet, onDocChange } from '../lib/storage'
 import { IconHeartFilled, IconRefresh } from '../lib/icons'
 
 /**
@@ -23,6 +23,8 @@ const SOURCE_SEARCH_CONCURRENCY = 3
  */
 interface SearchSnapshot {
   bgm: BgmSubject[]
+  /** 失败也要记进缓存：否则返回搜索页时错误消失，变成一句「无 Bangumi 结果」 */
+  bgmError: string
   sourceHits: Record<string, SubjectHit[]>
   sourceErrors: Record<string, string>
   /** 回填时用到的源名单（停用/新增后可能变化，一并记住供渲染） */
@@ -47,6 +49,16 @@ export default function SearchPage() {
    *  少一个需要在 effect 里消费的隐式状态。 */
   const [runId, setRunId] = useState(0)
 
+  useEffect(
+    () =>
+      onDocChange(() => {
+        // 收藏角标是从文档里抄出来的集合；启动读取失败、后来「重新读取」成功时
+        // 换掉的是整份 doc —— 不重抄就会一直显示上一轮的（空）角标集合
+        setFavIds(favoriteIdSet())
+      }),
+    [],
+  )
+
   useEffect(() => {
     // cancelled 守卫：快速连续搜索时丢弃过期响应，避免旧结果覆盖新结果
     let cancelled = false
@@ -68,8 +80,11 @@ export default function SearchPage() {
     // 一个请求都不发。骨架屏不重来、已看到的源结果原样还在。
     const cached = searchCache.get(q)
     if (cached) {
+      // 收藏角标也必须刷新：缓存路径以前直接 return，用户在条目页点了收藏
+      // 再返回时，卡片上的心形还停留在上一轮，看着像「收藏没生效」
+      setFavIds(favoriteIdSet())
       setBgm(cached.bgm)
-      setBgmError('')
+      setBgmError(cached.bgmError)
       setSourceHits(cached.sourceHits)
       setSourceErrors(cached.sourceErrors)
       setSources(
@@ -92,14 +107,33 @@ export default function SearchPage() {
     setBgmLoading(true)
     setSourcesLoading(true)
     // effect 内的累加器：setState 的 functional update 拿不到最终值，
-    // 而缓存快照必须在「全部 worker 都回来」那一刻写入，所以本地镜像一份
+    // 而缓存快照必须在「全部结果都落定」那一刻写入，所以本地镜像一份
     let bgmSnapshot: BgmSubject[] = []
+    let bgmErrSnapshot = ''
     let hitsAcc: Record<string, SubjectHit[]> = {}
     let errorsAcc: Record<string, string> = {}
     let namesAcc: { name: string; enabled: boolean }[] = []
+    // 两条链各自独立 settle，缓存必须等**两条都完成**再写。
+    // 只挂在数据源那条的 finally 上会写出一份残缺快照：Bangumi 是外部 API，
+    // 常常比同源的一次 /api/selector/sources 慢好几秒，而「零个启用的源」时
+    // Promise.all([]) 在一个微任务里就 resolve 了 —— 于是缓存里记下的是 bgm: []。
+    // 后果：搜一次 → 点进条目 → 返回 → 命中这份坏缓存 → 「无 Bangumi 结果」，
+    // 且此后每次返回都还是坏的（只有那个小刷新按钮能救），而用户明明看到过结果。
+    let bgmDone = false
+    let sourcesDone = false
+    // 「取源名单」这件事本身失败（同源接口 5xx / 会话问题）时不写缓存：
+    // 缓存一份空名单，等于把一次瞬时故障固化成整轮会话的「还没有启用的数据源」。
+    // 这种情形宁可让返回时重新搜一遍。
+    let sourcesListFailed = false
     const remember = () => {
-      if (cancelled) return
-      searchCache.set(q, { bgm: bgmSnapshot, sourceHits: hitsAcc, sourceErrors: errorsAcc, sourceNames: namesAcc })
+      if (cancelled || !bgmDone || !sourcesDone || sourcesListFailed) return
+      searchCache.set(q, {
+        bgm: bgmSnapshot,
+        bgmError: bgmErrSnapshot,
+        sourceHits: hitsAcc,
+        sourceErrors: errorsAcc,
+        sourceNames: namesAcc,
+      })
       // 容量淘汰：搜太多个旧词之后把最旧的丢掉，别让这份缓存跟着会话无限长
       if (searchCache.size > CACHE_LIMIT) {
         const oldest = searchCache.keys().next().value
@@ -115,10 +149,16 @@ export default function SearchPage() {
         }
       })
       .catch((e) => {
-        if (!cancelled) setBgmError(errMsg(e))
+        if (!cancelled) {
+          bgmErrSnapshot = errMsg(e)
+          setBgmError(bgmErrSnapshot)
+        }
       })
       .finally(() => {
-        if (!cancelled) setBgmLoading(false)
+        if (cancelled) return
+        setBgmLoading(false)
+        bgmDone = true
+        remember()
       })
 
     api
@@ -160,10 +200,14 @@ export default function SearchPage() {
         if (!cancelled) setSourcesLoading(false)
       })
       .catch(() => {
-        if (!cancelled) setSources([])
+        if (cancelled) return
+        sourcesListFailed = true
+        setSources([])
       })
       .finally(() => {
-        if (!cancelled) setSourcesLoading(false)
+        if (cancelled) return
+        setSourcesLoading(false)
+        sourcesDone = true
         remember()
       })
     return () => {

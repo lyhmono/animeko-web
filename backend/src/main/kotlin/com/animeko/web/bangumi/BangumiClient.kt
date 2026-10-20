@@ -171,7 +171,12 @@ class BangumiClient(
         runCatching { UrlGuard.requireAllowed("$url/v0/calendar", allowPrivateTargets) }.isSuccess
 
     /** 当前通道实际生效的地址列表（公开给设置页展示）。每次调用重读，改完立即生效、不用重启。 */
-    fun effectiveBases(): List<String> = resolveBases(channel)
+    /** 给设置页展示用：不校验。这里若抛错，站长打开设置页就看到 403，
+     *  反而**没法**把已经变成内网的那个地址改回来——把自己锁在门外了。 */
+    fun effectiveBases(): List<String> = resolveBases(channel, enforce = false)
+
+    /** 真正要发请求的地址列表：逐次校验（见 resolveBases 的注释） */
+    private fun requestBases(): List<String> = resolveBases(channel, enforce = true)
 
     /**
      * 把一个通道配置解析成候选地址。探测未保存的目标时走这里，与保存后走同一套规则。
@@ -181,11 +186,36 @@ class BangumiClient(
      * 那时若悄悄去探自动通道的地址，结果会挂在 CUSTOM 名下显示 ——
      * 站长会以为「我的中转填错了但其实是能用的」，比直接说「没有地址」更误导。
      */
-    private fun resolveBases(config: BgmChannelConfig): List<String> = when (config.channel) {
+    private fun resolveBases(config: BgmChannelConfig, enforce: Boolean): List<String> = when (config.channel) {
         BgmChannel.AUTO -> envBases
         BgmChannel.OFFICIAL -> listOf(OFFICIAL_BASE)
         BgmChannel.MIRROR -> listOf(MIRROR_BASE)
-        BgmChannel.CUSTOM -> config.customUrls.map { it.trim().removeSuffix("/") }.filter { it.isNotBlank() }
+        BgmChannel.CUSTOM -> config.customUrls
+            .map { it.trim().removeSuffix("/") }
+            .filter { it.isNotBlank() }
+            // **每次解析都验**，而不是只在保存与启动时验。这里同时堵住两个洞：
+            //  1) 探测路径（设置页那个「测一下」按钮）拿的是**还没保存、也就从没被
+            //     setChannel 校验过**的目标。实测默认部署（不配凭据 = 无鉴权）下
+            //     POST /api/bangumi/channel/probe {"customUrls":["http://127.0.0.1:8299/…"]}
+            //     真的让服务器去打了一针内网端口，蜜罐收到 GET /bangumi-mirror/v0/subjects/290980，
+            //     而回包的 detail/latencyMs 直接把「这个端口开着、它这么回答」告诉对方。
+            //     allowPrivateTargets 是 false 也照样发出去了——那道闸只在保存时路过。
+            //  2) 保存时验过一次，与真正发请求之间隔着的不只是几行代码，还可能是几天和
+            //     一次 DNS TTL：社区「镜像」地址常由别人提供，域名今天指公网、明天指内网
+            //     是做得到的。闸要设在出门口，不是设在登记处。
+            // 校验口径与代理/抓取一致：requireAllowed 会真做 DNS 解析并拒绝内网/保留段。
+            // 只约束 CUSTOM：AUTO 走环境变量（要能改容器才改得动，是站长本人的权限），
+            // OFFICIAL/MIRROR 是写死的公网常量。
+            .let { list -> if (!enforce) list else list.map { url ->
+                runCatching { UrlGuard.requireAllowed("$url/v0/calendar", allowPrivateTargets) }
+                    .getOrElse {
+                        // 不回显 Blocked 原文（里面是「主机名 -> 内网 IP」的映射），
+                        // 细节只进日志；调用方拿到的是 403 + 一句通用原因
+                        appLog.warn("Bangumi 自定义通道地址不被允许: {} ({})", url, it.message)
+                        throw UrlGuard.Blocked("自定义通道地址不被允许")
+                    }
+                url
+            } }
     }
 
     /** 当前通道是否支持每日放送：只有纯镜像通道明确不支持 */
@@ -265,7 +295,7 @@ class BangumiClient(
      * @param target 要探测的通道；为 null 时探测**当前已保存**的通道。
      */
     suspend fun probe(target: BgmChannelConfig? = null): List<BgmProbeResult> {
-        val list = if (target == null) effectiveBases() else resolveBases(target)
+        val list = if (target == null) requestBases() else resolveBases(target, enforce = true)
         if (list.isEmpty()) return emptyList()
         // 并发探测：串行的话官方挂起 + 镜像又慢时，设置页那个按钮要转两分钟
         return coroutineScope {
@@ -369,7 +399,7 @@ class BangumiClient(
             throw UpstreamException("当前 Bangumi 通道（社区镜像）不提供每日放送端点，可在设置页切换通道")
         }
         // 官方优先：镜像确定没有这个端点，排后面只作为「万一它是中转」的兜底
-        val candidates = effectiveBases().sortedBy { if (it == MIRROR_BASE) 1 else 0 }
+        val candidates = requestBases().sortedBy { if (it == MIRROR_BASE) 1 else 0 }
         // 首页附属内容不能让人等满 45 秒的 Bangumi 超时（官方在某些网络里是
         // 连接层静默丢包，实测 8 秒仍无响应）。给自己一个更短的预算：
         // 超时就放弃整块放送表 —— 首页的主体是搜索，不该被一个锦上添花的区块拖住。
@@ -490,7 +520,7 @@ class BangumiClient(
      * 拿同一份列表发完这一轮，比中途换地址撕裂一次请求更好解释。
      */
     private suspend fun <T> withFallback(block: suspend (base: String) -> T): T {
-        val list = effectiveBases()
+        val list = requestBases()
         val preferred = preferredBase
         if (preferred != null && preferred in list) {
             try {

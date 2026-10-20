@@ -2,6 +2,12 @@ import { Component, type ErrorInfo, type ReactNode } from 'react'
 
 interface Props {
   children: ReactNode
+  /**
+   * 变了就清掉错误状态重新渲染子树。
+   * 没有它的话，报错之后点导航（导航在本边界之外）只会一直停在「页面出错了」：
+   * URL 换了、内容区还是上一个页面的错误兜底，用户只能整页刷新。
+   */
+  resetKey?: unknown
 }
 
 interface State {
@@ -21,6 +27,13 @@ export default class ErrorBoundary extends Component<Props, State> {
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
     console.error('ErrorBoundary caught:', error, info.componentStack)
+  }
+
+  componentDidUpdate(prev: Props): void {
+    // 换页面就算一次新的开始：错误已经被"离开"了，不该继续挡住新页面
+    if (prev.resetKey !== this.props.resetKey && this.state.error) {
+      this.setState({ error: null })
+    }
   }
 
   // 只清 state 是不行的：React.lazy 失败后 payload._status 会永久停在 rejected，

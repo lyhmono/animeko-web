@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { getProgress, listRecent, type ProgressEntry, type RecentItem } from '../lib/storage'
+import { getProgress, listRecent, onDocChange, type ProgressEntry, type RecentItem } from '../lib/storage'
 import { IconPlay } from '../lib/icons'
 
 /**
@@ -22,12 +22,18 @@ export default function ContinueWatching() {
   const [items, setItems] = useState<ContinueItem[]>([])
 
   useEffect(() => {
-    const rows = listRecent()
-      .map((r) => ({ ...r, progress: getProgress(r.source, r.playUrl) }))
-      // 有进度的优先，其次按最近时间；两者都已在 listRecent 里按 ts 排过
-      .sort((a, b) => Number(!!b.progress) - Number(!!a.progress))
-      .slice(0, 6)
-    setItems(rows)
+    const refill = () => {
+      const rows = listRecent()
+        .map((r) => ({ ...r, progress: getProgress(r.source, r.playUrl) }))
+        // 有进度的优先，其次按最近时间；两者都已在 listRecent 里按 ts 排过
+        .sort((a, b) => Number(!!b.progress) - Number(!!a.progress))
+        .slice(0, 6)
+      setItems(rows)
+    }
+    refill()
+    // 启动时读取失败、后来点「重新读取」成功的场景：本组件是 `if (items.length === 0) return null`，
+    // 不重抄就一直不出现，用户只当这台机器上根本没有「继续观看」这回事
+    return onDocChange(refill)
   }, [])
 
   if (items.length === 0) return null

@@ -73,10 +73,17 @@ class AppConfigAuthFlagTest {
     }
 
     /**
-     * 上面那一格单独测解析函数，**测不到调用方**：如果有人把
+     * 上面那一格单独测解析函数，**测不到「解析结果被怎么用」**：如果有人把
      * `resolveAuthEnabled` 里的解析包成 `runCatching { … }.getOrNull() ?: 凭据推导`，
      * 那条最危险的路径（明确要求开启却被当成没配）就又静默了，而上面的用例照样全绿。
-     * 所以这里从最终入口再断言一次。
+     * 这一格盯的就是那一步：它经过真正的组合函数 resolveAuthEnabled，
+     * 把 parseBoolStrict 的报错在半路咽掉就会红。
+     *
+     * 说清楚它**没**盯住什么（原先这里写着「从最终入口再断言一次」，那是夸口）：
+     * 最终入口是 `AppConfig` 的默认参数表达式，它读的是 System.getenv，
+     * 而 JVM 进程内改不了自己的环境变量，所以那一段接线（变量名有没有写错、
+     * 三个凭据有没有传错位）在本类里测不到 —— 它由 scripts/live-smoke.sh 第 1、9 节
+     * 用真实进程（带真凭据起一个服务）覆盖。别把两边的功劳记到同一头上。
      */
     @Test
     fun `unrecognized value is fatal through the real entry point too`() {

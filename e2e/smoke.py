@@ -105,9 +105,14 @@ def main() -> int:
             status = page.evaluate(
                 "async () => { const r = await fetch('/api/bangumi/calendar'); return r.status; }"
             )
-            if status >= 500 or status == 404:
+            if status >= 500:
                 print(f"    (上游不可用 HTTP {status}，组件按设计隐藏)")
                 return
+            # 404 不是「上游挂了」：/api/bangumi/calendar 是我们自己定义的路由，
+            # 它 404 只有两种可能——路由被改名/删掉，或者部署的是旧产物。
+            # 原先把 404 一并归给上游，等于这条检查在路由消失时照样绿灯。
+            if status == 404:
+                raise AssertionError("每日放送接口 404：我们自己的路由不见了")
             raise AssertionError(f"接口正常({status})但每日放送没渲染")
 
         check("每日放送区块渲染", airing_ok, page)
@@ -157,11 +162,18 @@ def main() -> int:
             body = page.evaluate(
                 """async () => {
                   const r = await fetch('/api/bangumi/ranking');
-                  if (!r.ok) return { status: r.status, count: -1 };
+                  // 只有 5xx 才是「上游没数据」。404 是我们自己的路由问题，
+                  // 401/403 是门控问题，都不该被算成 count=-1 然后判定为预期
+                  if (!r.ok && r.status >= 500) return { status: r.status, count: -1 };
+                  if (!r.ok) return { status: r.status, count: 0, broken: true };
                   const j = await r.json();
                   return { status: r.status, count: (j.data || []).length };
                 }"""
             )
+            if body.get("broken"):
+                raise AssertionError(
+                    f"排行榜接口回 {body['status']}，不是上游故障而是我们自己的门控/路由问题"
+                )
             if body["count"] <= 0:
                 print(f"    (上游未返回数据：HTTP {body['status']}、{body['count']} 条，空榜属预期)")
                 return

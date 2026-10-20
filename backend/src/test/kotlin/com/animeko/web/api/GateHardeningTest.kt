@@ -54,46 +54,56 @@ class GateHardeningTest {
     private suspend fun HttpResponse.isAuthorized(): Boolean =
         Json.parseToJsonElement(bodyAsText()).jsonObject["authenticated"]!!.jsonPrimitive.content.toBoolean()
 
-    private suspend fun rawGet(client: io.ktor.client.HttpClient, vararg segments: String): HttpResponse =
-        client.get {
-            url { encodedPathSegments = segments.toList() }
-        }
+    private suspend fun rawGet(
+        client: io.ktor.client.HttpClient,
+        auth: String? = null,
+        vararg segments: String,
+    ): HttpResponse = client.get {
+        url { encodedPathSegments = segments.toList() }
+        if (auth != null) header(HttpHeaders.Authorization, auth)
+    }
 
     @Test
     fun `path spelling tricks hit the gate instead of the handler`() = testApplication {
         application { module(config()) }
+        // 每一种写法的**带凭据预期状态**：这是这条用例的关键一半。
+        // 原先只在反面断言里接受 401|404|405，而「路由压根没匹配上」也是 404/405 ——
+        // 七个写法里只有 //api/selector/sources 做过正面对照，其余六个的红绿灯
+        // 说明不了门的事。现在逐个先证明「这个写法确实打到那条路由」，
+        // 再证明「不带凭据时得到的是 401」（401 只能来自门，路由本身不会回 401）。
         val tricks = listOf(
-            listOf("", "api", "selector", "sources") to "//api/selector/sources",
-            listOf("%61pi", "selector", "sources") to "/%61pi/selector/sources",
-            listOf("api", "", "selector", "sources") to "/api//selector/sources",
-            listOf("", "api", "data") to "//api/data",
-            listOf("%61pi", "data") to "/%61pi/data",
-            listOf("", "api", "selector", "subscriptions", "preview") to "//api/selector/subscriptions/preview",
-            listOf("", "api", "proxy") to "//api/proxy",
+            listOf("", "api", "selector", "sources") to HttpStatusCode.OK,
+            listOf("%61pi", "selector", "sources") to HttpStatusCode.OK,
+            listOf("api", "", "selector", "sources") to HttpStatusCode.OK,
+            listOf("", "api", "data") to HttpStatusCode.OK,
+            listOf("%61pi", "data") to HttpStatusCode.OK,
+            // 只有 POST 的路由：GET 带着凭据也到不了 handler，但 405 已经证明
+            // 「这个路径在路由树里存在」，于是无凭据时的 401 才说明是门拦的
+            listOf("", "api", "selector", "subscriptions", "preview") to HttpStatusCode.MethodNotAllowed,
+            // 代理路由：没有 url 参数时 handler 自己回 400，同样证明打到了它
+            listOf("", "api", "proxy") to HttpStatusCode.BadRequest,
         )
-        for ((segments, label) in tricks) {
-            val naked = rawGet(client, *segments.toTypedArray())
-            assertTrue(
-                naked.status == HttpStatusCode.Unauthorized ||
-                    naked.status == HttpStatusCode.NotFound ||
-                    naked.status == HttpStatusCode.MethodNotAllowed,
+        val labels = listOf(
+            "//api/selector/sources", "/%61pi/selector/sources", "/api//selector/sources",
+            "//api/data", "/%61pi/data", "//api/selector/subscriptions/preview", "//api/proxy",
+        )
+        tricks.forEachIndexed { index, (segments, expectedWithAuth) ->
+            val label = labels[index]
+            val authed = rawGet(client, basic, *segments.toTypedArray())
+            assertEquals(expectedWithAuth, authed.status, "$label 带凭据时应当打到那条路由")
+
+            val naked = rawGet(client, null, *segments.toTypedArray())
+            assertEquals(
+                HttpStatusCode.Unauthorized,
+                naked.status,
                 "$label 绕过了鉴权：${naked.status} ${naked.bodyAsText().take(140)}",
             )
         }
 
-        // 反面对照：这些写法本来就路由到真接口 —— 带上凭据必须拿到 JSON。
-        // 少了这一半断言，上面的 401 可能只是「路径没匹配上」，测了个寂寞。
+        // 反面对照：正常写法本来就能用，确认上面那一串 401 不是「整个接口坏了」
         val withAuth = client.get("/api/selector/sources") { header(HttpHeaders.Authorization, basic) }
         assertEquals(HttpStatusCode.OK, withAuth.status)
         assertTrue(withAuth.bodyAsText().trim().startsWith("["), withAuth.bodyAsText().take(80))
-        val tricked = rawGet(client, "", "api", "selector", "sources").let {
-            client.get {
-                url { encodedPathSegments = listOf("", "api", "selector", "sources") }
-                header(HttpHeaders.Authorization, basic)
-            }
-        }
-        assertEquals(HttpStatusCode.OK, tricked.status, "写法归一化后仍然是同一个接口")
-        assertTrue(tricked.bodyAsText().trim().startsWith("["), tricked.bodyAsText().take(80))
     }
 
     @Test
@@ -179,12 +189,21 @@ class GateHardeningTest {
         application { module(config()) }
         repeat(8) { i ->
             val r = client.get("/api/selector/sources") { header(HttpHeaders.Authorization, guess(i)) }
-            assertEquals(HttpStatusCode.Unauthorized, r.status, "第 ${i + 1} 次猜测")
+            assertEquals(HttpStatusCode.Unauthorized, r.status, "第 ${"$"}{i + 1} 次猜测")
         }
-        // 用完次数之后，连「猜对了」也要先等窗口过去：限速的意义就是让在线爆破没有意义
-        val blocked = client.get("/api/selector/sources") { header(HttpHeaders.Authorization, basic) }
+        // 超出预算之后，错的猜测一律 429（不再回答对错，也就没有预言机）
+        val blocked = client.get("/api/selector/sources") { header(HttpHeaders.Authorization, guess(9)) }
         assertEquals(HttpStatusCode.TooManyRequests, blocked.status)
         assertTrue(blocked.headers[HttpHeaders.RetryAfter]?.isNotBlank() == true, "429 要给 Retry-After")
+        // 但**正确的凭据必须照样能用**。原先的顺序是 blocked() 在验证之前，
+        // 于是超限期间连正确口令也吃 401/429：那挡不住攻击者（他没有正确口令），
+        // 却能让任何人凭 8 次错误尝试把合法用户锁在门外 —— 而限速键是来源 IP，
+        // 反代没配 hops 时全站共用一把，等于匿名可控地反复锁站。
+        val legitimate = client.get("/api/selector/sources") { header(HttpHeaders.Authorization, basic) }
+        assertEquals(
+            HttpStatusCode.OK, legitimate.status,
+            "超限期间把正确凭据也拒掉，就给了任何人一个锁站的开关：" + legitimate.bodyAsText(),
+        )
     }
 
     /**

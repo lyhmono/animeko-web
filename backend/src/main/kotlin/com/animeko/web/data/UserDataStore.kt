@@ -137,6 +137,7 @@ class UserDataStore(
                 // NFS/CIFS 这类挂载不支持原子 rename；退回普通 move 也比丢掉这次写入好
                 Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING)
             }
+            syncDirOf(file)
         }
         return Snapshot(text, sha256Hex(bytes))
     }
@@ -161,6 +162,21 @@ class UserDataStore(
     private fun currentEtagLocked(): String {
         val bytes = if (Files.isRegularFile(file)) runCatching { Files.readAllBytes(file) }.getOrNull() else null
         return if (bytes == null || bytes.isEmpty()) EMPTY.etag else sha256Hex(bytes)
+    }
+
+
+    /**
+     * rename 之后 fsync **父目录**：目录项才是「新文件到底在不在」的那份记录。
+     * 只 force 文件本身的话，掉电后可能出现「文件内容在、目录里没有这个条目」，
+     * 于是下一次启动看不到这个数据源（实测本机 JDK21/Linux：FileChannel.open(dir, READ)
+     * 可以用，WRITE 会报 Is a directory）。
+     * 失败不致命（某些挂载点/平台不支持），静默跳过：那不比现在更差。
+     */
+    private fun syncDirOf(target: Path) {
+        val dir = target.parent ?: return
+        runCatching {
+            FileChannel.open(dir, StandardOpenOption.READ).use { it.force(true) }
+        }
     }
 
     private fun sib(suffix: String) = file.resolveSibling("${file.fileName}.$suffix")

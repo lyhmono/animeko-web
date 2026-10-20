@@ -68,9 +68,15 @@ class HttpRedirectPolicyTest {
 
     /**
      * 反向对照：默认值仍然会跟。这条不是「测试通过所以安全」的装饰 ——
-     * 它说明 `followRedirects` 的默认值是危险的，元数据调用方必须显式关掉；
-     * 哪天有人把 BangumiClient 里的 `followRedirects = false` 删了，
-     * 上一条用例就会失败，而这一条解释了为什么那个参数不能省。
+     * 它说明 `followRedirects` 的默认值是危险的，元数据调用方必须显式关掉。
+     *
+     * 但别把话说过头（原先这里的注释写着「哪天有人把 BangumiClient 里的
+     * followRedirects = false 删了，上一条用例就会失败」——不会）：
+     * 上面那条用例直接调 `JdkFetcher.fetch(..., followRedirects = false)`，
+     * 它验的是**这个类**在拿到 false 时的行为，跟 BangumiClient **怎么调它**没有关系。
+     * 调用点被改掉是由 BangumiClientTest 里那组 redirect 用例看着的，
+     * 而代理那条调用点（ApiRoutes 的 fetchStream）现在由 ProxyRouteTest 的
+     * `same host redirect keeps cookie...` 里那句「每一跳都必须自己发起」看着。
      */
     @Test
     fun `default fetch does follow, so call sites must opt out`() = kotlinx.coroutines.runBlocking {

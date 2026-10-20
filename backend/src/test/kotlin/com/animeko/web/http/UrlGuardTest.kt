@@ -59,19 +59,34 @@ class UrlGuardTest {
 
     @Test
     fun `reserved ranges stay blocked at the boundary and do not swallow public space`() {
-        // 边界：100.63.x 与 100.128.x 都在 CGNAT 段外，不该被顺手拦掉。
-        // 这里只断言「不是因为落在保留段而被拒」——它们解析不出来时按设计放行，
-        // 所以用字面 IP 才有效。
-        listOf("http://100.63.255.255/x", "http://100.128.0.1/x", "http://198.17.255.255/x", "http://198.20.0.1/x")
-            .forEach { url ->
-                val e = runCatching { UrlGuard.requireAllowed(url) }.exceptionOrNull()
-                if (e is UrlGuard.Blocked) {
-                    assertTrue(
-                        !e.message.orEmpty().contains("内网/保留"),
-                        "$url 不在保留段内，却被当成内网拦了：${e.message}",
-                    )
-                }
-            }
+        // 这条用例必须有**两侧**的断言。原先只在 `if (e is Blocked)` 里做断言，
+        // 而这四个地址都不在保留段内、requireAllowed 根本不抛 ——
+        // 于是整个用例一条断言都没执行（绿灯什么也没证明）。
+        //
+        // 外侧：紧邻保留段边界的公网地址，必须**放行**（不被顺手吞掉）。
+        // 字面 IP 不会触发 DNS（100.63.255.255 之类直接由 IP 形态判定），
+        // 所以这里可以直接断言返回值就是原串。
+        listOf(
+            "http://100.63.255.255/x",   // CGNAT 100.64.0.0/10 的下边界之外
+            "http://100.128.0.1/x",      // 上边界之外
+            "http://198.17.255.255/x",   // 198.18.0.0/15 之下
+            "http://198.20.0.1/x",       // 之上
+        ).forEach { url ->
+            assertEquals(url, UrlGuard.requireAllowed(url), "$url 在保留段之外，不该被拦")
+        }
+        // 内侧：紧贴边界的保留地址，必须仍然被拦，且拦它的理由是「保留段」
+        // （不是「无法解析」那一类的误伤）。边界写错一格（a1>=64 写成 63、
+        // 198.18/19 少算一个）就是这一格要红的。
+        listOf(
+            "http://100.64.0.0/x" to "100.64.0.0",
+            "http://100.127.255.255/x" to "100.127.255.255",
+            "http://198.18.0.1/x" to "198.18.0.1",
+            "http://198.19.255.255/x" to "198.19.255.255",
+        ).forEach { (url, ip) ->
+            val message = blocked(url)
+            assertTrue(message.contains("内网/保留"), "$url 应按保留段被拒，实际原因：$message")
+            assertTrue(message.contains(ip), "$url 的拒绝原因里应带上被拦的地址 $ip：$message")
+        }
     }
 
     @Test

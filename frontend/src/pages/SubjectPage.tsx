@@ -18,6 +18,12 @@ interface PlayFlow {
   matchedSource: string
   /** 自动匹配到多个/无法确定集数时的手动选剧集 */
   pickingEpisodes: EpisodesResult | null
+  /**
+   * 本次取剧集列表用的**数据源详情页地址**（hits[0].url）。
+   * 必须跟着走：播放页的连播在 URL 里没有下一集时，要靠它重新取一次列表
+   * （见 PlayerPage 的 resolveChain），否则连播只能多播一集就停住。
+   */
+  sourceSubjectUrl: string
 }
 
 export default function SubjectPage() {
@@ -113,6 +119,7 @@ export default function SubjectPage() {
       epSort: number,
       epLabel: string,
       next?: { source: string; play: string; title: string; anime: string; ep: string } | null,
+      subjectUrl?: string,
     ) => {
       const params = new URLSearchParams({
         source: sourceName,
@@ -124,6 +131,8 @@ export default function SubjectPage() {
         subject: String(subjectId),
       })
       if (next) params.set('next', JSON.stringify(next))
+      // 数据源详情页地址：连播链条在「URL 里没带下一集」时靠它重新取列表
+      if (subjectUrl) params.set('surl', subjectUrl)
       window.location.assign(`/play?${params.toString()}`)
     },
     [],
@@ -185,12 +194,13 @@ export default function SubjectPage() {
             want,
             matched.name,
             nextOf(sourceName, result.episodes, idx, animeName),
+            hits[0].url,
           )
           return
         }
         // 无法自动确定集数：交给用户手动选
         setFlow((f) =>
-          f ? { ...f, matching: false, pickingEpisodes: result, matchedSource: sourceName } : f,
+          f ? { ...f, matching: false, pickingEpisodes: result, matchedSource: sourceName, sourceSubjectUrl: hits[0].url } : f,
         )
       } catch (e) {
         // 这里也必须判 alive：用户取消后**又开了一个新的选集弹窗**时，
@@ -287,6 +297,7 @@ export default function SubjectPage() {
                   matchError: '',
                   matchedSource: '',
                   pickingEpisodes: null,
+                  sourceSubjectUrl: '',
                 })
               }
             >
@@ -388,6 +399,7 @@ export default function SubjectPage() {
                             idx,
                             subject.name_cn || subject.name,
                           ),
+                          flow.sourceSubjectUrl,
                         )
                       }
                     >

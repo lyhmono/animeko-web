@@ -95,7 +95,10 @@ fun Application.module(
         }
         // 栈被打穿（超深嵌套 JSON）。它必须排在 Throwable 前面，否则会被兜底吃成 500，
         // 而且 appLog.error 会为此落下上千行栈 —— 攻击者要的正是这个日志放大。
-        // 这里当兜底用：入站处已有 JsonGuard 提前拦掉，剩下的路径（磁盘上的旧文件等）才走到这。
+        // 这里当**最后一道**用：入站处有 JsonGuard 提前拦，绝大多数载荷到不了这一步。
+        // 注意别高估它的覆盖面：UserDataStore.read 用的是 runCatching（catch Throwable），
+        // 磁盘上那份过深的存档会被它接住并当成坏文件处理，**走不到这里**
+        // —— 那条路径的后果由 ApiRoutesTest 的「深存档」用例盯着，不是这一格。
         exception<StackOverflowError> { call, _ ->
             appLog.warn("解析嵌套过深的 JSON: {}", call.request.path())
             call.respond(
@@ -117,11 +120,7 @@ fun Application.module(
     // Bangumi 用独立的超时：社区镜像实测要 13~25 秒返回一次搜索，套用抓取那边
     // 的 20 秒上限会把它正好掐死（症状是「搜索页永远没有 Bangumi 结果」，
     // 而手动 curl 是通的）。测试注入 override 时不另开客户端。
-    val bangumiFetcher = when {
-        fetcherOverride != null -> fetcher
-        cfg.bangumiTimeoutMs == cfg.requestTimeoutMs -> fetcher
-        else -> JdkFetcher(timeoutMs = cfg.bangumiTimeoutMs)
-    }
+    val bangumiFetcher = bangumiFetcherFor(cfg, fetcher, fetcherOverride)
     val bangumi = BangumiClient(
         bangumiFetcher,
         cfg.bangumiBaseUrls,
@@ -167,6 +166,28 @@ fun Application.module(
         )
     }
     checkFileNameEncoding()
+}
+
+/**
+ * 给 Bangumi 挑一个客户端。三个分支的含义见 module() 里那段注释
+ * （社区镜像实测要 13~25 秒，套用抓取那边 20 秒的上限会把它正好掐死）。
+ *
+ * 单独抽出来只有一个理由：**这是一条所有测试都碰不到的分支**。
+ * 测试一律注入 fetcherOverride（为了不真打外网），于是第一个分支永远命中，
+ * 后面两格从未被执行过 —— 有人把 `cfg.bangumiTimeoutMs` 抄成 `cfg.requestTimeoutMs`，
+ * 或者把这两个变量写反，全套用例照样全绿，而线上表现是
+ * 「搜索页永远没有 Bangumi 结果」，且手动 curl 是通的（这正是历史上出现过的那次）。
+ * 抽成函数后，MainWiringTest 能直接对三个分支各要一条断言。
+ */
+internal fun bangumiFetcherFor(
+    cfg: AppConfig,
+    fetcher: Fetcher,
+    fetcherOverride: Fetcher?,
+    create: (Long) -> Fetcher = { JdkFetcher(timeoutMs = it) },
+): Fetcher = when {
+    fetcherOverride != null -> fetcher
+    cfg.bangumiTimeoutMs == cfg.requestTimeoutMs -> fetcher
+    else -> create(cfg.bangumiTimeoutMs)
 }
 
 /**

@@ -84,6 +84,22 @@ jobs:
             sleep 1
           done
 
+          # 上面那行注释声称验证了降权与 /data 可写，但当时其实什么都没查。
+          # 补上真断言：进程 uid 必须是 10001（gosu 生效），/data 必须可写
+          # （否则第一次保存个人数据才炸，而 CI 永远看不到）。
+          UID_IN=$(docker exec animeko-ci id -u)
+          if [ "$UID_IN" != "10001" ]; then
+            echo "::error::容器内进程 uid=$UID_IN，期望 10001：entrypoint 的 gosu 降权没生效"
+            docker logs animeko-ci
+            exit 1
+          fi
+          docker exec animeko-ci test -w /data || {
+            echo "::error::/data 对运行用户不可写，个人数据与数据源导入都会失败"
+            docker exec animeko-ci ls -ld /data || true
+            exit 1
+          }
+          echo "privilege drop OK: uid=$UID_IN, /data writable"
+
           # 前端产物：health 只能证明后端活着。dist 没落位时它照样 200，
           # 而用户打开是一张白页 —— 这种故障从 CI 里最看不出来，所以必须单独验。
           curl -fsS http://127.0.0.1:18080/ -o /tmp/index.html
@@ -102,8 +118,26 @@ jobs:
             head -c 400 /tmp/index.html; echo
             exit 1
           fi
-          curl -fsS "http://127.0.0.1:18080${ASSET}" -o /tmp/app.js
-          echo "frontend OK: ${ASSET} ($(wc -c < /tmp/app.js) bytes)"
+          # 只看「HTTP 200」是假的：托管逻辑一旦把 SPA 回退套到缺失资源上，
+          # 这个请求会拿到 200 + 一份 index.html，于是「JS 存在」通过，
+          # 而浏览器会因为 MIME 不对拒绝执行模块 —— 用户仍是白屏。
+          curl -fsS "http://127.0.0.1:18080${ASSET}" -o /tmp/app.js -D /tmp/app.h
+          CT=$(grep -i '^content-type:' /tmp/app.h | tr -d '\r' | awk '{print $2}')
+          case "$CT" in
+            *javascript*|*ecmascript*) ;;
+            *) echo "::error::JS 产物的 Content-Type 是 [$CT]，浏览器不会当模块执行"; exit 1 ;;
+          esac
+          if [ "$(wc -c < /tmp/app.js)" -lt 1000 ]; then
+            echo "::error::JS 产物只有 $(wc -c < /tmp/app.js) 字节，不像真的 bundle"
+            exit 1
+          fi
+          # 缺失资源必须 404 而不是回退成 index.html（同一判据在 live-smoke 里已有）
+          code=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080/assets/definitely-missing-42.js")
+          if [ "$code" != "404" ]; then
+            echo "::error::缺失的 JS 返回 $code（应为 404；回退成 HTML 会让重新部署后的旧 index 永久白屏）"
+            exit 1
+          fi
+          echo "frontend OK: ${ASSET} ($(wc -c < /tmp/app.js) bytes, $CT)"
 
           # PWA 资产：public/ 下的文件必须真的进了 dist，否则"添加到主屏幕"装不上
           curl -fsS http://127.0.0.1:18080/manifest.webmanifest -o /tmp/manifest.json

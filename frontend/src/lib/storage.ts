@@ -57,6 +57,31 @@ export function onSyncChange(listener: (s: SyncState) => void): () => void {
   return () => syncListeners.delete(listener)
 }
 
+// ---------- 整份换档通知 ----------
+
+const docListeners = new Set<(doc: UserData) => void>()
+
+/**
+ * `doc` 被**整份换掉**时通知：开机读到、冲突合并、注销清档、读取失败清空。
+ *
+ * 为什么需要：页面是同步 API 的消费者，通常在挂载那一刻把 `listFavorites()` /
+ * `listRecent()` 抄进自己的 state。而「启动时读取失败 → 用户点横幅上的重新读取」
+ * 这条路径换掉的是整个 doc，页面没有任何理由重抄 —— 症状是收藏明明读回来了，
+ * 收藏页还是一片「还没有收藏」，必须离开再回来才对，而用户得到的解释是「数据没了」。
+ *
+ * 局部写入**不发**这个通知：那些改动是页面自己发起的，内存与界面本来就一致，
+ * 多发一次只会在渲染里绕一圈。
+ */
+export function onDocChange(listener: (doc: UserData) => void): () => void {
+  docListeners.add(listener)
+  return () => docListeners.delete(listener)
+}
+
+function setDoc(next: UserData): void {
+  doc = next
+  docListeners.forEach((l) => l(next))
+}
+
 // ---------- 拉取 ----------
 
 /**
@@ -66,7 +91,7 @@ export function onSyncChange(listener: (s: SyncState) => void): () => void {
 export async function loadUserData(): Promise<void> {
   try {
     const remote = await api.loadDataWithEtag()
-    doc = remote.doc
+    setDoc(remote.doc)
     baseEtag = remote.etag
     loaded = true
     pendingKeys.clear()
@@ -74,7 +99,7 @@ export async function loadUserData(): Promise<void> {
     setSync({  status: 'ready', kind: null, error: ''  })
   } catch (e) {
     loaded = false
-    doc = {}
+    setDoc({})
     baseEtag = ''
     setSync({
       status: 'error',
@@ -198,9 +223,21 @@ async function pushOnce(): Promise<void> {
       round.progressKeys.forEach((k) => {
         if (asMap(doc.progress)[k] === round.sentProgress.get(k)) pendingProgressKeys.delete(k)
       })
-      setSync({  status: 'ready', kind: null, error: ''  })
-      // 确实有改动没被这份请求体带走 → 自己排下一轮，而不是等用户再点一次
-      if (changed.length > 0 || changedProgress) scheduleFollowUp()
+      // 确实有改动没被这份请求体带走 → 自己排下一轮，而不是等用户再点一次。
+      // 状态必须跟着排队这件事一起说「待保存」，不能先报 ready。
+      // 这条的**实际窗口有多宽**记在这里，免得把它夸大成用户级故障：
+      // 本轮实测（挂 12 秒的 PUT + 在飞期间再点一次收藏）——如果这段时间里已经有一次
+      // flushUserData 在 `await running` 上排着队，第一轮落地后约 20ms 第二轮就发出去了，
+      // 于是「已保存」只谎称了 20 毫秒，界面上看不出来；只有在没有排队轮次、
+      // 纯靠这里补定时器的那条路径上，这个窗口才是 800 毫秒。
+      // 结论：这是**状态标注的正确性**修复（顺带让文件头第 3 条说得通），
+      // 不是一个可以稳定复现给用户看的缺陷 —— 别在注释里把它写成后者。
+      if (changed.length > 0 || changedProgress) {
+        scheduleFollowUp()
+        setSync({ status: 'pending', kind: null, error: '' })
+      } else {
+        setSync({ status: 'ready', kind: null, error: '' })
+      }
     } catch (e) {
       if (isApiError(e, 409, ERR_DATA_STALE)) {
         const merged = await mergeWithServer(round.keys, round.progressKeys)
@@ -214,6 +251,20 @@ async function pushOnce(): Promise<void> {
       if (!fatal) scheduleFollowUp(RETRY_MS)
       return
     }
+  }
+  // 上面那个 while 靠 attempt<3 退出时，pendingKeys 可能还是满的：那意味着
+  // 「合并完再写又被版本冲突弹回来」连续发生了三次（另一个标签页/设备在高频写）。
+  // 原实现到这里就直接 return，于是三份状态一起坏了：待写集合非空、没有定时器、
+  // 界面停在最后一轮那句「保存中」—— 状态点从此永远挂着「保存中…」，
+  // 再没有任何东西会把这份改动推上去，用户以为存好了，刷新一下就没了。
+  // 这里既不骗他（如实报错）也不放弃（定时重试，直到推上去或他刷新为止）。
+  if (pendingKeys.size > 0) {
+    setSync({
+      status: 'error',
+      kind: 'save',
+      error: '本机改动与服务端版本连续冲突三次，已暂停；将在 5 秒后自动重试',
+    })
+    scheduleFollowUp(RETRY_MS)
   }
 }
 
@@ -247,7 +298,7 @@ async function mergeWithServer(keys: string[], progressKeys: string[]): Promise<
       delete merged[key]
     }
   }
-  doc = merged
+  setDoc(merged)
   baseEtag = fresh.etag
   return true
 }
@@ -292,9 +343,20 @@ function asMap(value: unknown): Record<string, unknown> {
 function writeProgressMap(map: Record<string, unknown>, entryKey: string): void {
   // 剪掉最久没动的条目：一条都不删的话，看够了集数就会撞上服务端 512KB 上限，
   // 之后每一次收藏/进度写入都会 400，等于整个数据层从此写不进去
-  const entries = Object.entries(map).filter(([, v]) => asMap(v).ts != null)
+  const entries = Object.entries(map)
   if (entries.length > MAX_PROGRESS_ENTRIES) {
-    entries.sort((a, b) => (asMap(b[1]).ts as number) - (asMap(a[1]).ts as number))
+    // 说清楚这次到底改变了什么，别写成「原先会无条件删掉没有 ts 的条目」那种大话：
+    // 原先是先把条目按「有没有 ts」分堆，**只有带 ts 的那堆参与上限判断** ——
+    // 于是一旦带 ts 的超过 400，所有不带 ts 的连排序资格都没有就被丢了（它们本来
+    // 可能是刚导入的那几条）；而反过来，不带 ts 的再多也不算数，文档可以无限超出
+    // 400 这一档 —— 而 400 存在的理由正是别让 512KB 上限把整个数据层写死。
+    // 现在所有条目一起按 ts 竞争（缺 ts 视为最旧，最先淘汰）：上限是真上限，
+    // 淘汰的也是「最没信息的那几条」，而不是「格式旧的那一类」。
+    const tsOf = (v: unknown): number => {
+      const ts = asMap(v).ts
+      return typeof ts === 'number' && Number.isFinite(ts) ? ts : 0
+    }
+    entries.sort((a, b) => tsOf(b[1]) - tsOf(a[1]))
     const kept: Record<string, unknown> = {}
     entries.slice(0, MAX_PROGRESS_ENTRIES).forEach(([k, v]) => {
       kept[k] = v
@@ -696,7 +758,7 @@ export function markUserDataStale(): void {
   pendingKeys.clear()
   pendingProgressKeys.clear()
   loaded = false
-  doc = {}
+  setDoc({})
   baseEtag = ''
   setSync({  status: 'ready', kind: null, error: ''  })
 }
@@ -705,6 +767,7 @@ export function markUserDataStale(): void {
 
 export interface ImportSummary {
   favorites: number
+  sourceFavorites: number
   subjectProgress: number
   progress: number
   searchHistory: number
@@ -734,6 +797,7 @@ function numOr(value: unknown, fallback: number): number {
  *
  * 各类数据的合并规则：
  *  - 收藏：按 Bangumi id 去重，同 id 保留**本地**版本（本地可能刚改过状态）
+ *  - 数据源收藏：按 (源, 地址) 去重取并集
  *  - 条目进度：取更大的集号（进度只前进不后退）
  *  - 每集进度：按 (源, 播放地址) 取 ts 更新的一条
  *  - 搜索历史 / 最近观看：并集去重，仍受各自上限约束
@@ -757,6 +821,7 @@ export function importUserData(text: string): ImportSummary {
   const incoming = parsed as Record<string, unknown>
   const summary: ImportSummary = {
     favorites: 0,
+    sourceFavorites: 0,
     subjectProgress: 0,
     progress: 0,
     searchHistory: 0,
@@ -776,6 +841,35 @@ export function importUserData(text: string): ImportSummary {
     if (added.length > 0) {
       writeJson('favorites', [...added, ...local])
       summary.favorites = added.length
+    }
+  }
+
+  // 数据源收藏（favoritesSource）。导出是整份 doc，里面就含这一键，
+  // 而导入原先**完全不处理它** —— 于是「备份 → 换设备/换账号恢复」这条路上
+  // 数据源收藏整段静默消失，摘要里一个数字都没有，用户根本不知道少了一批。
+  // 备份功能存在的意义就是别丢数据，这一格不能留白。
+  if (Array.isArray(incoming[SOURCE_FAV_KEY])) {
+    const local = listSourceFavorites()
+    const seen = new Set(local.map((f) => sourceFavKeyOf(f.source, f.url)))
+    const added: SourceFavorite[] = []
+    for (const raw of incoming[SOURCE_FAV_KEY] as unknown[]) {
+      const item = asMap(raw)
+      if (typeof item.url !== 'string' || typeof item.source !== 'string') continue
+      const fav: SourceFavorite = {
+        source: item.source,
+        url: item.url,
+        name: String(item.name ?? ''),
+        cover: String(item.cover ?? ''),
+        ts: numOr(item.ts, 0),
+      }
+      const key = sourceFavKeyOf(fav.source, fav.url)
+      if (seen.has(key)) continue
+      seen.add(key)
+      added.push(fav)
+    }
+    if (added.length > 0) {
+      writeJson(SOURCE_FAV_KEY, [...added, ...local])
+      summary.sourceFavorites = added.length
     }
   }
 

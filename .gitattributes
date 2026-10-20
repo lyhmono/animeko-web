@@ -7,3 +7,6 @@
 Dockerfile text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+# 两个 gradle wrapper 都必须 LF：CI 直接执行 backend/gradlew，
+# Windows 检出（core.autocrlf=true）会把它变成 CRLF → "bad interpreter: /usr/bin/env: 'bash'"
+backend/gradlew text eol=lf

@@ -45,8 +45,12 @@ ENV LANG=C.UTF-8 \
 VOLUME /data
 EXPOSE 8080
 
+# 端口必须从 ANIMEKO_PORT 取：它是被明文支持的操作者开关（README 环境变量表第一行，
+# AppConfig 还专门把 0 与非法值判成拒绝启动）。写死 8080 的话，换了端口的部署
+# 服务明明健康却永远 unhealthy —— 而 HEALTHCHECK 是容器编排里唯一的健康信号，
+# k8s/compose 会据此重启一个根本没坏的进程。shell 形式的 CMD 在运行时展开变量。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8080/api/health || exit 1
+    CMD curl -fsS "http://127.0.0.1:${ANIMEKO_PORT:-8080}/api/health" || exit 1
 
 # 入口脚本：root 起来只为给挂载的 /data 改属主，随后 gosu 降权到 app 用户。
 # 服务本体只读 /app（root 属主、全局可读），只写 /data。

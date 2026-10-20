@@ -36,6 +36,12 @@ export default function Poster({
       sizes={sizes}
       alt={alt}
       loading="lazy"
+      // 不发 Referer。默认行为会把**当前页的完整 URL**送给每家第三方图床
+      // （Bangumi 的 CDN、各数据源自己的 img 域名），而搜索页的地址是
+      // /search?q=<关键词> —— 等于把用户搜了什么、以及这台自建实例的域名，
+      // 一并抄送给结果里每一个源的站点。图床并不靠 Referer 才能出图
+      // （防盗链的站点直连失败后本来就会走本站代理那条路）。
+      referrerPolicy="no-referrer"
       onError={() => {
         if (viaProxy) setDead(true)
         else setViaProxy(true)

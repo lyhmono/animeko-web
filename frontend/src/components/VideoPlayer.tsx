@@ -478,6 +478,26 @@ export default function VideoPlayer({
   const onPointerMove = (e: ReactPointerEvent<HTMLVideoElement>) => {
     const g = gestureRef.current
     if (!g.active) return
+    // 「按键已经全松开」是这里唯一可靠的收尾信号。
+    // 鼠标**没有**隐式指针捕获：实测（本机 Chromium + puppeteer 合成事件）
+    // 在画面上按下、拖到控制条上松开时，画面元素既收不到 pointerup 也收不到
+    // pointercancel，于是 g.active 一直停在 true。
+    // 后果不是手感问题：之后只要把鼠标**移过**画面（一个键都没按），
+    // 下面的逻辑就会照着 seek 分支把 currentTime 跟着鼠标横着拖 ——
+    // 用户在没有任何操作的情况下看到播放进度乱跳，并且控制条再也不出现。
+    // （同理也不要用 setPointerCapture 来「保证收到 up」：实测加了捕获后
+    //  这条序列拿到的是 pointercancel 而不是 pointerup，兜不住同一个洞。）
+    if (e.buttons === 0) {
+      const wasMoved = g.moved
+      g.active = false
+      if (wasMoved) {
+        // 拖动收尾仍要同步一次：否则进度条会弹回拖之前的位置
+        const video = videoRef.current
+        if (video) setCurrent(video.currentTime)
+        revealControls()
+      }
+      return
+    }
     g.dx = e.clientX - g.x0
     g.dy = e.clientY - g.y0
     if (g.mode === 'none') {

@@ -81,6 +81,14 @@ export default function LoginPage({ onSuccess }: { onSuccess: () => void }) {
           {busy ? '登录中…' : '进入'}
         </button>
 
+        {error.includes('未配置登录凭据') && (
+          // 服务端没开鉴权却又落到登录页（例如停在旧标签页里）时给出出口，
+          // 否则这个表单永远提交不成功
+          <button className="btn btn-secondary btn-block" type="button" onClick={() => window.location.assign('/')}>
+            这台服务没开登录，直接进站点
+          </button>
+        )}
+
         <p className="login-hint">
           连续输错会被限速（默认 5 分钟内 8 次）。忘记口令就在服务端环境变量里改一份新的，重启后生效。
         </p>

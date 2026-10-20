@@ -78,6 +78,52 @@ class SeedSubscriptionTest {
     }
 
     /** 轮询到订阅源出现为止；异步导入不等 application {} 返回就完成 */
+    /**
+     * 轮询等到**全部**给定名字都出现。
+     *
+     * 订阅是逐条落盘的，所以「先等到甲、再断言乙也在」是抖动的：甲出现的那一刻
+     * 乙完全可能还没写。实测这条用例在单跑时三次全过、放进整套里就会偶发红，
+     * 而 CI 里一次红一次绿比一直红更难查。
+     */
+    private suspend fun awaitSources(
+        client: io.ktor.client.HttpClient,
+        vararg names: String,
+        tries: Int = 60,
+    ): String {
+        var last = ""
+        repeat(tries) {
+            last = client.get("/api/selector/sources").bodyAsText()
+            if (names.all { last.contains(it) }) return last
+            delay(250)
+        }
+        return last
+    }
+
+    /**
+     * 轮询到「名单不再变化」为止，专门给**反面断言**用。
+     *
+     * 后台那条循环是逐条落盘的，所以「某个源不该在列表里」这种结论不能在
+     * 「另一个源刚出现」的那一刻读一次就下：那时正是「第一条已写、第二条还没写」
+     * 的中间态 —— 白名单彻底失效（两条都导）时，这条用例照样绿灯，
+     * 靠的是时序侥幸而不是行为。等到连续几次读取完全一致，才算那条协程收了尾。
+     */
+    private suspend fun awaitSettledSources(
+        client: io.ktor.client.HttpClient,
+        stableReads: Int = 4,
+        tries: Int = 60,
+    ): String {
+        var last = ""
+        var same = 0
+        repeat(tries) {
+            val now = client.get("/api/selector/sources").bodyAsText()
+            same = if (now == last) same + 1 else 0
+            last = now
+            if (same >= stableReads) return last
+            delay(250)
+        }
+        return last
+    }
+
     private suspend fun awaitSource(client: io.ktor.client.HttpClient, name: String, tries: Int = 60): String {
         var last = ""
         repeat(tries) {
@@ -96,7 +142,8 @@ class SeedSubscriptionTest {
         application {
             module(config(dataDir, seedUrl = "https://sub.test/css.json"), fetcherOverride = stub)
         }
-        val names = awaitSource(client, "订阅源甲")
+        // 两个都要等到，不能等到甲就顺手断言乙（逐条落盘时会偶发漏一个）
+        val names = awaitSources(client, "订阅源甲", "订阅源乙")
         assertTrue(names.contains("订阅源甲"), names)
         assertTrue(names.contains("订阅源乙"), names)
         // 示例源不再被订阅「取代」：它先落地，订阅是追加
@@ -144,6 +191,7 @@ class SeedSubscriptionTest {
         }
         val names = awaitSource(client, "零级源")
         assertTrue(names.contains("零级源"), names)
-        assertTrue(!names.contains("四级源"), "tier 白名单外的源不该被导入：$names")
+        val settled = awaitSettledSources(client)
+        assertTrue(!settled.contains("四级源"), "tier 白名单外的源不该被导入：$settled")
     }
 }

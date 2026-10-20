@@ -37,6 +37,8 @@ private class StreamStubFetcher(
     private val html: Map<String, String> = emptyMap(),
 ) : Fetcher {
     val requests = mutableListOf<Pair<String, Map<String, String>>>()
+    /** 每一次 fetchStream 实际收到的 followRedirects 值，见上面的注释 */
+    val redirectFlags = mutableListOf<Boolean>()
 
     data class Spec(
         val status: Int = 200,
@@ -52,6 +54,11 @@ private class StreamStubFetcher(
         headers: Map<String, String>,
         followRedirects: Boolean,
     ): StreamResult {
+        // 记下调用方到底传了什么：代理的 SSRF 防线是「每一跳自己重新过 UrlGuard」，
+        // 而那只成立如果 HTTP 客户端自己不跳。原先这个参数被直接丢掉，
+        // 于是「有人把 fetchStream(..., followRedirects = false) 改成默认值」
+        // 这类回归在本类里根本测不出来（真实 JdkFetcher 的默认 client 是 NORMAL）。
+        redirectFlags.add(followRedirects)
         // 存副本：代理在跨主机重定向后会就地 remove("Cookie")，
         // 直接持有同一个 map 会让第一次请求的记录被改写，断言失去意义。
         requests.add(url to LinkedHashMap(headers))
@@ -346,6 +353,11 @@ class ProxyRouteTest {
         assertEquals(2, h.stub.requests.size)
         assertEquals("https://cdn.example.com/hls/index2.m3u8", h.stub.requests[1].first)
         assertEquals(COOKIE, h.stub.requests[1].second["Cookie"])
+        // 逐跳校验的前提：每一跳都是**我们自己**发的请求。真实 JdkFetcher 里
+        // 默认的 client 是 Redirect.NORMAL，一旦有人把调用点的 followRedirects = false
+        // 删掉/改掉，302 → 169.254.169.254 就会在 UrlGuard 看不见的情况下发出去。
+        // 这个参数原先在 stub 里被直接丢弃，所以那一格是测不出来的。
+        assertEquals(listOf(false, false), h.stub.redirectFlags, "每一跳都必须自己发起")
     }
 
     /**

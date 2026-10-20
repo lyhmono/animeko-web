@@ -20,15 +20,23 @@
  * 5. **不调 skipWaiting**：新版本等所有旧页面关掉再接管。
  *    立即接管会让「还开着的老页面」去请求已经被删掉的旧 chunk，
  *    正好制造第 3 条要避免的那种白屏。
+ *
+ * 6. `/api/` 的判定必须**按段解码**，不能比字符串前缀。后端的路由与鉴权门禁都是
+ *    按段解码匹配的（这正是之前修过的洞）：实测 `//api/data` 与 `/%61pi/data` 都会
+ *    打到真接口并返回该用户的个人数据。而 `url.pathname.startsWith('/api/')` 对这两种
+ *    写法都是 false → 会被下面的缓存逻辑接管 → `caches.put` 把带凭据的响应写进持久缓存
+ *    （Cache API 不理会 `Cache-Control: no-store`），注销、换账号之后仍可能被缓存命中回放。
  */
 /**
  * 缓存版本。改动缓存策略时**手动**改这里，activate 会清掉所有旧版本缓存。
+ * v1→v2：修「`/api/` 用前缀判断」那个洞时**必须**升版本——只改代码不升版本，
+ * 之前被误存进缓存的凭据响应会一直留在设备上（新的清理逻辑只删非当前版本）。
  * 注意：assets 缓存会随部署累积（新部署产生新哈希文件名，旧文件不再被引用
  * 但仍在缓存里，一次部署约 300KB）。这是刻意接受的取舍 —— 换来的是弱网下
  * 二次打开直接命中本地，而清理需要解析 index.html 才知道哪些还在用，
  * 复杂度和出错面都不划算。真需要腾空间时把这里 +1 即可全清。
  */
-const VERSION = 'v1'
+const VERSION = 'v2'
 const SHELL_CACHE = `animeko-shell-${VERSION}`
 const ASSET_CACHE = `animeko-assets-${VERSION}`
 
@@ -65,7 +73,7 @@ self.addEventListener('fetch', (event) => {
 
   const url = new URL(req.url)
   if (url.origin !== self.location.origin) return
-  if (url.pathname.startsWith('/api/')) return
+  if (isApiPath(url.pathname)) return
   // sw.js 自身不进缓存：浏览器的更新检查会绕过 SW，但页面里若有 fetch('/sw.js')
   // 就会命中缓存拿到旧副本，一点好处都没有
   if (url.pathname === '/sw.js') return
@@ -82,12 +90,50 @@ self.addEventListener('fetch', (event) => {
   event.respondWith(staleWhileRevalidate(req, ASSET_CACHE))
 })
 
+/**
+ * 第一段解码后是不是 `api` —— 与后端门禁用同一条判据。
+ *
+ * 只比 `pathname.startsWith('/api/')` 会漏掉 `//api/data`（空段 + `//`）与
+ * `/%61pi/data`（`a` 的百分号写法）：这两种都能命中真接口、返回带凭据的个人数据
+ * （实测都 200）。漏判的后果不是多一次网络请求，而是**把凭据响应写进持久缓存**：
+ * Cache API 不看 `Cache-Control: no-store`，注销换账号后旧缓存还可能被命中。
+ * 认不出来的段（畸形百分号转义）按 api 处理：宁可少缓存，不可误存。
+ */
+function isApiPath(pathname) {
+  for (const seg of pathname.split('/')) {
+    if (seg === '') continue
+    let decoded = seg
+    try {
+      decoded = decodeURIComponent(seg)
+    } catch {
+      return true
+    }
+    return decoded.toLowerCase() === 'api'
+  }
+  return false
+}
+
+/**
+ * 只存明确允许存储的响应。
+ *
+ * 这里刻意**不**把 no-cache 当成不可缓存：它的含义是「可以存，但每次必须回源验证」，
+ * 而导航请求本来就是 network-first。index.html 正是后端发 `no-cache`（入口文档不能
+ * 被缓存住，否则重新部署后指向已删除的 chunk → 白屏），若在这里连它一起拒掉，
+ * 离线壳就没得兜底了。真正不能落盘的是 no-store / private。
+ */
+function cacheable(resp) {
+  if (!resp || !resp.ok) return false
+  const cc = (resp.headers.get('cache-control') || '').toLowerCase()
+  if (cc.includes('no-store') || cc.includes('private')) return false
+  return true
+}
+
 async function networkFirstNavigation(req) {
   const cache = await caches.open(SHELL_CACHE)
   try {
     const fresh = await fetch(req)
     // 只存成功的 HTML：把 5xx 或登录页存成壳，下次离线打开就是错的
-    if (fresh && fresh.ok) await cache.put('/', fresh.clone())
+    if (cacheable(fresh)) await cache.put('/', fresh.clone())
     return fresh
   } catch {
     const cached = await cache.match('/')
@@ -104,7 +150,7 @@ async function cacheFirst(req, cacheName) {
   const hit = await cache.match(req)
   if (hit) return hit
   const fresh = await fetch(req)
-  if (fresh && fresh.ok) await cache.put(req, fresh.clone())
+  if (cacheable(fresh)) await cache.put(req, fresh.clone())
   return fresh
 }
 
@@ -113,7 +159,7 @@ async function staleWhileRevalidate(req, cacheName) {
   const hit = await cache.match(req)
   const network = fetch(req)
     .then(async (fresh) => {
-      if (fresh && fresh.ok) await cache.put(req, fresh.clone())
+      if (cacheable(fresh)) await cache.put(req, fresh.clone())
       return fresh
     })
     .catch(() => null)

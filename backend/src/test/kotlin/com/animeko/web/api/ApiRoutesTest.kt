@@ -10,6 +10,7 @@ import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.parameter
 import io.ktor.client.request.post
+import io.ktor.client.request.put
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
@@ -39,6 +40,66 @@ class ApiRoutesTest {
     )
 
     @Test
+    fun `deep nesting is refused at the entry instead of blowing the stack`() = testApplication {
+        // JsonGuardTest 只测了那个纯函数本身，**四个调用点一个都没测到**：
+        // 把 requireShallow 那四行全删掉，整套测试仍然全绿。
+        //
+        // 这条用例第一次写出来的时候**也是一条废用例**，这里把原因留下：
+        // 删掉闸门后那个请求仍然回 400，body 里也仍然带「嵌套」两个字 ——
+        // 因为 SOE 穿过了 userData.write 的 catch (Exception)，落进
+        // Main 的 exception<StackOverflowError> 兜底，而它的文案同样写着「嵌套过深」。
+        // 只看状态码 + 关键字，就分辨不出「闸门挡住了」和「栈已经打穿过一次」，
+        // 而这两者的区别正是本用例存在的意义（后者每次要落上千行栈）。
+        // 所以断言钉死在**闸门的文案**上：超深、128 层。
+        application { module(testConfig()) }
+        val bomb = "[".repeat(200_000) + "]".repeat(200_000)
+        val refused = client.put("/api/data") { setBody(bomb) }
+        assertEquals(HttpStatusCode.BadRequest, refused.status, "深度超限应当是 400（内容坏的是来访者的请求）")
+        val reason = refused.bodyAsText()
+        assertTrue(reason.contains("超过") && reason.contains("128"), "要的是入站闸门的答复，不是栈崩之后的兜底文案：${reason.take(160)}")
+        // 正面对照：同一接口对正常深度的文档必须照常可写，
+        // 否则上面那个 400 可能只是「这个接口根本不接受任何东西」
+        val ok = client.put("/api/data") { setBody("""{"favorites":[{"id":1}]}""") }
+        assertEquals(HttpStatusCode.OK, ok.status, ok.bodyAsText())
+        // 字符串里的括号不算深度：这是扫描器最容易写错的一格
+        val strings = client.put("/api/data") { setBody("""{"note":"${"[".repeat(5000)}"}""") }
+        assertEquals(HttpStatusCode.OK, strings.status, strings.bodyAsText())
+    }
+
+    @Test
+    fun `a deep document already on disk neither 500s nor gets thrown away`() = testApplication {
+        // 磁盘上的旧文件不经过入站闸门（那道闸在 receiveCappedText 里），
+        // 所以这一格是唯一还能碰到「极深 JSON 解析」的入口。
+        //
+        // 三条**实测事实**，写在用例里免得后人照着注释猜机制（本轮跑出来的）：
+        //  · 20 万层（400KB）在这条路径上抛的是 StackOverflowError；
+        //  · 它被读侧的 runCatching **接住了** —— runCatching 捕获的是 Throwable，
+        //    不是 Exception，所以 Error 也照样接（这一点曾经写在 JsonGuard 的注释里，
+        //    而且是错的，现已改掉）；
+        //  · 接住之后读侧按「坏文件」处理：备份成 *.bad、对外回一份 {}。
+        //    「坏文件不该把整个页面带走」是对的，但它有个必须记在账上的副作用：
+        //    客户端拿到成功的 200 就认为同步过了，于是下一次写入会覆盖主文档，
+        //    而原件只剩 *.bad 那份谁也不会回去读的备份。
+        // 所以这条路径**不会**走到 Main 的 exception<StackOverflowError>（那里
+        // 只有 StatusPages 一条链上没人接的 Error 才轮得到），本用例断言的是
+        // 现在真实可观察到的行为，不是一个听起来正确的假设。
+        val cfg = testConfig()
+        val stored = cfg.dataDir.resolve("userdata.json")
+        java.nio.file.Files.writeString(stored, "[".repeat(200_000) + "]".repeat(200_000))
+        application { module(cfg) }
+        val resp = client.get("/api/data")
+        assertTrue(
+            resp.status == HttpStatusCode.OK || resp.status == HttpStatusCode.BadRequest,
+            "磁盘上的深嵌套只能得到 200/400，实际 ${resp.status}：${resp.bodyAsText().take(120)}",
+        )
+        // 不管走哪条分支，用户写过的字节都不许凭空消失：要么还在主文档里，
+        // 要么在 *.bad 里。这一格盯的是「解析失败顺手删档/只留一份没人读的副本还不备份」那类改动。
+        val survived = java.nio.file.Files.isRegularFile(stored) ||
+            java.nio.file.Files.isRegularFile(cfg.dataDir.resolve("userdata.json.bad"))
+        assertTrue(survived, "解析不了也得把原文件留着：读侧没有权力销毁用户的存档")
+    }
+
+    @Test
     fun `health returns ok`() = testApplication {
         application { module(testConfig()) }
         val response = client.get("/api/health")
@@ -50,7 +111,16 @@ class ApiRoutesTest {
     @Test
     fun `auth disabled by default`() = testApplication {
         application { module(testConfig()) }
-        assertEquals(HttpStatusCode.OK, client.get("/api/health").status)
+        // 只看 /api/health 是 200 等于没测：health 本来就在免鉴权白名单里，
+        // 鉴权开着它同样是 200 —— 把默认值改成「开」这条用例也不会红。
+        // 必须读 body 里的 authEnabled，并且真的打一个保护接口确认无需凭据可用。
+        val body = Json.parseToJsonElement(client.get("/api/health").bodyAsText()).jsonObject
+        assertEquals("false", body["authEnabled"]?.jsonPrimitive?.content, "没配凭据时鉴权应当是关的")
+        val open = client.get("/api/selector/sources")
+        assertEquals(HttpStatusCode.OK, open.status, "鉴权关闭时保护接口不该要凭据")
+        assertTrue(open.bodyAsText().trim().startsWith("["), open.bodyAsText().take(80))
+        // 正面对照在紧挨着的那条 `auth protects api...` 里：同一个路径、门装上以后
+        // 无凭据必须是 401。两条合起来才说明「200」是因为门开着，而不是路由没接上。
     }
 
     @Test

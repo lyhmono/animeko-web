@@ -63,16 +63,32 @@ class SelectorRepository(private val dir: Path) {
     /**
      * 按 mtime 缓存解析结果。save/delete 会显式失效缓存条目 —— 不能只靠 mtime：
      * getLastModifiedTime 截到毫秒，同一毫秒内的两次写入会被误判成「没变」。
+     *
+     * 坏文件必须**出声**。读侧对解析失败是跳过（这一步是对的：一个坏文件不该把
+     * 整个服务带走），但原先一声不吭，于是排查变成死胡同：用户看到的是
+     * 「这个源自己消失了」，列表里少一个，而没有任何地方说过为什么。
+     * 同一个文件名只记一次（修好之前不刷屏）：这条路径在每个采集请求上都会走。
      */
     private fun loadCached(path: Path): StoredSource? {
         val key = path.fileName.toString()
         val mtime = runCatching { Files.getLastModifiedTime(path).toMillis() }.getOrNull() ?: 0L
         cache[key]?.let { if (it.mtime == mtime) return it.source }
-        val parsed = runCatching { json.decodeFromString<StoredSource>(path.readText()) }.getOrNull()
-            ?: return null
-        cache[key] = Cached(mtime, parsed)
-        return parsed
+        val parsed = runCatching { json.decodeFromString<StoredSource>(path.readText()) }
+        val source = parsed.getOrElse { e ->
+            if (loggedCorrupt.add(key)) {
+                appLog.warn(
+                    "数据源文件解析失败，这个源不会出现在列表里：{}（{}）；改回合法 JSON 或重新导入即恢复",
+                    path, e.message ?: e::class.simpleName,
+                )
+            }
+            return null
+        }
+        loggedCorrupt.remove(key)
+        cache[key] = Cached(mtime, source)
+        return source
     }
+
+    private val loggedCorrupt = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     private fun invalidate(file: Path) {
         cache.remove(file.fileName.toString())
@@ -125,6 +141,7 @@ class SelectorRepository(private val dir: Path) {
             }
             try {
                 Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE)
+                syncDirOf(target)
             } catch (e: AtomicMoveNotSupportedException) {
                 // NFS/CIFS 这类挂载不支持原子 rename（/data 挂网络盘并不罕见）。
                 // 退回普通 move 仍比丢掉这次写入好，但**失败必须照抛**：
@@ -132,6 +149,7 @@ class SelectorRepository(private val dir: Path) {
                 // 于是 save() 返回成功、界面报「导入完成」，而文件根本没写进去。
                 try {
                     Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING)
+                    syncDirOf(target)
                 } catch (e2: IOException) {
                     runCatching { Files.deleteIfExists(tmp) }
                     throw IllegalArgumentException("写入数据源文件失败：${e2.message ?: e2::class.simpleName}", e2)
@@ -236,7 +254,19 @@ class SelectorRepository(private val dir: Path) {
         val safe = name.map { ch ->
             if (ch.isLetterOrDigit() || ch in "-_.") ch else '_'
         }.joinToString("")
-        return runCatching { dir.resolve("$safe.json") }.getOrElse {
+        // 文件系统的上限是**字节**（ext4/overlayfs 实测 NAME_MAX=255），而名字长度限的是字符。
+        // 100 个汉字符是 300 字节：这类源名会在落盘那一步直接 ENAMETOOLONG，
+        // 而报错来自 FileChannel.open，用户看到的是一句「写入数据源文件失败」——
+        // 看不出是名字的问题，更没有「短多少才够」的说法（实测导入中文长名订阅必踩）。
+        // 所以在碰磁盘之前先按字节判一次，并把差额说清楚。
+        val fileName = "$safe.json"
+        val bytes = fileName.toByteArray(Charsets.UTF_8).size
+        require(bytes <= MAX_FILE_NAME_BYTES) {
+            "数据源名称「$name」转成文件名后是 $bytes 字节，超过文件系统单名 ${MAX_FILE_NAME_BYTES} 字节的限制" +
+                "（汉字按 3 字节算）：请改成不超过约 ${(MAX_FILE_NAME_BYTES - 9) / 3} 个汉字长度的名字，" +
+                "或在导入前先缩短"
+        }
+        return runCatching { dir.resolve(fileName) }.getOrElse {
             // LANG 未设置时 sun.jnu.encoding 会是 ANSI_X3.4-1968，
             // 中文源名在这一步就抛 InvalidPathException：现象是「导入总是失败」，
             // 而原始报错（Malformed input or input contains unmappable characters）没人看得懂
@@ -250,6 +280,21 @@ class SelectorRepository(private val dir: Path) {
             "不含中文。请给进程设置 LANG=C.UTF-8 与 LC_ALL=C.UTF-8 后重启（Docker 镜像已内置）。"
     }
 
+
+    /**
+     * rename 之后 fsync **父目录**：目录项才是「新文件到底在不在」的那份记录。
+     * 只 force 文件本身的话，掉电后可能出现「文件内容在、目录里没有这个条目」，
+     * 于是下一次启动看不到这个数据源（实测本机 JDK21/Linux：FileChannel.open(dir, READ)
+     * 可以用，WRITE 会报 Is a directory）。
+     * 失败不致命（某些挂载点/平台不支持），静默跳过：那不比现在更差。
+     */
+    private fun syncDirOf(target: Path) {
+        val dir = target.parent ?: return
+        runCatching {
+            FileChannel.open(dir, StandardOpenOption.READ).use { it.force(true) }
+        }
+    }
+
     private companion object {
         const val MAX_NAME_LENGTH = 100
 
@@ -257,5 +302,11 @@ class SelectorRepository(private val dir: Path) {
         const val MAX_CONFIG_CHARS = 200_000
 
         const val MAX_PATTERN_LENGTH = 500
+
+        /**
+         * 落盘文件名的字节上限（ext4/overlayfs 的 NAME_MAX，实测本机为 255）。
+         * 留了余量：临时文件叫 `<名字>.json.tmp`，比正式名还长 4 字节。
+         */
+        private const val MAX_FILE_NAME_BYTES = 255
     }
 }

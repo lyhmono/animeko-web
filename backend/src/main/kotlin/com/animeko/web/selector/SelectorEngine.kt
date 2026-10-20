@@ -153,8 +153,11 @@ class SelectorEngine(
             doc.select("iframe[src]").forEach { candidates.add(it.absUrl("src")) }
             doc.select("a[href]").forEach { candidates.add(it.absUrl("href")) }
             candidateUrls(html).forEach { candidates.add(it) }
-            val nested = candidates.filter { it.startsWith("http") && nestedRegex.containsMatchIn(it) }
-                .take(MAX_NESTED_PAGES)
+            // 与 videoCandidates 同一条规则：长度先判，正则后判，顺序不能颠倒
+            // （`&&` 是短路的，反过来就等于没挡）。
+            val nested = candidates.filter {
+                it.length in 11..MAX_CANDIDATE_URL_LEN && it.startsWith("http") && nestedRegex.containsMatchIn(it)
+            }.take(MAX_NESTED_PAGES)
             val deadline = System.currentTimeMillis() + NESTED_BUDGET_MS
             for (n in nested) {
                 // 每个嵌套页都要一次完整抓取（单次超时 20s），不设总预算的话
@@ -291,25 +294,37 @@ class SelectorEngine(
      * 错图比没图更糟，用户会以为点进去能播另一部番。
      * 取不到就返回 null，界面走占位图：封面是锦上添花，绝不能因为取图失败丢掉整条结果。
      */
-    private fun coverOf(
-        el: org.jsoup.nodes.Element,
-        base: String,
-        siblings: Set<org.jsoup.nodes.Element> = emptySet(),
-    ): String? {
+    private fun coverOf(el: org.jsoup.nodes.Element, base: String, siblings: SiblingIndex): String? {
         coverUrl(el, base)?.let { return it }
         coverIn(el, base)?.let { return it }
-        if (siblings.isEmpty()) return null
+        if (siblings.total == 0) return null
         var node = el.parent()
         var hops = 0
         while (node != null && hops < MAX_COVER_HOPS) {
-            // 这一层已经罩住了别的条目 → 再往上只会更共享，不必也不能继续找
-            if (node.getAllElements().count { it in siblings } > 1) break
+            // 这一层已经罩住了别的条目 → 再往上只会更共享，不必也不能继续找。
+            // 问的是预计算的祖先计数，不是 node.getAllElements()：后者要整棵子树扫一遍，
+            // 每个条目扫一次就是 O(条目数 × 文档规模)，4000 条目的列表页实测秒级起步，
+            // 而那正是「这个源搜索特别慢」的来源（计数本身 O(1)）。
+            if ((siblings.ancestorCounts[node] ?: 0) > 1) break
             coverIn(node, base)?.let { return it }
             node = node.parent()
             hops++
         }
         return null
     }
+
+    /**
+     * 一次查询的条目身份索引。
+     *
+     * ancestorCounts[node] = 有多少个条目落在 node 的子树里（含 node 自身）。
+     * 构建是 O(条目数 × 祖先链长度)，与文档大小无关；判定时 O(1)。
+     * 用身份语义（IdentityHashMap）而不是 Element.equals：jsoup 的 equals 是
+     * 结构比较，会把两个不同的节点判成相等，那样「这条的容器里还有别条」就数不准了。
+     */
+    class SiblingIndex internal constructor(
+        val total: Int,
+        val ancestorCounts: Map<org.jsoup.nodes.Element, Int>,
+    )
 
     /**
      * 一组结果条目的「同一份集合」身份视图。
@@ -320,12 +335,16 @@ class SelectorEngine(
      * 分配与插入，8000 条目的列表页（8MB 上限内完全可能出现）实测要几十秒，
      * 而这个开销和封面本身没有任何关系。
      */
-    private fun siblingSet(elements: List<org.jsoup.nodes.Element>): Set<org.jsoup.nodes.Element> {
-        val set = java.util.Collections.newSetFromMap(
-            java.util.IdentityHashMap<org.jsoup.nodes.Element, Boolean>(),
-        )
-        set += elements
-        return set
+    private fun siblingSet(elements: List<org.jsoup.nodes.Element>): SiblingIndex {
+        val counts = java.util.IdentityHashMap<org.jsoup.nodes.Element, Int>()
+        for (el in elements) {
+            var node: org.jsoup.nodes.Element? = el
+            while (node != null) {
+                counts.merge(node, 1, Int::plus)
+                node = node.parent()
+            }
+        }
+        return SiblingIndex(elements.size, counts)
     }
 
     private fun coverIn(
@@ -441,7 +460,12 @@ class SelectorEngine(
         doc.select("a[href]").forEach { candidates.add(it.absUrl("href")) }
         doc.select("video[src], source[src]").forEach { candidates.add(it.absUrl("src")) }
         candidateUrls(html).forEach { candidates.add(it) }
-        return candidates.filter { it.startsWith("http") }
+        // 长度上限要挡在**所有**候选上，而不是只挡在 candidateUrls 那条扫描路径上：
+        // DOM 里抽出来的 href 是原样进集合的（`<a href="https://x/aaaa…30 万个 a">`），
+        // 少这一格，配置里一个 (a+)+$ 就会在那种串上跑 —— JVM 的 java.util.regex 没有超时，
+        // 而这条链路的正则与页面内容都是别人写的。实测代价：一次解析 6 秒起步，
+        // 且完全取决于机器忙不忙（这类只会抖出来说明它本来就挡不住）。
+        return candidates.filter { it.length in 11..MAX_CANDIDATE_URL_LEN && it.startsWith("http") }
     }
 
     private fun candidateUrls(html: String): List<String> {
@@ -457,7 +481,10 @@ class SelectorEngine(
         return listOf(html, unescapeJsStrings(html))
             .flatMap { regex.findAll(it) }
             .map { it.value.trim().trimEnd('`', '}', '{', '(', ')', '.', ',', ';', '!') }
-            .filter { it.length > 10 }
+            // 上限是给**后面那些来自配置的字符串正则**用的：JVM 的 java.util.regex 没有超时，
+        // 一个 (a+)+$ 这样的模式配上一个 8MB 不换行的 token 就永远跑不完，
+        // 而这条链路的输入是第三方页面内容。超过这个长度的地址也不可能是可播地址。
+        .filter { it.length in 11..MAX_CANDIDATE_URL_LEN }
             .distinct()
             .toList()
     }
@@ -524,11 +551,13 @@ class SelectorEngine(
         source: String,
     ): String {
         var target = guard(url)
+        // 实际发出去的头。跨主机跳转时要从中剥掉凭据，见下面重定向处。
+        var sent = headers
         cfg?.let { throttle(it) }
         var hops = 0
         while (true) {
             val result = try {
-                fetcher.fetchBounded(target, headers, MAX_PAGE_BYTES)
+                fetcher.fetchBounded(target, sent, MAX_PAGE_BYTES)
             } catch (e: UpstreamException) {
                 throw e
             } catch (e: CancellationException) {
@@ -544,7 +573,15 @@ class SelectorEngine(
                 ?: throw UpstreamException("$source 返回 ${result.status} 但没有 Location")
             if (hops >= MAX_PAGE_REDIRECTS) throw UpstreamException("$source 重定向次数过多")
             hops++
-            target = guard(absUrl(target, location))
+            val next = guard(absUrl(target, location))
+            // 换了主机的这一跳不再带源站 Cookie：那是**上一个主机**给我们的，
+            // 302 把它送给第三个域名既不是用户的授权，也让源站凭据跟着页面里
+            // 随便一个跳转目标走（代理链路早就这么做，见 ApiRoutes 的重定向循环）。
+            // 只剥 Cookie：Referer 常是防盗链的必要信息且不含凭据，UA 同理。
+            if (UrlGuard.hostOf(next) != UrlGuard.hostOf(target)) {
+                sent = sent - "Cookie"
+            }
+            target = next
         }
     }
 
@@ -584,6 +621,9 @@ class SelectorEngine(
     companion object {
         /** 抓取页面体积上限：同时约束「用户自定义正则」的输入规模（JVM 正则没有超时） */
         const val MAX_PAGE_BYTES: Long = 8L * 1024 * 1024
+
+        /** 单个候选 URL 的长度上限，见 candidateUrls */
+        private const val MAX_CANDIDATE_URL_LEN = 4096
 
         /** 第三方配置里 requestInterval 的可用上限，见 effectiveInterval */
         const val MAX_REQUEST_INTERVAL_MS: Long = 15_000

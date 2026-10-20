@@ -74,6 +74,34 @@ class BangumiStubFetcher(
 @OptIn(ExperimentalCoroutinesApi::class)
 class BangumiClientTest {
 
+    /**
+     * 设置页的「探测」按钮拿的是**还没保存、也就从没被 setChannel 校验过**的目标。
+     * 实测（修复前）默认部署下 POST /api/bangumi/channel/probe
+     * {"customUrls":["http://127.0.0.1:19999"]} 真的让服务器去打了一针内网端口，
+     * 而回包的 detail/latencyMs 直接把「这个端口开着、它这么回答」告诉对方
+     * ——同一个地址 PUT /api/bangumi/channel 是被拒的，说明政策对、调用点漏了。
+     */
+    @Test
+    fun `probing an unsaved custom channel cannot reach internal addresses`() = runTest {
+        val fetcher = BangumiStubFetcher(
+            getRoutes = mapOf("https://api.bgm.tv/v0/subjects" to subjectResponse),
+        )
+        val client = BangumiClient(
+            fetcher,
+            listOf("https://api.bgm.tv"),
+            allowPrivateTargets = false,
+        )
+        assertFailsWith<com.animeko.web.http.UrlGuard.Blocked> {
+            client.probe(
+                com.animeko.web.bangumi.BgmChannelConfig(
+                    com.animeko.web.bangumi.BgmChannel.CUSTOM,
+                    listOf("http://127.0.0.1:19999"),
+                ),
+            )
+        }
+        assertTrue(fetcher.requests.isEmpty(), "被拦下之前已经发出过上游请求：${fetcher.requests}")
+    }
+
     private val searchResponse = """
         {"data":[{"id":328609,"name":"ぼっち・ざ・ろっく！","name_cn":"孤独摇滚！","date":"2022-10-07",
         "platform":"TV","images":{"large":"https://img.example/l/xx.jpg"},

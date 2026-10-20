@@ -5,13 +5,19 @@ package com.animeko.web.http
  *
  * kotlinx 的树解析器是**递归**的：`[[[[…]]]]` 递归多深就吃多深的 Java 栈，
  * 20 万层（400KB，正好在本服务 1MB 请求体上限之内）会把栈打穿，抛出
- * StackOverflowError。而 Error 不是 Exception —— 代码里所有
- * `runCatching { parseToJsonElement(...) }` 都接不住它，于是：
- *  - 一个畸形请求体变成 500（正确答案是 400：内容坏的是来访者的请求）；
- *  - 每次都在日志里落下上千行栈。实测一次 PUT 写 1026 行，
- *    批量打这个接口等于用日志把这台机器的磁盘灌满。
+ * StackOverflowError。为什么不能靠下游兜着，两条实测（本轮跑出来的）：
+ *  · `catch (e: Exception)` 接不住它 —— 它是 Error。SubscriptionService /
+ *    SelectorEngine 里那两处显式 catch Exception 的地方，删掉本闸门后
+ *    SOE 会一路穿到 StatusPages；
+ *  · `runCatching { … }` **接得住**（它 catch 的是 Throwable），而且接住之后的
+ *    行为更糟：UserDataStore.read 会把这份「解析失败的合法 JSON」当坏文件
+ *    搬成 *.bad、对外回一份 {}，客户端拿到 200 就以为同步过了，
+ *    下一次写入直接把用户的整份存档覆盖掉。
+ * 所以「反正有 runCatching / StatusPages 兜底」是不成立的：一个变成 500 +
+ * 上千行栈的日志放大，另一个变成静默的数据覆盖。两道兜底都保留，
+ * 但闸门必须设在解析之前。
  *
- * 所以解析前先扫一遍深度。扫描是单遍 O(n)、不分配，相对解析本身可以忽略。
+ * 扫描是单遍 O(n)、不分配，相对解析本身可以忽略。
  */
 object JsonGuard {
     /**

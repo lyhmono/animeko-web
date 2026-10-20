@@ -109,11 +109,11 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 | `ANIMEKO_HOST` | `0.0.0.0` | 监听地址 |
 | `ANIMEKO_PORT` | `8080` | 服务端口 |
 | `ANIMEKO_DATA_DIR` | `/data`（镜像内） | 数据目录：`selectors/` 数据源配置、`userdata.json` 个人数据 |
-| `ANIMEKO_FRONTEND_DIR` | `/app/frontend/dist` | 前端构建产物目录 |
+| `ANIMEKO_FRONTEND_DIR` | `frontend/dist`（镜像用 ENV 设成 `/app/frontend/dist`） | 前端构建产物目录。**代码默认值与镜像里不一样**：裸跑 jar 时它找的是相对当前工作目录的 `frontend/dist`，找不到就只服务 API（首页 404）并留一条 warn 说清是哪个目录 |
 | `ANIMEKO_AUTH_USER` / `ANIMEKO_AUTH_PASSWORD` | — | 登录页的账号与口令；**配了就自动开启登录** |
 | `ANIMEKO_AUTH_TOKEN` | — | 只配一个口令也行：登录页把它当密码（用户名任意），API 调用可用 `Authorization: Bearer` |
 | `ANIMEKO_AUTH_ENABLED` | 自动 | 默认跟随凭据。显式写 `false` 可关掉登录页（前面已有反代鉴权时才需要）；**公网暴露时务必开启** |
-| `ANIMEKO_COOKIE_SECURE` | `false` | 会话 Cookie 是否加 `Secure`。反代配好 HTTPS 后设为 `true`；在纯 HTTP 下设 `true` 会让浏览器丢弃 Cookie、登录页反复回弹 |
+| `ANIMEKO_COOKIE_SECURE` | `false` | 会话 Cookie 是否加 `Secure`，并**同时改用 `__Host-` 前缀**（要求 Secure、不许带 Domain、Path=/，于是别的子域再也种不进同名会话）。反代配好 HTTPS 后设为 `true`；在纯 HTTP（非 localhost）下设 `true` 会让浏览器丢弃 Cookie、登录页反复回弹，所以前缀只跟着它走 |
 | `ANIMEKO_ALLOW_PRIVATE_TARGETS` | `false` | 是否允许代理/抓取内网地址（见下方安全说明） |
 | `ANIMEKO_ALLOW_CROSS_ORIGIN` | `false` | 是否放开「写接口仅限同源」的 CSRF 检查（见下方安全说明） |
 | `ANIMEKO_TRUSTED_PROXY_HOPS` | `0` | 服务前面有几层**你控制**的反代。0=直连（X-Forwarded-* 一律不信）；填 N 后限速按 XFF 从右数第 N 个真实客户端记账、同源判定改看 `X-Forwarded-Host`。层数要如实填：少了把代理 IP 当客户端（限速全员共享），多了把客户端伪造的 XFF 当真值 |
@@ -158,7 +158,7 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 | 方法 | 路径 | 凭据 | 说明 |
 |---|---|---|---|
 | GET | `/api/health` | 免 | `{status, version, authEnabled, authenticated}`；`authenticated` **只反映会话 Cookie**（见下）。容器 `HEALTHCHECK` 依赖它，所以永远免鉴权 |
-| POST | `/api/session/login` | 免 | `{username, password}` → `Set-Cookie: animeko_session=…`。按 IP 限速，超限 `429` + `Retry-After` |
+| POST | `/api/session/login` | 免 | `{username, password}` → `Set-Cookie: animeko_session=…`（开了 `ANIMEKO_COOKIE_SECURE` 则是 `__Host-animeko_session`）。按 IP 对**猜错**限速，超限 `429` + `Retry-After`（正确口令不受该窗口影响）；请求体上限 32KB |
 | POST | `/api/session/logout` | 需要 | 服务端立即作废该会话号（只清浏览器 Cookie 是不够的） |
 | GET | `/api/data` | 需要 | 个人数据整份文档 + `ETag`；无文档时 `{}` |
 | PUT | `/api/data` | 需要 | 整份覆盖。带 `If-Match` 时版本不符回 `409 DATA_STALE`；请求体 ≤1MB，文档 ≤512KB |
@@ -185,15 +185,23 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 - **默认就是登录状态**：只要配了 `ANIMEKO_AUTH_USER`+`ANIMEKO_AUTH_PASSWORD`（或 `ANIMEKO_AUTH_TOKEN`），
   登录鉴权自动开启，打开网站先进登录页。想彻底关掉（例如前面已有反代鉴权）显式写 `ANIMEKO_AUTH_ENABLED=false`。
 - 登录成功后服务端签发会话 Cookie（`HttpOnly`、`SameSite=Strict`、`Path=/`、30 天空闲即失效、使用中自动续期）。
+  开了 `ANIMEKO_COOKIE_SECURE` 时名字变成 `__Host-animeko_session`：浏览器对这个前缀强制「必须 Secure、不许带 Domain、Path 必须是 /」，
+  于是同级子域再也无法往这台机器上**种**一个同名会话（cookie tossing）。读侧两个名字都认（升级/降级那次不至于把已登录的人踢下线），
+  注销时两个都覆盖。
   用 Cookie 而不是让前端带 `Authorization` 头，是因为 `<video>`、`<img>`、hls.js 的分片请求
   都加不了自定义头 —— 只有 Cookie 会被浏览器自动带到这些子资源上。
   未认证请求同时下发 **Basic 质询**，命令行与不带 Cookie 的场景仍可用：
   `curl -u 账号:口令`，或只配了 token 时**用户名任意、密码填 token**；
   API 客户端也可以用 `Authorization: Bearer <ANIMEKO_AUTH_TOKEN>`。
-- 凭据校验失败按客户端 IP 限速：**5 分钟内 8 次**，超过后连输对口令也返回 `429`（带 `Retry-After`）。
+- 凭据校验失败按客户端 IP 限速：**5 分钟内 8 次**，超过后**继续猜错**只得到 `429`（带 `Retry-After`），
+  不再回答「这次对不对」。**但猜对的人不会被这个窗口挡在门外** —— 把正确口令也拒掉拦不住任何人
+  （他等 5 分钟再来一次照样进得来），却能把机主锁死：会话只存内存，容器一重启就必须重新走登录页，
+  而下面那种「全站共用一个限速键」的部署里，任何匿名访客都能反复占住这条路。
+  限速是**猜测速率**的闸门，不是给合法用户设的门槛。
   **直连部署（默认）按 `remoteHost` 记账**：X-Forwarded-For 完全由客户端提供，信它就能靠
   轮换假 IP 无限重置计数器（有回归用例）。**反代部署必须设 `ANIMEKO_TRUSTED_PROXY_HOPS=<层数>`**：
-  否则所有请求的 `remoteHost` 都是代理自己，一个客户端输错到限额，其他所有人跟着被锁 5 分钟。
+  否则所有请求的 `remoteHost` 都是代理自己，全站共用一个计数器 —— 一个访客猜错到限额后，
+  别人的猜测会一起被 429 挡掉（正确口令仍然进得来，但每个人的爆破预算被并成了同一份）。
   填了层数后取 XFF 从右数第 N 个地址（每跳可信代理在右端追加一个「这一跳看到的地址」）；
   链长短于层数、或取到的值不是 IP 形态时退回 `remoteHost`，不让伪造值进键空间。
   限速覆盖**所有**能验证凭据的路径，不只是登录接口 —— 只要还剩一个免限流的接口能回答
@@ -285,6 +293,12 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
   被拦时返回 `403 CROSS_SITE_REQUEST`。反向代理若改写了 `Host` 造成误判：
   设 `ANIMEKO_TRUSTED_PROXY_HOPS=<层数>` 后判定改看 `X-Forwarded-Host`（浏览器看到的原始主机），
   或者确认反代保持 `proxy_set_header Host $host`；`ANIMEKO_ALLOW_CROSS_ORIGIN=true` 是最后手段
+    - 填 hops 的**前提**是那位代理会**改写**（不是追加）`X-Forwarded-Host` / `X-Forwarded-Proto` /
+      `X-Forwarded-For`。nginx 用 `proxy_set_header`，不要用 `proxy_add_header`。
+      如果设了 `hops>=1` 而代理把客户端发来的 XFH 原样透传，攻击者就能自己填一个与
+      `Origin` 相同的 `X-Forwarded-Host`，从而把「写接口仅限同源」这一层整体绕过 ——
+      这不是猜测，是信任 N 层转发头这个决定的直接后果。同理，代理不改写头部时，
+      限速键会落到客户端伪造的地址上（见上面那段），爆破预算形同不存在。
   （此时请自行保证服务不被不可信网络访问）。
   命令行/API 客户端不带 `Origin`，不受影响。
 - 鉴权豁免判定走**归一化后的路径段精确匹配**（丢空段、逐段 URL 解码），不是 URI 字符串前缀。
@@ -360,7 +374,7 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 ### 社区数据源哪里找
 
 上游 Animeko 有社区维护的聚合数据源仓库 **[creamycake-anime/animeko-subs](https://github.com/creamycake-anime/animeko-subs)**
-（旧名 `ani-subs`），本项目已用其订阅文件实测：**19 个在线源全部可直接导入**。
+（旧名 `ani-subs`），本项目已用其订阅文件实测：**里面的在线源都能直接导入**（不写具体条数 —— 那份文件由社区持续增删，写死一个数字必然过期，这里就曾经写着 19 而实测已是 18）。
 
 - 单个源文件：仓库里 `subs/web/t0/` ～ `subs/web/t4/` 下的 `<数据源名>.json`（t0 质量最高），
   整段复制后到「数据源」页粘贴导入即可；BT 源在 `subs/bt/`，**本项目不支持 BT 源**。
@@ -428,14 +442,15 @@ cd frontend && NODE_ENV=development npm install && npm run dev   # http://localh
   而 `npm install` 本身是成功退出 0 的。
 - **起服务要带 UTF-8 locale**（原因见上面「社区数据源哪里找」）。
 
-单元测试：`cd backend && ./gradlew test` —— 178 个用例，覆盖 JsonPath / Selector 引擎与数据源仓库 /
+单元测试：`cd backend && ./gradlew test` —— 用例数以 `grep -rho '@Test' backend/src/test | wc -l` 为准（写死一个数字必然过期，这里就曾经写着 178 而实际早已 260+）。覆盖 JsonPath / Selector 引擎与数据源仓库 /
 聚合订阅（含逐跳重定向、订阅内重名、坏条目单独失败、预览指纹防内容漂移、自动导入沿用已关闭的源、
 一个订阅挂了不连带其它订阅）/ HLS 重写 /
 代理会话绑定与过期（含主机名解析不出来时不得放行凭据）/ HLS 上游非 2xx 不得伪装成合法清单 / 个人数据从 .bak 恢复与读写同锁 / 登录会话与限速（含 XFF 伪造与可信代理层数）/ 凭据预言机 /
 路径写法绕过 / 个人数据落盘与条件写 / SSRF 拦截不回显内网地址 / 候选 URL 尾缀净化 /
 条目封面三种形态（自身属性、子树 img、同容器平级缩略图，含「不许拿邻居的图」）/
 配置正则过期时的通用后缀兜底（且配置命中优先）/
-停用源服务端拒绝 / API 路由与静态托管缓存策略 / Bangumi 客户端。要求 0 编译警告。
+停用源服务端拒绝 / API 路由与静态托管缓存策略 / Bangumi 客户端。
+编译会有告警但**不会因此失败**（没开 `-Werror`/`allWarningsAsErrors`）——与其写一句没人执行的「要求 0 警告」，不如把它写成现状：一个不生效的承诺比没有承诺更坏。
 GitHub Actions（`.github/workflows/ci.yml`）在 push/PR 上自动跑后端测试与前端 `tsc + vite build`。
 
 端到端冒烟（对**真实二进制**跑，不是测试桩）：`bash scripts/live-smoke.sh` —— 13 节 78 项，

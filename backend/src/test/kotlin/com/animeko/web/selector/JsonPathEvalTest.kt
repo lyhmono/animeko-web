@@ -9,6 +9,26 @@ import kotlin.test.assertTrue
 
 class JsonPathEvalTest {
 
+    /**
+     * `..key` 连用会组合爆炸，而且爆炸来自「扫描次数」而不是「嵌套深度」，
+     * 所以 JsonGuard 的 128 层深度闸门一点忙都帮不上。
+     * 实测（未封顶时）：深度 128 配 $..a..a..a..a → 0.96 秒产出 10,668,000 个元素，
+     * 再多一段直接跑不完 —— 一份社区数据源配置就能把整个进程打死。
+     */
+    @Test
+    fun `repeated recursive descent is capped instead of exploding`() {
+        val depth = 128
+        val doc = "{\"a\":".repeat(depth) + "1" + "}".repeat(depth)
+        val root = Json.parseToJsonElement(doc)
+        val started = System.nanoTime()
+        val r = JsonPathEval.evaluate("$"+  "..a".repeat(5), root)
+        val ms = (System.nanoTime() - started) / 1_000_000
+        assertTrue(r == null || r.size <= 20_000, "中间结果没封顶，长到了 ${r?.size}")
+        assertTrue(ms < 2_000, "花了 ${ms}ms，工作上限没有生效")
+        // 正常选择器不受影响
+        assertEquals(1, JsonPathEval.evaluate("$..a", Json.parseToJsonElement("""{"a":{"b":1}}"""))?.size)
+    }
+
     private val json = Json { ignoreUnknownKeys = true }
 
     private fun parse(text: String): JsonObject = json.parseToJsonElement(text).let { it as JsonObject }

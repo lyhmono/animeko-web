@@ -96,12 +96,18 @@ export default function SettingsPage() {
       await flushUserData()
       const parts = [
         summary.favorites > 0 ? `收藏 ${summary.favorites} 部` : '',
+        summary.sourceFavorites > 0 ? `数据源收藏 ${summary.sourceFavorites} 条` : '',
         summary.subjectProgress > 0 ? `条目进度 ${summary.subjectProgress} 条` : '',
         summary.progress > 0 ? `播放进度 ${summary.progress} 条` : '',
         summary.searchHistory > 0 ? `搜索历史 ${summary.searchHistory} 条` : '',
         summary.recent > 0 ? `最近观看 ${summary.recent} 条` : '',
       ].filter(Boolean)
-      setBackupMsg(parts.length > 0 ? `已合并：${parts.join('、')}` : '备份里没有比本地更新的数据')
+      // flushUserData 不抛错（失败都落在同步状态里），所以这里必须自己看一眼：
+      // 否则「已合并」会盖在一次失败的服务器写入上面，用户以为备份已经安全落地，
+      // 关掉页面就又回到导入前的样子
+      const st = getSyncState()
+      const tail = st.status === 'error' ? `（已在本机生效，但保存到服务器失败：${st.error || '未知原因'}）` : ''
+      setBackupMsg(parts.length > 0 ? `已合并：${parts.join('、')}${tail}` : `备份里没有比本地更新的数据${tail}`)
     } catch (e) {
       setBackupMsg(`导入失败：${e instanceof Error ? e.message : '未知错误'}`)
     }

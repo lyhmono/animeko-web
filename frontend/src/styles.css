@@ -1779,6 +1779,10 @@ textarea::placeholder {
   position: absolute;
   inset: 0;
   z-index: 4;
+  /* 只是一条文字提示，却铺满整块画面并压在控制条（z-index 2）之上。
+     不加这一行的话，源站 403 之后播放/拖动/音量/全屏**全部点不动**，
+     用户只能刷新——同文件其它几个覆盖层都设了这个。 */
+  pointer-events: none;
   display: flex;
   align-items: center;
   justify-content: center;

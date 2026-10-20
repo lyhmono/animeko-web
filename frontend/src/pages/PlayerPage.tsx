@@ -31,14 +31,21 @@ function parseNext(raw: string | null): NextEpisode | null {
   return null
 }
 
-function nextToParams(next: NextEpisode): URLSearchParams {
-  return new URLSearchParams({
+function nextToParams(next: NextEpisode, subjectId = 0, subjectUrl = ''): URLSearchParams {
+  const p = new URLSearchParams({
     source: next.source,
     play: next.play,
     title: next.title,
     anime: next.anime,
     ep: next.ep,
   })
+  // 连播要把条目 id 一起带过去。原先 next 里只有五个字段（没有 subject），
+  // 于是自动切到下一话后 subjectId=0，那一句 `if (subjectId > 0) setSubjectProgress(...)`
+  // 再也不执行 —— 条目页的「看到第几话」永久停在上一话，而且没有任何报错。
+  if (subjectId > 0) p.set('subject', String(subjectId))
+  // 数据源详情页地址也要带过去：它是连播链条「手里没有下一集时」唯一的续命凭据
+  if (subjectUrl) p.set('surl', subjectUrl)
+  return p
 }
 
 function fmtTime(seconds: number): string {
@@ -56,7 +63,9 @@ export default function PlayerPage() {
   const animeName = params.get('anime') ?? ''
   const ep = params.get('ep') ?? ''
   /** 从条目页进来时带的 Bangumi 条目 id：用来回写「看到第几话」 */
-  const subjectId = Number(params.get('subject') ?? '') || 0
+  const subjectId = Number(params.get('subject') || '') || 0
+  /** 数据源详情页地址：连播链条重新取剧集列表时用（见 resolveChain） */
+  const subjectUrl = params.get('surl') ?? ''
   const nextInfo = useMemo(() => parseNext(params.get('next')), [params])
 
   const [src, setSrc] = useState('')
@@ -66,6 +75,21 @@ export default function PlayerPage() {
   const [error, setError] = useState('')
   const [manualUrl, setManualUrl] = useState('')
   const [nextCountdown, setNextCountdown] = useState<number | null>(null)
+  /**
+   * 连播链条在「URL 里没有下一集」时现场解析出来的那一集。
+   *
+   * 为什么必须有这一格：条目页只把**紧邻的下一集**塞进 URL 的 next，
+   * 而播放页跳转时只能原样传下去（它手里就这一条）。于是
+   * 「播完 12 → 自动播 13」之后，13 播完时 next 已经用完，
+   * `handleEnded` 的 `if (nextInfo)` 不成立 —— 整条自动连播从此静默停住，
+   * 「即将播放下一集」再也不出现，用户唯一的办法是回条目页重新点一次。
+   * 一个号称「自动连播」的功能只会连一集，这不是降级，是功能不成立。
+   */
+  const [autoNext, setAutoNext] = useState<NextEpisode | null>(null)
+  /** 顺带多算出来的一集：带进下一跳的 URL，让下一页仍能走零成本的旧路径 */
+  const successorRef = useRef<NextEpisode | null>(null)
+  const chainSeqRef = useRef(0)
+  const target = nextInfo ?? autoNext
 
   const lastWriteRef = useRef<number | null>(null)
   const stageRef = useRef<HTMLDivElement | null>(null)
@@ -129,15 +153,64 @@ export default function PlayerPage() {
   }, [source, playUrl])
 
   // 连播倒计时
+  const navToNext = () => {
+    const ep = target
+    if (!ep) return
+    const p = nextToParams(ep, subjectId, subjectUrl)
+    // 只有 resolveChain 顺手多算出来的那一集才写进 URL；从条目页来的旧路径
+    // 手里只有 next 这一条，下一跳会自己去取列表（那时 surl 已经带上了）
+    if (successorRef.current) p.set('next', JSON.stringify(successorRef.current))
+    window.location.assign(`/play?${p.toString()}`)
+  }
+
+  /**
+   * 手里没有下一集时，重新向数据源详情页取一次剧集列表，按当前这一集定位它的下一集。
+   *
+   * 定位用 playUrl 而不是集号数字：源的集号文本五花八门（「第12话」「12」「正片」），
+   * 而 playUrl 就是这一页此刻正在播的那条地址，是唯一可靠的钥匙。
+   * **找不到当前这一集时必须什么都不做**：少了这一格，findIndex 返回 -1，
+   * list[i + 1] 就是 list[0]，症状会变成「播完最后一集自动跳回第一集」——
+   * 源站在两次抓取之间换了列表（很常见）时就会触发。
+   */
+  const resolveChain = async () => {
+    if (!source || !subjectUrl || !playUrl) return
+    const seq = ++chainSeqRef.current
+    try {
+      const result = await api.sourceEpisodes(source, subjectUrl)
+      if (seq !== chainSeqRef.current) return
+      const list = result.episodes.length > 0
+        ? result.episodes
+        : result.groups.flatMap((g) => g.episodes)
+      const i = list.findIndex((e) => e.playUrl === playUrl)
+      if (i < 0) return
+      const mk = (e: (typeof list)[number]): NextEpisode => ({
+        source,
+        play: e.playUrl,
+        title: `${animeName || title} ${e.name}`,
+        anime: animeName,
+        ep: String(e.sortNum ?? e.sort),
+      })
+      const nx = list[i + 1]
+      if (!nx) return
+      setAutoNext(mk(nx))
+      const after = list[i + 2]
+      successorRef.current = after ? mk(after) : null
+      setNextCountdown(5)
+    } catch {
+      // 取列表失败就停在今天的行为上（停在当前，用户仍可手动选）。
+      // 不弹错误框：视频已经播完了，此时那句「拿不到剧集列表」只是噪声
+    }
+  }
+
   useEffect(() => {
     if (nextCountdown == null) return
     if (nextCountdown <= 0) {
-      if (nextInfo) window.location.assign(`/play?${nextToParams(nextInfo).toString()}`)
+      navToNext()
       return
     }
     const timer = window.setTimeout(() => setNextCountdown((c) => (c ?? 1) - 1), 1000)
     return () => window.clearTimeout(timer)
-  }, [nextCountdown, nextInfo])
+  }, [nextCountdown, target, subjectId, subjectUrl])
 
   // 播放进度节流写入
   const handleProgress = (time: number, duration: number) => {
@@ -152,10 +225,12 @@ export default function PlayerPage() {
     }
   }
 
-  // 播放结束：清除进度，有下一集则启动连播倒计时
+  // 播放结束：清除进度，有下一集则启动连播倒计时；
+  // URL 里没带下一集时先去找一集（找到才会启动倒计时，找不到就停在这里）
   const handleEnded = () => {
     if (source && playUrl) clearProgress(source, playUrl)
-    if (nextInfo) setNextCountdown(5)
+    if (target) setNextCountdown(5)
+    else void resolveChain()
   }
 
   const resumePlay = () => {
@@ -169,10 +244,7 @@ export default function PlayerPage() {
     setResumeTime(null)
   }
 
-  const gotoNext = () => {
-    if (!nextInfo) return
-    window.location.assign(`/play?${nextToParams(nextInfo).toString()}`)
-  }
+  const gotoNext = navToNext
 
   const playManualUrl = () => {
     const url = manualUrl.trim()
@@ -187,6 +259,11 @@ export default function PlayerPage() {
     setStartAt(0)
     setResumeTime(null)
     setNextCountdown(null)
+    // 连播的「现场解析出来的那一集」也必须一起清掉：URL 里的 next 已经删了，
+    // 但 autoNext 是本页的 state，留着它就等于「手动换地址播完仍会跳回数据源那条链」
+    setAutoNext(null)
+    successorRef.current = null
+    chainSeqRef.current++
     addRecent({
       source: 'manual',
       playUrl: url,
@@ -227,7 +304,7 @@ export default function PlayerPage() {
             startAt={startAt}
             fullscreenTarget={stageRef}
             theater
-            onNextEpisode={nextInfo ? gotoNext : undefined}
+            onNextEpisode={target ? gotoNext : undefined}
             onProgress={handleProgress}
             onEnded={handleEnded}
             onError={(msg, status) => {
@@ -273,7 +350,7 @@ export default function PlayerPage() {
         <div className="next-bar fade-in">
           <IconNext size={15} />
           <span className="next-text">
-            即将播放下一集：<b>{nextInfo?.title ?? ''}</b>
+            即将播放下一集：<b>{target?.title ?? ''}</b>
           </span>
           <span className="next-count">{nextCountdown}s</span>
           <button className="btn btn-sm" onClick={gotoNext}>
