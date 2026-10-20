@@ -84,6 +84,7 @@ export default function Layout() {
         </NavLink>
         <form
           className="nav-search"
+          data-testid="nav-search"
           role="search"
           onSubmit={(e) => {
             e.preventDefault()
@@ -100,7 +101,7 @@ export default function Layout() {
           />
         </form>
         <div className="nav-links">
-          <div className="nav-actions">
+          <div className="nav-actions" data-testid="nav-actions">
           <button
             className="theme-toggle"
             onClick={toggleTheme}

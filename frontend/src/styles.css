@@ -225,13 +225,43 @@ textarea::placeholder {
  * 摆回顶栏：右边缘留出两个 36px 按钮 + 间距（= 96px），垂直居中于 56px 顶栏。
  */
 .nav-tabs {
-  position: absolute;
+  /* fixed 而不是 absolute：.nav 是 sticky，滚到顶部后会一直贴住视口；
+     而 absolute 相对 .app 定位，页面一滚就跟着内容跑 ——
+     结果是顶栏还在、导航项却没了。fixed 与 sticky 的顶栏同步。
+     只给 top 不给 bottom（也不给 height），就不会被拉伸填满。 */
+  position: fixed;
   top: 10px;
   right: 96px;
   display: flex;
   align-items: center;
   gap: 2px;
   z-index: 101;
+}
+
+/*
+ * 中等宽度（721-1100px）：顶栏放不下 logo + 搜索框 + 5 个文字导航 + 2 个按钮。
+ * 实测 5 个链接约 378px，加上 320px 搜索框与 logo 会重叠 —— 而原来的断点只有
+ * 720px（手机）和 640px，这段区间完全没人管。
+ * 这里改用纯图标：链接宽度降到约 42px/个，整组约 220px，任何宽度都放得下。
+ * 用 title 属性保留悬停提示，功能不受影响（图标本身够辨识）。
+ */
+@media (min-width: 721px) and (max-width: 1100px) {
+  .nav-tabs {
+    right: 92px;
+  }
+
+  .nav-tabs .nav-icon {
+    display: inline-flex;
+  }
+
+  .nav-tabs .nav-text {
+    display: none;
+  }
+
+  .nav-tabs a {
+    padding: 7px 10px;
+    gap: 0;
+  }
 }
 
 .nav-tabs a,
@@ -322,14 +352,10 @@ textarea::placeholder {
     padding-bottom: calc(72px + env(safe-area-inset-bottom));
   }
 
-  /* 播放页：底栏会压住进度条与手势区，整条隐藏并撤掉内容避让 */
+  /* 播放页：底栏会压住进度条与手势区，整条隐藏。
+     （对应的内容避让撤除在文件末尾那段一并处理，避免同一个决定写两处） */
   .app-player .nav-tabs {
     display: none;
-  }
-
-  .app-player .main,
-  .app-player .footer {
-    padding-bottom: 0;
   }
 }
 

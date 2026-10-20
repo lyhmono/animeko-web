@@ -75,16 +75,22 @@ def main() -> int:
         )
         check("顶栏导航存在", lambda: expect(page.get_by_test_id("nav-tabs")).to_be_visible(), page)
         check("首页 tab 存在", lambda: expect(page.get_by_test_id("nav-home")).to_be_visible(), page)
-        # 底部 tab 在桌面不该是 fixed（那是手机端的形态）。
-        # 不用「否定断言」：not_to_have_css 在元素缺失时也会通过，等于什么都没验。
-        check(
-            "桌面端导航不在底部",
-            lambda: assert_true(
-                css(page, "nav-tabs", "position") != "fixed",
-                f"桌面端 position={css(page, 'nav-tabs', 'position')}",
-            ),
-            page,
-        )
+        def desktop_nav_at_top() -> None:
+            """桌面端导航必须在**视口顶部**，而不是底部。
+
+            不能再用「position != fixed」判断：桌面端现在也用 fixed
+            （为了与 sticky 顶栏同步，见 .nav-tabs 的注释）。
+            真正要验的是位置：rect.bottom 应该落在顶部 80px 以内。
+            """
+            r = page.get_by_test_id("nav-tabs").evaluate(
+                "(el) => { const b = el.getBoundingClientRect(); return {top: b.top, bottom: b.bottom}; }"
+            )
+            if r["bottom"] > 80:
+                raise AssertionError(
+                    f"桌面端导航底边在 {r['bottom']:.0f}px，应贴在顶部（<80）"
+                )
+
+        check("桌面端导航在顶部", desktop_nav_at_top, page)
         def airing_ok() -> None:
             """每日放送要么渲染出来，要么明确因为上游不可用而隐藏 —— 两者都算对。
 
@@ -172,6 +178,57 @@ def main() -> int:
         # 空收藏时只有空态、没有状态 tabs，所以断言「主体在」而不是 tabs，
         # 否则首次部署（0 收藏）会得到一条假失败
         check("收藏页渲染", lambda: expect(page.get_by_test_id("main")).to_be_visible(), page)
+
+        def nav_follows_scroll() -> None:
+            """向下滚动后，导航项必须还贴在顶栏里。
+
+            这是真实存在过的缺陷：.nav 是 sticky（滚到顶就贴住视口），
+            而 .nav-tabs 当时是 absolute 相对 .app 定位 —— 页面一滚，
+            顶栏留下了、导航项却跟着内容滚走了。
+            断言方式：滚动 400px，再量导航的 rect.top，应该还在顶部附近。
+            """
+            page.evaluate("() => window.scrollTo(0, 400)")
+            page.wait_for_timeout(300)
+            r = page.get_by_test_id("nav-tabs").evaluate(
+                "(el) => el.getBoundingClientRect().top"
+            )
+            if r > 40:
+                raise AssertionError(f"滚动 400px 后导航跑到了 {r:.0f}px（顶栏还在，导航滚走了）")
+            page.evaluate("() => window.scrollTo(0, 0)")
+
+        check("滚动后导航仍贴顶", nav_follows_scroll, page)
+
+        # ---------- 中等宽度：顶栏不该挤在一起 ----------
+        print("tablet 900x700")
+        t = browser.new_page(viewport={"width": 900, "height": 700})
+        t.goto(BASE, wait_until="networkidle")
+
+        def no_overlap() -> None:
+            """顶栏里各区块不能重叠。
+
+            这条专门防「加了导航却没管中间宽度」：5 个文字链接约占 378px，
+            与 320px 的搜索框在 900px 视口下会叠在一起 —— 而原来的断点只有
+            720px 与 640px，721-1100px 这段完全没人管。
+            量法：拿每个区块的 rect，两两比较横向区间是否相交。
+            """
+            rects = {}
+            for tid in ("nav-logo", "nav-search", "nav-tabs", "nav-actions"):
+                loc = t.get_by_test_id(tid)
+                if loc.count() == 0:
+                    continue
+                r = loc.first.evaluate(
+                    "(el) => { const b = el.getBoundingClientRect(); return {l: b.left, r: b.right}; }"
+                )
+                rects[tid] = (r["l"], r["r"])
+
+            order = [k for k in ("nav-logo", "nav-search", "nav-tabs", "nav-actions") if k in rects]
+            for a, b in zip(order, order[1:]):
+                if rects[a][1] > rects[b][0] + 1:
+                    raise AssertionError(
+                        f"{a} 右边缘 {rects[a][1]:.0f} 压住了 {b} 的左边缘 {rects[b][0]:.0f}"
+                    )
+
+        check("顶栏各区块不重叠", no_overlap, t)
 
         # ---------- 手机 ----------
         print("mobile 390x844")
