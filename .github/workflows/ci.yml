@@ -84,21 +84,37 @@ jobs:
             sleep 1
           done
 
-          # 上面那行注释声称验证了降权与 /data 可写，但当时其实什么都没查。
-          # 补上真断言：进程 uid 必须是 10001（gosu 生效），/data 必须可写
-          # （否则第一次保存个人数据才炸，而 CI 永远看不到）。
-          UID_IN=$(docker exec animeko-ci id -u)
+          # 降权与 /data 可写要验的是**服务进程**，不是 `docker exec` 起来的 shell。
+          # 上一版这里写的是 `docker exec … id -u`，那是条恒假的断言：exec 用的是镜像
+          # 配置的默认用户，而本 Dockerfile 没有 `USER` 指令（它从 root 起，只在
+          # entrypoint 里用 gosu 把服务本体降下来），所以 exec 永远报 0。
+          # 实测：CI 在 590acdf 上就报「容器内进程 uid=0」，而那时 gosu 是生效的。
+          #
+          # 现在按三条各自能证明的东西来问：
+          #  1) PID 1 的 Uid —— 入口脚本是 `exec gosu app "$0"`、服务又是 `exec` 上去的，
+          #     所以 PID 1 就是服务本体，它的 uid 才是真相；
+          #  2) /data/selectors 的属主 —— 这个目录是服务在启动时自己建的（SelectorRepository
+          #     的 init），属主是 10001 就等于同时证明了「进程以该 uid 运行」和「它能写 /data」；
+          #  3) 以 10001 身份测 /data 可写 —— `-u 10001` 让 exec 用运行用户的身份，
+          #     root 的 exec 来测可写性毫无意义（root 什么都能写）。
+          UID_IN=$(docker exec animeko-ci awk '/^Uid:/{print $2}' /proc/1/status)
           if [ "$UID_IN" != "10001" ]; then
-            echo "::error::容器内进程 uid=$UID_IN，期望 10001：entrypoint 的 gosu 降权没生效"
+            echo "::error::服务进程（PID 1）uid=$UID_IN，期望 10001：entrypoint 的 gosu 降权没生效"
             docker logs animeko-ci
             exit 1
           fi
-          docker exec animeko-ci test -w /data || {
-            echo "::error::/data 对运行用户不可写，个人数据与数据源导入都会失败"
+          SEL_OWNER=$(docker exec animeko-ci stat -c '%u' /data/selectors)
+          if [ "$SEL_OWNER" != "10001" ]; then
+            echo "::error::/data/selectors 属主是 $SEL_OWNER 而不是 10001：服务没能在数据卷上写入"
+            docker exec animeko-ci ls -ld /data /data/selectors || true
+            exit 1
+          fi
+          docker exec -u 10001 animeko-ci test -w /data || {
+            echo "::error::/data 对运行用户（10001）不可写，个人数据与数据源导入都会失败"
             docker exec animeko-ci ls -ld /data || true
             exit 1
           }
-          echo "privilege drop OK: uid=$UID_IN, /data writable"
+          echo "privilege drop OK: PID 1 uid=$UID_IN, /data/selectors owner=$SEL_OWNER, writable by 10001"
 
           # 前端产物：health 只能证明后端活着。dist 没落位时它照样 200，
           # 而用户打开是一张白页 —— 这种故障从 CI 里最看不出来，所以必须单独验。
