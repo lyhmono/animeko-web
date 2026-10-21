@@ -151,6 +151,36 @@ class SubscriptionServiceTest {
     }
 
     @Test
+    fun `re-importing an existing source keeps it disabled`() = runTest {
+        // 实测（本机 18079）：导入 → 停用 → 用订阅「更新」同一条 → enabled 又变回 true。
+        // 用户关掉一个源是明确判断过它不可用的（死站，或每个源都要等 20 秒超时的那一个）；
+        // 重新导入订阅是为拿新内容/新源，不该顺手把这个决定翻回去 ——
+        // 症状是之后每次搜索都在那个源上等超时，用户只看到「搜索变慢了」。
+        // 自动导入那条路径一直是沿用原状态的（autoImport 的 `known[name] ?: true`），
+        // 手动挑源导入漏了这一步。
+        val (svc, repo) = service(aggregate, existing("嘀嗒影视"))
+        repo.setEnabled("嘀嗒影视", false)
+        assertFalse(repo.find("嘀嗒影视")!!.enabled, "前提：源已被停用")
+
+        val result = svc.importSelected(
+            url = "https://sub.example.test/css.json", text = null, names = listOf("嘀嗒影视"),
+        )
+        assertEquals(listOf("嘀嗒影视"), result.updated)
+        assertFalse(repo.find("嘀嗒影视")!!.enabled, "更新配置不能把用户关掉的源重新打开")
+        assertTrue(
+            repo.find("嘀嗒影视")!!.arguments.searchConfig.searchUrl.contains("dadi.test"),
+            "但内容要真的换成订阅里的那一份（停用不等于拒绝更新）",
+        )
+
+        // 正面对照：新导入的源默认是启用的（别把「保住已停用」做成「导进来全是停用」）
+        val fresh = svc.importSelected(
+            url = "https://sub.example.test/css.json", text = null, names = listOf("稀饭动漫"),
+        )
+        assertEquals(listOf("稀饭动漫"), fresh.added)
+        assertTrue(repo.find("稀饭动漫")!!.enabled)
+    }
+
+    @Test
     fun `bare array and single source shapes are accepted`() = runTest {
         val bareArray = mediaSourcesJson()
         val (svcA, _) = service(bareArray)

@@ -199,10 +199,16 @@ class SubscriptionService(
                 failed += "$name（订阅里没有这一条）"
                 continue
             }
-            val existed = repo.find(name) != null
+            val existing = repo.find(name)
             try {
-                repo.save(args)
-                if (existed) updated += name else added += name
+                // 更新已有源时**沿用它的启停状态**：用户把某个源关掉，是明确判断过它不可用
+                // （死站，或者每个源都要等 20 秒超时的那个）。重新导入订阅是为了拿新内容/新源，
+                // 不该顺手把这个决定翻回去 —— 自动导入那条路径早就这样做了
+                // （autoImport 的 `known[args.name] ?: true`），手动挑源导入却漏了。
+                // 实测症状：停用 → 用订阅「更新」同一条 → 又变回启用，随后每次搜索都要
+                // 在那个死源上等超时，用户只看到「搜索变慢了」，联想不到是导入干的。
+                repo.save(args, existing?.enabled ?: true)
+                if (existing != null) updated += name else added += name
             } catch (e: IllegalArgumentException) {
                 failed += "$name（${e.message?.take(120) ?: "配置不合法"}）"
             }
