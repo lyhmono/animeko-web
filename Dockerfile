@@ -20,7 +20,26 @@ RUN npm run build
 FROM gradle:9.3.1-jdk21-jammy AS backend-build
 WORKDIR /app
 COPY backend/ ./
-RUN gradle installDist --no-daemon -x test
+# 部署机上一次就死在这一步：等 25 分钟后报
+#   "Gradle build daemon disappeared unexpectedly (it may have been killed or may have crashed)"
+# 守护进程日志停在「daemon is running. Sleeping until state changes」—— 没有异常、没有栈，
+# 这是被 OOM killer 杀掉的典型形状。项目 gradle.properties 给 Gradle 留了 -Xmx2g，
+# 另外还有独立的 Kotlin 守护进程（再吃约 1g）和 parallel 构建；小内存 VPS 上叠起来就被砍。
+#
+# 这里把峰值压到**一个** JVM：
+#   - Gradle 堆收到 1g、元空间封顶 512m（原来的 2g 是给小内存机型埋的雷）；
+#   - Kotlin 编译改在 Gradle 进程内跑（kotlin.compiler.execution.strategy=in-process），
+#     不再 fork 第二个 JVM —— 那是被 OOM 时最先死、且死得最无声的那个；
+#   - 关并行、只给 2 个 worker。
+# 代价是本机实测 clean 编译从 ~50s 变成 68s；换来的是 2GB 机器也构建得完。
+# 先在日志里留下内存与核数：下次再失败时，这份输出能直接说明是内存不够、还是机器本身卡住。
+# 用 /proc/meminfo 而不是 free：基础镜像里不一定装了 procps（`free` 来自它），
+# 而那行诊断恰恰要在「构建失败」时还能用，不能依赖一个可能不存在的命令。
+RUN grep -E 'MemTotal|MemAvailable' /proc/meminfo || true; nproc || true; \
+    gradle installDist --no-daemon -x test --console=plain \
+      -Dorg.gradle.jvmargs="-Xmx1g -XX:MaxMetaspaceSize=512m" \
+      -Pkotlin.compiler.execution.strategy=in-process \
+      -Dorg.gradle.parallel=false --max-workers=2
 
 # ---------- Stage 3: 运行 ----------
 FROM eclipse-temurin:21-jre-jammy
