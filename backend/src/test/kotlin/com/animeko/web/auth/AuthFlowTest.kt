@@ -45,6 +45,13 @@ class AuthFlowTest {
         return raw.substringBefore(';')
     }
 
+    /** 登录一次，返回 `name=value` 形态的会话 Cookie。 */
+    private suspend fun io.ktor.server.testing.ApplicationTestBuilder.login(
+        password: String = "correct horse",
+    ): String = cookieOf(
+        client.post("/api/session/login") { setBody("""{"username":"me","password":"$password"}""") },
+    )
+
     @Test
     fun `login issues a hardened session cookie that unlocks the api`() = testApplication {
         application { module(config()) }
@@ -82,6 +89,64 @@ class AuthFlowTest {
         // 登录返回 200 而每一次后续请求都是 401，症状是「登录页反复回弹」
         val ok = client.get("/api/selector/sources") { header(HttpHeaders.Cookie, cookieOf(resp)) }
         assertEquals(HttpStatusCode.OK, ok.status, "带 __Host- 会话必须能用（Cookie 头是原样名字）")
+    }
+
+    @Test
+    fun `a stale host-prefixed cookie cannot shadow a valid session`() = testApplication {
+        // 实测（本机 18078）：`Cookie: __Host-animeko_session=<无效>; animeko_session=<有效>` → 401。
+        // 触发路径不刁钻：HTTPS 部署（曾种下 __Host- 那份）改成 cookieSecure=false 之后，
+        // 浏览器里那份还在，等它服务端过期、用户重新登录种下不带前缀的新名字，
+        // 读侧却先看旧的那份 —— 每个请求 401，而注销接口自己也要鉴权、同样 401，
+        // Cookie 永远清不掉。读侧必须「任一有效即算已登录」。
+        application { module(config()) }
+        val token = login().substringAfter('=')
+        val ok = client.get("/api/selector/sources") {
+            header(HttpHeaders.Cookie, "__Host-animeko_session=deadbeef; animeko_session=$token")
+        }
+        assertEquals(HttpStatusCode.OK, ok.status, "陈旧的 __Host- 不该遮蔽有效会话")
+        val other = client.get("/api/selector/sources") {
+            header(HttpHeaders.Cookie, "__Host-animeko_session=$token; animeko_session=deadbeef")
+        }
+        assertEquals(HttpStatusCode.OK, other.status)
+        // 对照：两个都无效时必须还是 401（别为了修遮蔽把校验放过）
+        assertEquals(
+            HttpStatusCode.Unauthorized,
+            client.get("/api/selector/sources") {
+                header(HttpHeaders.Cookie, "__Host-animeko_session=aaa; animeko_session=bbb")
+            }.status,
+        )
+    }
+
+    @Test
+    fun `logout invalidates both cookie name variants and clears both`() = testApplication {
+        application { module(config()) }
+        val a = login().substringAfter('=')
+        val b = login().substringAfter('=')
+        // 两份都带着（正是改过 COOKIE_SECURE 的浏览器会送出来的形状）
+        val both = "__Host-animeko_session=$b; animeko_session=$a"
+        assertEquals(HttpStatusCode.OK, client.get("/api/selector/sources") { header(HttpHeaders.Cookie, both) }.status)
+        val out = client.post("/api/session/logout") { header(HttpHeaders.Cookie, both) }
+        assertEquals(HttpStatusCode.OK, out.status)
+        val cleared = out.headers.getAll(HttpHeaders.SetCookie).orEmpty()
+        assertTrue(cleared.any { it.startsWith("__Host-animeko_session=;") }, cleared.toString())
+        assertTrue(cleared.any { it.startsWith("animeko_session=;") }, cleared.toString())
+        // 两份会话都在服务端作废了：只作废被「优先」的那一份，另一份还能用
+        assertEquals(HttpStatusCode.Unauthorized, client.get("/api/selector/sources") { header(HttpHeaders.Cookie, "__Host-animeko_session=$b") }.status)
+        assertEquals(HttpStatusCode.Unauthorized, client.get("/api/selector/sources") { header(HttpHeaders.Cookie, "animeko_session=$a") }.status)
+    }
+
+    @Test
+    fun `a failed auth expires both cookie names`() = testApplication {
+        // 浏览器里留着一份服务端不认的会话时，401 必须顺手把它过期掉：
+        // 否则「登录成功 → 下一个请求仍 401」会一直循环，用户只能去手动清 Cookie
+        application { module(config()) }
+        val resp = client.get("/api/selector/sources") {
+            header(HttpHeaders.Cookie, "__Host-animeko_session=stale; animeko_session=stale2")
+        }
+        assertEquals(HttpStatusCode.Unauthorized, resp.status)
+        val cleared = resp.headers.getAll(HttpHeaders.SetCookie).orEmpty()
+        assertEquals(2, cleared.size, "401 要把两个名字都清掉：$cleared")
+        assertTrue(cleared.all { it.contains("Max-Age=0") }, cleared.toString())
     }
 
     @Test

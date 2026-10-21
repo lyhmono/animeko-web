@@ -89,9 +89,23 @@ private const val HOST_PREFIXED_COOKIE = "__Host-$SESSION_COOKIE"
 private fun sessionCookieName(cookieSecure: Boolean): String =
     if (cookieSecure) HOST_PREFIXED_COOKIE else SESSION_COOKIE
 
-/** 读：两个名字都认，优先 `__Host-` 那份。 */
-private fun ApplicationCall.sessionToken(): String? =
-    cookieValue(HOST_PREFIXED_COOKIE) ?: cookieValue(SESSION_COOKIE)
+/**
+ * 读：两个名字都认，但**必须两个都试**，不能只取优先的那个。
+ *
+ * 「优先 `__Host-`」听起来无害，实际会把人锁在门外：从 HTTPS 部署（`__Host-`）
+ * 切回 `cookieSecure=false` 之后，浏览器里那份 `__Host-` 还留着；等它在服务端过期
+ * 或已被注销，而用户重新登录种下的是不带前缀的新名字，读侧却仍然先看那份陈旧的 ——
+ * 于是每一个请求都是 401，连注销接口自己都要鉴权、同样 401，Cookie 永远清不掉。
+ * 实测：`Cookie: __Host-animeko_session=<无效>; animeko_session=<有效>` → 401。
+ *
+ * 现在返回**所有**候选，由调用方「任一有效即算已登录」，
+ * 注销则把两个都作废（它们都是这台机器发出去的会话）。
+ */
+private fun ApplicationCall.sessionTokens(): List<String> =
+    listOf(cookieValue(HOST_PREFIXED_COOKIE), cookieValue(SESSION_COOKIE))
+        .filterNotNull()
+        .filter { it.isNotEmpty() }
+        .distinct()
 
 private const val PROXY_PATH = "/api/proxy"
 
@@ -177,6 +191,10 @@ fun Application.configureApiRoutes(
                         finish()
                     }
                     AuthResult.Failed -> {
+                        // 顺手把两个会话 Cookie 名都过期掉：若浏览器里还揣着一份服务端已不认的
+                        // 旧 Cookie（改过 ANIMEKO_COOKIE_SECURE 的部署就会这样），不清掉的话
+                        // 它会一直被送上来，而用户看到的是「登录成功、下一个请求又 401」。
+                        call.response.clearSessionCookie(cfg)
                         // 只有「浏览器直接访问」这类请求才值得下发 Basic 质询（curl 与命令行也没有
                         // Sec-Fetch-Mode）。给 XHR/媒体请求下发质询会让浏览器弹原生口令框，
                         // 盖住前端自己的登录页 —— 而 hls.js 的分片请求全是 XHR。
@@ -272,7 +290,8 @@ fun Application.configureApiRoutes(
         }
 
         post(LOGOUT_PATH) {
-            call.sessionToken()?.let { site.invalidate(it) }
+            // 两个都作废：它们是同一台机器签发的同一份会话的两种写法
+            call.sessionTokens().forEach { site.invalidate(it) }
             call.response.clearSessionCookie(cfg)
             call.respond(SessionStateResponse(authenticated = false))
         }
@@ -765,7 +784,7 @@ private fun ApplicationCall.pathSegments(): List<String> {
 }
 
 private fun ApplicationCall.hasValidSession(site: SessionStore): Boolean =
-    sessionToken()?.let { site.isValid(it) } == true
+    sessionTokens().any { site.isValid(it) }
 
 /**
  * 这个 401 该不该附 Basic 质询。

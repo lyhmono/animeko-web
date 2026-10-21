@@ -119,6 +119,11 @@ contains "jar 里有会话号" 'animeko_session' "$(cat "$JAR")"
 # 带前缀浏览器会整条丢弃 Set-Cookie，症状是「口令对了却一直在登录页」
 SCNAME=$(printf '%s' "$HDR" | tr ';' '\n' | grep -o 'Set-Cookie: *[^= ]*' | head -1 | sed 's/.*: *//')
 check "http 部署的会话 Cookie 名不带 __Host- 前缀" "animeko_session" "$SCNAME"
+# 读侧必须两个名字都试：改过 ANIMEKO_COOKIE_SECURE 的浏览器会同时送出一份陈旧的
+# __Host- 和一份新登录种下的普通名。只认优先的那个 → 每个请求 401，而注销接口自己
+# 也要鉴权、同样 401，Cookie 永远清不掉（实测过，不修就是把人锁在门外）。
+SVAL=$(grep animeko_session "$JAR" | awk '{print $NF}')
+check "陈旧 __Host- 不遮蔽有效会话" "200" "$(curl -sS -o /dev/null -w '%{http_code}' -m 5 -H "Cookie: __Host-animeko_session=deadbeef; animeko_session=$SVAL" "$BASE/api/selector/sources")"
 # 登录接口现在先读体再判限速，所以它自己必须有一个远小于 1MB 的上限，
 # 否则被限流的客户端照样能按请求体压带宽与堆
 BIG=$(python3 -c "print('{\"username\":\"me\",\"password\":\"' + 'a'*40000 + '\"}')")
