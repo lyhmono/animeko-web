@@ -26,6 +26,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Lockfile must not pin a third-party registry
+        working-directory: frontend
+        run: |
+          # 锁文件里 124 条 resolved 曾经全指向 http://mirrors.tencent.com（明文 HTTP），
+          # 那台镜像一抖，Docker 构建就在 npm ci 上 ETIMEDOUT —— 与代码无关的部署失败。
+          # 这一格防止它在别处重新生成锁文件时又悄悄绑上去：只允许默认源。
+          hosts=$(grep -o '"resolved": "https\?://[^/]*' package-lock.json | sed 's/.*"resolved": "https\?:\/\///' | sort -u)
+          echo "lockfile 里的下载源: ${hosts:-<空>}"
+          if [ "$hosts" != "registry.npmjs.org" ]; then
+            echo "::error::package-lock.json 绑定了第三方 registry：${hosts:-<空>}（镜像抖动会直接让部署失败）"
+            exit 1
+          fi
       - name: Frontend typecheck + build
         working-directory: frontend
         run: |

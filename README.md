@@ -102,6 +102,11 @@ docker buildx build --platform linux/arm64 -t animeko-web:arm64 --load .
 docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 ```
 
+> 前端依赖默认从 `https://registry.npmjs.org` 装（锁文件里 124 条 `resolved` 都指向它）。
+> 国内构建机如果连官方源慢，加 `--build-arg NPM_REGISTRY=https://registry.npmmirror.com`
+> 即可换源；不传就是官方源。**不要**把锁文件重新生成到某个第三方镜像上 —— 那会让
+> 每次构建都依赖那台镜像的可用性（这里就发生过一次：镜像抖动，部署在 `npm ci` 上 ETIMEDOUT）。
+
 ### 环境变量
 
 | 变量 | 默认 | 说明 |

@@ -6,6 +6,11 @@ backend/out/
 frontend/dist/
 frontend/node_modules/
 
+# 版本库元数据：构建用不到，但会被完整打进构建上下文（每份历史都发给 builder）
+.git/
+.gitignore
+.gitattributes
+
 # 运行时数据（挂载卷）
 data/
 

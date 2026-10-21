@@ -4,7 +4,15 @@
 FROM node:22-alpine AS frontend-build
 WORKDIR /web
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci --no-audit --no-fund
+# 锁文件里的 resolved 一律指向 https://registry.npmjs.org，不再绑死某个第三方镜像。
+# 之前 124 条全指向 http://mirrors.tencent.com（还是明文 HTTP），那台镜像一抖，
+# 任何一次构建都直接 ETIMEDOUT —— 部署失败与项目代码无关，只是它替我们选了个源。
+# 国内构建机要走镜像时：--build-arg NPM_REGISTRY=https://registry.npmmirror.com
+# （实测 npm ci 会把锁文件里指向默认源的地址替换成这里给的源）。
+# 再给 npm 加退避重试：一次网络抖动不该让整次部署失败。
+ARG NPM_REGISTRY=https://registry.npmjs.org
+RUN npm ci --no-audit --no-fund --registry=${NPM_REGISTRY} \
+      --fetch-retries=5 --fetch-timeout=120000
 COPY frontend/ ./
 RUN npm run build
 
