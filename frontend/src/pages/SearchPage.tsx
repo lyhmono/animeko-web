@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import Poster from '../components/Poster'
 import { api, errMsg } from '../api'
-import type { BgmSubject, StoredSource, SubjectHit } from '../types'
+import type { BgmSubject, SubjectHit } from '../types'
 import { addSearchHistory, favoriteIdSet, onDocChange } from '../lib/storage'
 import { IconHeartFilled, IconRefresh } from '../lib/icons'
 
@@ -39,7 +39,11 @@ export default function SearchPage() {
   const [bgm, setBgm] = useState<BgmSubject[]>([])
   const [bgmLoading, setBgmLoading] = useState(!!q)
   const [bgmError, setBgmError] = useState('')
-  const [sources, setSources] = useState<StoredSource[]>([])
+  // 这个页面只用到源的名字（名称列表 + 计数）：状态里就只存名字。
+  // 原先存整个 StoredSource，缓存分支只能靠 `as unknown as` 伪造一个缺 description/
+  // searchConfig 的对象 —— 现在只读 name 所以没炸，但那等于在这一行把类型系统关掉了，
+  // 以后谁要用到 searchConfig 就会拿到 undefined 而编译器一声不吭。
+  const [sources, setSources] = useState<{ name: string }[]>([])
   const [sourceHits, setSourceHits] = useState<Record<string, SubjectHit[]>>({})
   const [sourceErrors, setSourceErrors] = useState<Record<string, string>>({})
   const [sourcesLoading, setSourcesLoading] = useState(!!q)
@@ -87,11 +91,7 @@ export default function SearchPage() {
       setBgmError(cached.bgmError)
       setSourceHits(cached.sourceHits)
       setSourceErrors(cached.sourceErrors)
-      setSources(
-        cached.sourceNames
-          .filter((s) => s.enabled)
-          .map((s) => ({ factoryId: 'web-selector', version: 2, enabled: true, arguments: { name: s.name } } as unknown as StoredSource)),
-      )
+      setSources(cached.sourceNames.filter((s) => s.enabled).map((s) => ({ name: s.name })))
       setBgmLoading(false)
       setSourcesLoading(false)
       return
@@ -167,7 +167,7 @@ export default function SearchPage() {
         if (cancelled) return
         const enabled = list.filter((s) => s.enabled)
         namesAcc = list.map((s) => ({ name: s.arguments.name, enabled: s.enabled }))
-        setSources(enabled)
+        setSources(enabled.map((s) => ({ name: s.arguments.name })))
         // 逐个回填，不能等 Promise.all 一次性 set：十几个源里有几个是死的，
         // 每个要等到超时才回来。攒齐再渲染的结果是「明明有结果的源
         // 也陪着死源一起空转」，用户看到满屏「0 个结果」以为功能坏了 —— 实测如此。
@@ -236,7 +236,7 @@ export default function SearchPage() {
     const pending: string[] = []
     const zero: string[] = []
     for (const s of sources) {
-      const name = s.arguments.name
+      const name = s.name
       const error = sourceErrors[name]
       if (error !== undefined) {
         failed.push({ name, error })
