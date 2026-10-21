@@ -493,6 +493,27 @@ export function setSubjectProgress(subjectId: number, ep: number): void {
   writeJson('subjectProgress', next)
 }
 
+// ---------- 播放方式（设备偏好，不进服务端文档）----------
+
+/**
+ * 直连播放：浏览器直接连数据源站点取流，不经过这台服务器。
+ *
+ * 默认开：视频流量是这台机器最大的一笔开销，而且直连没有中转延迟。
+ * 代价是源站能看到观看者的 IP；遇到防盗链（要特定 Referer/Cookie）或 CDN 不给
+ * CORS 时直连会失败，播放器会自动回退到 /api/proxy 再试一次。
+ * 存在本机：同一份部署在不同网络环境下（手机蜂窝 / 家里宽带）可以各选各的。
+ */
+const DIRECT_PLAY_KEY = 'animeko-web:direct-playback'
+
+export function getDirectPlayback(): boolean {
+  // 只有明确写过 off 才关；没设置过按「开」处理
+  return localRead(DIRECT_PLAY_KEY) !== 'off'
+}
+
+export function setDirectPlayback(on: boolean): void {
+  localWrite(DIRECT_PLAY_KEY, on ? 'on' : 'off')
+}
+
 // ---------- 播放进度 ----------
 export interface ProgressEntry {
   source: string

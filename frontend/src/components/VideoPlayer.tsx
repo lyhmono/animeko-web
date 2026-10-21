@@ -17,8 +17,10 @@ import {
 } from '../lib/icons'
 
 interface Props {
-  /** 播放地址（已通过服务端代理） */
+  /** 首选播放地址（直连或代理） */
   src: string
+  /** 首选失败时的备用地址（服务端中转）。给出后，致命错误会自动切一次 */
+  fallbackSrc?: string
   /** 加载后一次性定位到的秒数（断点续播） */
   startAt?: number
   /** 全屏目标容器；播放页传入包含控制条的舞台，缺省时全屏本组件 */
@@ -32,6 +34,13 @@ interface Props {
   /** status 为清单请求的 HTTP 状态码（410=会话过期、403=目标不被允许），供上层决定重新解析 */
   onError?: (message: string, status?: number) => void
 }
+
+/**
+ * 单击/双击的分界（毫秒），与系统默认的双击间隔一致。
+ * 单击动作必须等这么久才执行：否则双击的第一下就会先把控制条切掉、第二下再快进 ——
+ * 用户看到的是一次双击同时干了两件事（实测复现过）。双击窗口内的第二次点击会取消它。
+ */
+const DOUBLE_TAP_MS = 300
 
 function formatTime(seconds: number): string {
   if (!isFinite(seconds) || seconds < 0) return '00:00'
@@ -75,6 +84,7 @@ function snapRate(value: number): number {
 
 export default function VideoPlayer({
   src,
+  fallbackSrc,
   startAt,
   fullscreenTarget,
   theater = false,
@@ -112,6 +122,10 @@ export default function VideoPlayer({
   /** 手势/双击的中央浮层提示，1.2 秒后自动消退 */
   const [gestureToast, setGestureToast] = useState<GestureToast | null>(null)
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  /** 等待双击窗口结束的单击动作（显隐控制条） */
+  const tapTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  /** 控制条当前是否可见：单击动作要延迟 300ms 才执行，闭包里的 state 可能已过期 */
+  const controlsVisibleRef = useRef(true)
   /** 亮度滤镜值（1 = 原样），手势调节时临时压暗/提亮画面 */
   const brightnessRef = useRef(1)
   /** 倍速菜单开合（自绘 popover 取代原生 select 的视觉） */
@@ -124,18 +138,36 @@ export default function VideoPlayer({
   const onProgressRef = useRef(onProgress)
   const onEndedRef = useRef(onEnded)
   const fullscreenTargetRef = useRef(fullscreenTarget)
+  /** 事件回调只绑一次，回退状态要经 ref 读取最新值（同上面几个回调的理由） */
+  const fallbackSrcRef = useRef(fallbackSrc)
+  const useFallbackRef = useRef(false)
   useEffect(() => {
     onErrorRef.current = onError
     onProgressRef.current = onProgress
     onEndedRef.current = onEnded
     fullscreenTargetRef.current = fullscreenTarget
+    fallbackSrcRef.current = fallbackSrc
+    useFallbackRef.current = useFallback
   })
+
+  /**
+   * 直连优先：主地址失败（防盗链、CORS、网络）时切到服务端中转，只切一次。
+   * 换源/重新解析（src 变化）后重新给直连一次机会 —— 新地址可能是另一台主机。
+   */
+  const [useFallback, setUseFallback] = useState(false)
+  const [lastPrimarySrc, setLastPrimarySrc] = useState(src)
+  if (src !== lastPrimarySrc) {
+    // render 阶段同步派生状态：用 effect 重置会让新 src 先带着旧的 useFallback 加载一帧
+    setLastPrimarySrc(src)
+    if (useFallback) setUseFallback(false)
+  }
+  const activeSrc = useFallback && fallbackSrc ? fallbackSrc : src
 
   // 加载源
   const startAtAppliedRef = useRef(false)
   useEffect(() => {
     const video = videoRef.current
-    if (!video || !src) return
+    if (!video || !activeSrc) return
     let hls: Hls | null = null
     setError(null)
     // 换源（切集）后要重新允许定位一次，否则第二集的断点续播永远不生效
@@ -148,14 +180,19 @@ export default function VideoPlayer({
     // removeAttribute('src') 清不掉它，只能显式抹）
     applyBrightness(1)
 
-    if (isDirectPlayable(src)) {
-      video.src = src
+    if (isDirectPlayable(activeSrc)) {
+      video.src = activeSrc
     } else if (Hls.isSupported()) {
       hls = new Hls({ enableWorker: true, fragLoadingTimeOut: 30000 })
-      hls.loadSource(src)
+      hls.loadSource(activeSrc)
       hls.attachMedia(video)
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (!data.fatal) return
+        // 直连的清单拿不到（CORS/防盗链）：先悄悄换成服务端中转，这不算最终失败
+        if (!useFallback && fallbackSrc) {
+          setUseFallback(true)
+          return
+        }
         // 清单加载失败时把 HTTP 状态码一起抛出：410 是「播放会话过期」，
         // 与「源站拒绝代理」是两回事，上层据此自动重新解析一次
         const status = (data.response as { code?: number } | undefined)?.code
@@ -167,7 +204,7 @@ export default function VideoPlayer({
         onErrorRef.current?.(msg, status)
       })
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = src
+      video.src = activeSrc
     } else {
       const msg = '当前浏览器不支持 HLS 播放'
       setError(msg)
@@ -179,7 +216,7 @@ export default function VideoPlayer({
       video.removeAttribute('src')
       video.load()
     }
-  }, [src])
+  }, [activeSrc])
 
   // 断点续播：加载后定位一次
   useEffect(() => {
@@ -197,7 +234,7 @@ export default function VideoPlayer({
     if (video.readyState >= 1) apply()
     video.addEventListener('loadedmetadata', apply)
     return () => video.removeEventListener('loadedmetadata', apply)
-  }, [startAt, src])
+  }, [startAt, activeSrc])
 
   // ---------- 影院化控制层 ----------
 
@@ -222,8 +259,14 @@ export default function VideoPlayer({
     return () => {
       if (hideTimerRef.current) clearTimeout(hideTimerRef.current)
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+      if (tapTimerRef.current) clearTimeout(tapTimerRef.current)
     }
   }, [revealControls])
+
+  // 延迟执行的单击动作读这个 ref，而不是闭包里那份可能已过期的 state
+  useEffect(() => {
+    controlsVisibleRef.current = controlsVisible
+  }, [controlsVisible])
 
   // 缓冲进度：轮询 video.buffered（hls.js 不会把它同步到 DOM 事件上，
   // 而 progress 事件只在当前播放位置推进时触发，seek 到未缓冲处就看不出差距）
@@ -281,6 +324,12 @@ export default function VideoPlayer({
     const onMediaError = () => {
       // 没有 error 对象的 error 事件是切源/卸载清理时补发的，别当成播放失败
       if (!video.error) return
+      // 直连被源站拒绝（403/404/CORS）：先切服务端中转再试一次
+      if (!useFallbackRef.current && fallbackSrcRef.current) {
+        setUseFallback(true)
+        setError(null)
+        return
+      }
       const code = video.error.code
       const msg = `视频加载失败（MEDIA_ERROR_${code}），源站可能拒绝了代理请求，可尝试下方手动地址播放`
       setError(msg)
@@ -443,7 +492,6 @@ export default function VideoPlayer({
     moved: false,
     lastTap: 0,
     seekBase: 0,
-    lastTapLeft: false,
     // 音量/亮度的**起始快照**：move 里必须从快照值加累计位移算，
     // 不能从「上一帧更新后的值」减「从起点累计的位移」——那是双重重算，
     // 音量会以两倍速跳、亮度会沿二次曲线爆掉（快照和 seekBase 一个道理）
@@ -460,6 +508,12 @@ export default function VideoPlayer({
 
   const onPointerDown = (e: ReactPointerEvent<HTMLVideoElement>) => {
     if (e.pointerType === 'mouse' && e.button !== 0) return
+    // 新手势开始 = 上一次单击还没到执行时刻的那件事作废：
+    // 否则「点一下、立刻开始拖拽」会在拖动中途被延迟动作切掉控制条。
+    if (tapTimerRef.current) {
+      clearTimeout(tapTimerRef.current)
+      tapTimerRef.current = undefined
+    }
     // 摸到画面就收起倍速菜单：它浮在控制条上方，不收的话会一直挡着进度条
     if (rateOpen) setRateOpen(false)
     const g = gestureRef.current
@@ -528,6 +582,18 @@ export default function VideoPlayer({
     }
   }
 
+  /** 双击左右三分区：复用键盘那套 seekBy，只额外给出与滑动手势一致的提示条 */
+  const seekStep = (delta: number) => {
+    seekBy(delta)
+    const video = videoRef.current
+    const total = video?.duration || 0
+    showToast({
+      kind: 'seek',
+      text: `${delta > 0 ? '+' : ''}${delta} 秒`,
+      level: total > 0 && video ? video.currentTime / total : 0,
+    })
+  }
+
   const onPointerUp = (e: ReactPointerEvent<HTMLVideoElement>) => {
     const g = gestureRef.current
     if (!g.active) return
@@ -539,26 +605,31 @@ export default function VideoPlayer({
       revealControls()
       return
     }
-    // 单击逻辑里带双击检测：300ms 内同侧屏幕的第二次点击是「快进/快退 10 秒」
+    // 单击 vs 双击：DOUBLE_TAP_MS 内的第二次点击算双击。
+    // 三分区（与主流播放器一致）：左 1/3 快退 10 秒、右 1/3 快进 10 秒、中间 全屏。
+    // 单击动作（显隐控制条）**延后**到双击窗口结束才执行，双击时取消 ——
+    // 原先第一下立刻切控制条、第二下再快进，用户看到的是「一次双击干了两件事」。
     const now = Date.now()
     const rect = e.currentTarget.getBoundingClientRect()
-    const leftSide = e.clientX - rect.left < rect.width / 2
-    if (now - g.lastTap < 300 && leftSide === g.lastTapLeft) {
+    const rel = rect.width > 0 ? (e.clientX - rect.left) / rect.width : 0.5
+    if (now - g.lastTap < DOUBLE_TAP_MS) {
       g.lastTap = 0
-      const video = videoRef.current
-      if (video) {
-        const delta = leftSide ? -10 : 10
-        video.currentTime = Math.max(0, Math.min(duration || Infinity, video.currentTime + delta))
-        setCurrent(video.currentTime)
-        showToast({ kind: 'seek', text: `${delta > 0 ? '+' : ''}${delta} 秒`, level: duration ? video.currentTime / duration : 0 })
+      if (tapTimerRef.current) {
+        clearTimeout(tapTimerRef.current)
+        tapTimerRef.current = undefined
       }
+      if (rel < 1 / 3) seekStep(-10)
+      else if (rel > 2 / 3) seekStep(10)
+      else toggleFullscreen()
       return
     }
     g.lastTap = now
-    g.lastTapLeft = leftSide
-    // 单击显隐控制条；控制条收起时这次点击不透传成播放/暂停
-    if (controlsVisible) setControlsVisible(false)
-    else revealControls()
+    if (tapTimerRef.current) clearTimeout(tapTimerRef.current)
+    tapTimerRef.current = setTimeout(() => {
+      tapTimerRef.current = undefined
+      if (controlsVisibleRef.current) setControlsVisible(false)
+      else revealControls()
+    }, DOUBLE_TAP_MS)
   }
 
   // ---- 画中画 ----

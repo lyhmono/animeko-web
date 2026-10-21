@@ -5,6 +5,7 @@ import VideoPlayer from '../components/VideoPlayer'
 import {
   addRecent,
   clearProgress,
+  getDirectPlayback,
   getProgress,
   setProgress,
   setSubjectProgress,
@@ -48,6 +49,18 @@ function nextToParams(next: NextEpisode, subjectId = 0, subjectUrl = ''): URLSea
   return p
 }
 
+/** 媒体地址能不能交给浏览器直连：https 页面里不许直连 http 媒体（浏览器会按混合内容拦掉）。 */
+function directUrlFor(media: string): string | null {
+  if (!/^https?:/i.test(media)) return null
+  if (typeof location !== 'undefined' && location.protocol === 'https:' && media.startsWith('http:')) return null
+  return media
+}
+
+/** 服务端中转地址：凭据在服务端会话里，URL 只带一个 sid（解析时才有） */
+function proxyUrlFor(media: string): string {
+  return `/api/proxy?${new URLSearchParams({ url: media }).toString()}`
+}
+
 function fmtTime(seconds: number): string {
   if (!isFinite(seconds) || seconds < 0) return '00:00'
   const m = Math.floor(seconds / 60)
@@ -69,6 +82,8 @@ export default function PlayerPage() {
   const nextInfo = useMemo(() => parseNext(params.get('next')), [params])
 
   const [src, setSrc] = useState('')
+  /** 首选失败时的服务端中转地址（直连模式下才会有意义） */
+  const [fallbackSrc, setFallbackSrc] = useState('')
   const [startAt, setStartAt] = useState(0)
   const [resumeTime, setResumeTime] = useState<number | null>(null)
   const [resolving, setResolving] = useState(false)
@@ -114,7 +129,9 @@ export default function PlayerPage() {
     // source=manual：playUrl 即媒体直链，跳过数据源解析直接经 /api/proxy 播放
     if (source === 'manual') {
       resolveSeqRef.current++
-      setSrc(`/api/proxy?${new URLSearchParams({ url: playUrl }).toString()}`)
+      const proxy = proxyUrlFor(playUrl)
+      setFallbackSrc(proxy)
+      setSrc(getDirectPlayback() ? (directUrlFor(playUrl) ?? proxy) : proxy)
       addRecent({ source, playUrl, title: title || playUrl, anime: animeName, ep, ts: Date.now() })
       return
     }
@@ -126,7 +143,9 @@ export default function PlayerPage() {
       .resolveVideo(source, playUrl)
       .then((video) => {
         if (seq !== resolveSeqRef.current) return
-        setSrc(video.proxyPath)
+        // 直连优先：视频流量不经过这台服务器；直连被防盗链/CORS 拒绝时播放器会自动回退
+        setFallbackSrc(video.proxyPath)
+        setSrc(getDirectPlayback() ? (directUrlFor(video.url) ?? video.proxyPath) : video.proxyPath)
         addRecent({
           source,
           playUrl,
@@ -249,7 +268,9 @@ export default function PlayerPage() {
   const playManualUrl = () => {
     const url = manualUrl.trim()
     if (!url) return
-    setSrc(`/api/proxy?${new URLSearchParams({ url }).toString()}`)
+    const proxy = proxyUrlFor(url)
+    setFallbackSrc(proxy)
+    setSrc(getDirectPlayback() ? (directUrlFor(url) ?? proxy) : proxy)
     setError('')
     // 手动换地址是本页**唯一不整页跳转**的换片路径（其余走 location.assign，组件重挂）。
     // 所以两份状态必须在这里自己清掉，否则会跟着带到新视频上：
@@ -301,6 +322,7 @@ export default function PlayerPage() {
         {src && (
           <VideoPlayer
             src={src}
+            fallbackSrc={fallbackSrc}
             startAt={startAt}
             fullscreenTarget={stageRef}
             theater
@@ -446,7 +468,7 @@ export default function PlayerPage() {
               <span className="keys">
                 <span className="kbd">双击</span>
               </span>
-              画面左 / 右半边快退 / 快进 10 秒
+              画面左 / 右侧快退 / 快进 10 秒 · 中间全屏
             </div>
             <div className="row">
               <span className="keys">

@@ -5,8 +5,10 @@ import {
   exportUserData,
   flushUserData,
   isUserDataLoaded,
+  getDirectPlayback,
   getSyncState,
   importUserData,
+  setDirectPlayback,
   getTheme,
   onSyncChange,
   setTheme,
@@ -23,6 +25,7 @@ export default function SettingsPage() {
   const [healthError, setHealthError] = useState('')
   const [healthLoading, setHealthLoading] = useState(true)
   const [theme, setThemeState] = useState<Theme>(getTheme)
+  const [directPlayback, setDirectPlaybackState] = useState<boolean>(getDirectPlayback)
   const [sync, setSync] = useState<SyncState>(getSyncState)
   const [saving, setSaving] = useState(false)
   /** 备份/恢复的结果提示（成功与失败共用一条，避免两套状态） */
@@ -125,6 +128,28 @@ export default function SettingsPage() {
   return (
     <div className="fade-in" style={{ maxWidth: 720 }}>
       <h2 className="section-title">设置</h2>
+
+      <div className="settings-group card">
+        <h3>播放方式</h3>
+        <div className="settings-row">
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text-secondary)' }}>
+            <input
+              type="checkbox"
+              checked={directPlayback}
+              onChange={(e) => {
+                const on = e.target.checked
+                setDirectPlaybackState(on)
+                setDirectPlayback(on)
+              }}
+            />
+            直连数据源播放（不经过这台服务器）
+          </label>
+        </div>
+        <div style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 6 }}>
+          直连时视频流量不占这台服务器的带宽，代价是源站能看到观看者的 IP。遇到防盗链（要特定
+          Referer/Cookie）或 CDN 不允许跨域时，播放器会自动回退到服务器中转，不需要手动切换。
+        </div>
+      </div>
 
       <div className="settings-group card">
         <h3>数据与登录</h3>
