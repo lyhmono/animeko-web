@@ -1106,11 +1106,27 @@ private const val MAX_BODY_BYTES = 1L * 1024 * 1024
  */
 private const val MAX_LOGIN_BODY_BYTES = 32L * 1024
 
+/**
+ * 「请求体超限」要能和「JSON 不合法」区分开。
+ *
+ * 它俩在 StatusPages 里都映射成 400，但**经由 bodyObject 的路由会先把它吞掉**：
+ * bodyObject 对任何异常都返回 null，调用方于是回「请填写口令」或「missing keyword」。
+ * 实测：40KB 的登录体（上限 32KB）得到的是 `{"error":"请填写口令"}` —— 状态码没错，
+ * 但排查的人会去检查表单，而真正的问题是他发了 40KB。
+ * 所以用一个专门类型标记它，bodyObject 见到就原样抛出（TooDeep 同理）。
+ */
+private class RequestTooLarge(message: String) : IllegalArgumentException(message)
+
 private suspend fun bodyField(call: ApplicationCall, field: String): String? =
     bodyObject(call)?.stringField(field)
 
 private suspend fun bodyObject(call: ApplicationCall, maxBytes: Long = MAX_BODY_BYTES): JsonObject? = try {
     prettyJson.parseToJsonElement(call.receiveCappedText(maxBytes)).jsonObject
+} catch (e: RequestTooLarge) {
+    // 这两类「内容坏/太大」的结论必须原样传出去，不能伪装成「缺字段」
+    throw e
+} catch (e: JsonGuard.TooDeep) {
+    throw e
 } catch (e: Exception) {
     null
 }
@@ -1152,7 +1168,9 @@ private fun JsonObject.stringArrayField(key: String): List<String> {
 private suspend fun ApplicationCall.receiveCappedText(maxBytes: Long = MAX_BODY_BYTES): String {
     // 先看 Content-Length 挡掉老实的超大请求，再逐块累加，防止 chunked 传输谎报长度
     val declared = request.contentLength()
-    require(declared == null || declared <= maxBytes) { "请求体超过 ${maxBytes / 1024}KB 上限" }
+    if (declared != null && declared > maxBytes) {
+        throw RequestTooLarge("请求体超过 ${maxBytes / 1024}KB 上限")
+    }
     val channel = request.receiveChannel()
     val out = ByteArrayOutputStream()
     val chunk = ByteArray(64 * 1024)
@@ -1161,7 +1179,7 @@ private suspend fun ApplicationCall.receiveCappedText(maxBytes: Long = MAX_BODY_
         val n = channel.readAvailable(chunk)
         if (n == -1) break
         total += n
-        require(total <= maxBytes) { "请求体超过 ${maxBytes / 1024}KB 上限" }
+        if (total > maxBytes) throw RequestTooLarge("请求体超过 ${maxBytes / 1024}KB 上限")
         out.write(chunk, 0, n)
     }
     val text = String(out.toByteArray(), Charsets.UTF_8)

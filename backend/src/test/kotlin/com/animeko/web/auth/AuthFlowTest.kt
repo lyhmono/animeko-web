@@ -150,6 +150,28 @@ class AuthFlowTest {
     }
 
     @Test
+    fun `an oversized login body is reported as oversized, not as a missing field`() = testApplication {
+        // 实测（本机 18079）：40KB 的登录体（上限 32KB）原先回的是
+        // `{"error":"请填写口令"}` —— 400 是对的，但这句话会把人引去检查表单，
+        // 而真正的问题是他发了 40KB。bodyObject 以前把所有异常都吞成 null。
+        application { module(config()) }
+        val big = """{"username":"me","password":"${"a".repeat(40_000)}"}"""
+        val resp = client.post("/api/session/login") { setBody(big) }
+        assertEquals(HttpStatusCode.BadRequest, resp.status)
+        assertTrue("上限" in resp.bodyAsText(), "要说明是体积超限：${resp.bodyAsText()}")
+        assertEquals(emptyList(), resp.headers.getAll(HttpHeaders.SetCookie).orEmpty())
+    }
+
+    @Test
+    fun `a too-deep login body says nesting instead of a missing field`() = testApplication {
+        application { module(config()) }
+        val deep = "[".repeat(200) + "]".repeat(200)   // 远小于 32KB，但深度超过 128
+        val resp = client.post("/api/session/login") { setBody(deep) }
+        assertEquals(HttpStatusCode.BadRequest, resp.status)
+        assertTrue("嵌套" in resp.bodyAsText(), resp.bodyAsText())
+    }
+
+    @Test
     fun `plain http deployments must not use the host prefix`() = testApplication {
         // `__Host-` 要求 Secure。默认部署是 http（本机 8080 或 SSH 隧道），
         // 那时加上前缀浏览器会**整条丢弃** Set-Cookie，比不加固糟糕得多：
