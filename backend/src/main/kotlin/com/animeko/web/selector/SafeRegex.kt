@@ -63,6 +63,10 @@ object SafeRegex {
      * 与 [group] 的区别：匹配成功但命名组为空时退回 [fallback]。
      * 线路名格式的语义是「匹配不上就丢掉这条元素，匹配上但取不出 ch 就用全文」，
      * 两种 null 不能混为一谈。
+     *
+     * 预算耗尽也退回 [fallback]：如果这里返回 null，调用方的 `mapNotNull`
+     * 会把这条线路整个丢掉，后面 `lists.zip(channelNames)` 整体错位 ——
+     * 正则没跑完就变成「A 线路的剧集挂到 B 线路名下」，比少一个线路名糟得多。
      */
     fun groupOrText(
         pattern: Pattern,
@@ -75,6 +79,6 @@ object SafeRegex {
         if (!matcher.find()) null
         else runCatching { matcher.group(group) }.getOrNull()?.trim()?.takeIf { it.isNotBlank() } ?: fallback
     } catch (e: BudgetExceeded) {
-        null
+        fallback
     }
 }

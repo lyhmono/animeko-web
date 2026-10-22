@@ -324,6 +324,7 @@ export default function PlayerPage() {
             src={src}
             fallbackSrc={fallbackSrc}
             startAt={startAt}
+            playKey={`${source}|${playUrl}`}
             fullscreenTarget={stageRef}
             theater
             onNextEpisode={target ? gotoNext : undefined}

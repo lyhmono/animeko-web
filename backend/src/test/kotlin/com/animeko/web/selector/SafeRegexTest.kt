@@ -15,9 +15,10 @@ class SafeRegexTest {
 
     @Test
     fun `the character budget aborts a match instead of hanging on exponential backtracking`() {
-        val catastrophic = assertNotNull(SafeRegex.compile("(a+)+$"))
-        // 30 个 a 的失败匹配是 2^30 级别的回溯；没有预算时要跑好几秒，有预算时立即放弃
-        val text = "a".repeat(30) + "!"
+        // 注意用三层嵌套：实测 JDK21 对 `(a+)+$` 有优化（30 个 a 也只要 1ms），
+        // 拿它写测试会变成一条什么都没证明的绿灯；`((a+)+)+$` 才会真的跑不完
+        val catastrophic = assertNotNull(SafeRegex.compile("^((a+)+)+$"))
+        val text = "a".repeat(40) + "!"
         val started = System.nanoTime()
         assertFalse(SafeRegex.contains(catastrophic, text, maxChecks = 20_000))
         val ms = (System.nanoTime() - started) / 1_000_000
@@ -50,5 +51,17 @@ class SafeRegexTest {
         // 完全不匹配：null（调用方据此丢弃）
         val mismatch = assertNotNull(SafeRegex.compile("^z+$"))
         assertNull(SafeRegex.groupOrText(mismatch, "abc", "ch", "全文"))
+    }
+
+    @Test
+    fun `groupOrText falls back instead of dropping a channel when the budget runs out`() {
+        // 线路名如果因为预算耗尽返回 null，mapNotNull 会丢项，lists.zip(channelNames)
+        // 就会把后面的剧集挂错线路；这里必须退回到全文保住下标。
+        // 同样用三层嵌套，避免 JDK 对 `(a+)+$` 的优化让这条用例空跑。
+        val catastrophic = assertNotNull(SafeRegex.compile("^(?<ch>(a+)+)+$"))
+        assertEquals(
+            "全文",
+            SafeRegex.groupOrText(catastrophic, "a".repeat(40) + "!", "ch", "全文", maxChecks = 20_000),
+        )
     }
 }

@@ -23,6 +23,11 @@ interface Props {
   fallbackSrc?: string
   /** 加载后一次性定位到的秒数（断点续播） */
   startAt?: number
+  /**
+   * 当前这一集的稳定标识（源 + 播放页地址）。同一集换 CDN/重解析时不变，
+   * 换手动地址或换集时变化 —— 只有前者需要沿用当前的播放位置。
+   */
+  playKey?: string
   /** 全屏目标容器；播放页传入包含控制条的舞台，缺省时全屏本组件 */
   fullscreenTarget?: RefObject<HTMLElement | null>
   /** 影院模式：舞台外框压暗，让放映区成为唯一视觉焦点 */
@@ -94,6 +99,7 @@ export default function VideoPlayer({
   src,
   fallbackSrc,
   startAt,
+  playKey = '',
   fullscreenTarget,
   theater = false,
   onPrevEpisode,
@@ -254,11 +260,12 @@ export default function VideoPlayer({
     return () => video.removeEventListener('loadedmetadata', apply)
   }, [startAt, activeSrc])
 
-  // 只有同一集的备用地址切换才续上当前位置；主地址换了（换集）必须清掉，
-  // 否则会把上一集的秒数用到新一集上。
+  // 同一集换源（直连→中转、410 重解析）要续上当前位置，靠 playKey 区分：
+  // 它不变说明还是这一集，变了（手动换地址/换集）就不能沿用上一段的位置。
+  // 不能用 src 判断：410 重解析时 proxyPath 会换一个 sid，src 也会变。
   useEffect(() => {
     resumeAtRef.current = 0
-  }, [src])
+  }, [playKey])
 
   // ---------- 影院化控制层 ----------
 
