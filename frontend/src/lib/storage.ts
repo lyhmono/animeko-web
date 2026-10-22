@@ -96,6 +96,9 @@ export async function loadUserData(): Promise<void> {
     loaded = true
     pendingKeys.clear()
     pendingProgressKeys.clear()
+    pendingFavIds.clear()
+    pendingSourceFavKeys.clear()
+    pendingSubjectKeys.clear()
     setSync({  status: 'ready', kind: null, error: ''  })
   } catch (e) {
     loaded = false
@@ -119,6 +122,14 @@ const MAX_PROGRESS_ENTRIES = 400
 const pendingKeys = new Set<string>()
 /** progress 是一个大 map，整键覆盖会吃掉别的标签页刚写的其它剧集，所以细到条目级 */
 const pendingProgressKeys = new Set<string>()
+/**
+ * 收藏同样细到条目：整键覆盖会让另一个标签页刚删掉的条目「复活」——
+ * 实测两个标签页各删一条不同收藏，最终只保住一份（另一条被对方的旧快照写回去）。
+ */
+const pendingFavIds = new Set<number>()
+const pendingSourceFavKeys = new Set<string>()
+/** subjectProgress 也是 map：整键覆盖会让另一台设备刚记下的条目消失 */
+const pendingSubjectKeys = new Set<string>()
 
 let timer: ReturnType<typeof setTimeout> | undefined
 let running: Promise<void> | null = null
@@ -169,14 +180,26 @@ export async function flushUserData(): Promise<void> {
 interface Round {
   keys: string[]
   progressKeys: string[]
+  favIds: number[]
+  sourceFavKeys: string[]
+  subjectKeys: string[]
   sentValues: Map<string, unknown>
   sentProgress: Map<string, unknown>
+  sentFavs: Map<number, unknown>
+  sentSourceFavs: Map<string, unknown>
+  sentSubjects: Map<string, unknown>
 }
 
 function snapshotValues(round: Round): void {
   for (const key of round.keys) round.sentValues.set(key, doc[key])
   const progress = asMap(doc.progress)
   for (const entry of round.progressKeys) round.sentProgress.set(entry, progress[entry])
+  const favs = favoritesById(doc.favorites)
+  for (const id of round.favIds) round.sentFavs.set(id, favs.get(id))
+  const srcFavs = sourceFavoritesById(doc[SOURCE_FAV_KEY])
+  for (const k of round.sourceFavKeys) round.sentSourceFavs.set(k, srcFavs.get(k))
+  const subjects = asMap(doc.subjectProgress)
+  for (const k of round.subjectKeys) round.sentSubjects.set(k, subjects[k])
 }
 
 /** 发出去之后又被改过的顶层键 */
@@ -185,6 +208,18 @@ function changedKeys(round: Round): string[] {
     if (key === 'progress') {
       const progress = asMap(doc.progress)
       return round.progressKeys.some((entry) => progress[entry] !== round.sentProgress.get(entry))
+    }
+    if (key === 'favorites') {
+      const now = favoritesById(doc.favorites)
+      return round.favIds.some((id) => now.get(id) !== round.sentFavs.get(id))
+    }
+    if (key === SOURCE_FAV_KEY) {
+      const now = sourceFavoritesById(doc[SOURCE_FAV_KEY])
+      return round.sourceFavKeys.some((k) => now.get(k) !== round.sentSourceFavs.get(k))
+    }
+    if (key === 'subjectProgress') {
+      const now = asMap(doc.subjectProgress)
+      return round.subjectKeys.some((k) => now[k] !== round.sentSubjects.get(k))
     }
     return doc[key] !== round.sentValues.get(key)
   })
@@ -203,8 +238,14 @@ async function pushOnce(): Promise<void> {
     const round: Round = {
       keys: [...pendingKeys],
       progressKeys: [...pendingProgressKeys],
+      favIds: [...pendingFavIds],
+      sourceFavKeys: [...pendingSourceFavKeys],
+      subjectKeys: [...pendingSubjectKeys],
       sentValues: new Map(),
       sentProgress: new Map(),
+      sentFavs: new Map(),
+      sentSourceFavs: new Map(),
+      sentSubjects: new Map(),
     }
     snapshotValues(round)
     setSync({  status: 'saving', kind: null, error: ''  })
@@ -223,6 +264,18 @@ async function pushOnce(): Promise<void> {
       round.progressKeys.forEach((k) => {
         if (asMap(doc.progress)[k] === round.sentProgress.get(k)) pendingProgressKeys.delete(k)
       })
+      const favsNow = favoritesById(doc.favorites)
+      round.favIds.forEach((id) => {
+        if (favsNow.get(id) === round.sentFavs.get(id)) pendingFavIds.delete(id)
+      })
+      const srcFavsNow = sourceFavoritesById(doc[SOURCE_FAV_KEY])
+      round.sourceFavKeys.forEach((k) => {
+        if (srcFavsNow.get(k) === round.sentSourceFavs.get(k)) pendingSourceFavKeys.delete(k)
+      })
+      const subjectsNow = asMap(doc.subjectProgress)
+      round.subjectKeys.forEach((k) => {
+        if (subjectsNow[k] === round.sentSubjects.get(k)) pendingSubjectKeys.delete(k)
+      })
       // 确实有改动没被这份请求体带走 → 自己排下一轮，而不是等用户再点一次。
       // 状态必须跟着排队这件事一起说「待保存」，不能先报 ready。
       // 这条的**实际窗口有多宽**记在这里，免得把它夸大成用户级故障：
@@ -240,7 +293,7 @@ async function pushOnce(): Promise<void> {
       }
     } catch (e) {
       if (isApiError(e, 409, ERR_DATA_STALE)) {
-        const merged = await mergeWithServer(round.keys, round.progressKeys)
+        const merged = await mergeWithServer(round)
         if (merged) continue // 换好基准，重试这一次写
         setSync({  status: 'error', kind: 'save', error: '本机改动与服务端冲突且无法合并，请刷新页面重试'  })
         return
@@ -269,11 +322,16 @@ async function pushOnce(): Promise<void> {
 }
 
 /**
- * 版本冲突：重读服务端文档，只把「本标签页改过的键」贴上去。
- * 这样另一台设备/另一个标签页的改动不会被整份覆盖，
- * 而我们自己的改动也不会丢。progress 再细一层到条目，避免互相吃掉别的剧集。
+ * 版本冲突：重读服务端文档，只把「本标签页改过的东西」贴上去。
+ *
+ * 粒度分两档：
+ *  - progress / subjectProgress / favorites / favoritesSource **按条目**合并 ——
+ *    这几个都是「多条目容器」，两个标签页各动一条时，整键覆盖会让另一方的那条复活/消失
+ *    （实测：两个标签页各删一条收藏，最终只保住一份；各播一集，另一集进度丢失）。
+ *  - 其余键（recent、searchHistory 等）仍按整键：它们只是最近记录，上限小、可自愈，
+ *    两个标签页同时各加一条时可能只留下一条，这是已知取舍。
  */
-async function mergeWithServer(keys: string[], progressKeys: string[]): Promise<boolean> {
+async function mergeWithServer(round: Round): Promise<boolean> {
   let fresh
   try {
     fresh = await api.loadDataWithEtag()
@@ -281,6 +339,16 @@ async function mergeWithServer(keys: string[], progressKeys: string[]): Promise<
     setSync({ status: 'error', kind: 'load', error: `冲突后重读失败：${errMsg(e)}` })
     return false
   }
+  // 合并要按**当前**的待写集合，而不是本轮开始时的快照：
+  // PUT 在飞的这段时间里用户还能继续点（收藏、进度），那些改动记在 pending* 里，
+  // 但不在 round 里。用快照合并会把它们从内存文档里抹掉（setDoc(merged)），
+  // 下一轮再把这个「被抹掉」的文档发上去 —— 改动就这么静默丢了
+  // （实测：删 A → PUT 在飞时删 B → 第一轮 409 → 合并只应用了 A → B 复活）。
+  const keys = [...new Set([...round.keys, ...pendingKeys])]
+  const progressKeys = [...new Set([...round.progressKeys, ...pendingProgressKeys])]
+  const favIds = [...new Set([...round.favIds, ...pendingFavIds])]
+  const sourceFavKeys = [...new Set([...round.sourceFavKeys, ...pendingSourceFavKeys])]
+  const subjectKeys = [...new Set([...round.subjectKeys, ...pendingSubjectKeys])]
   const merged: UserData = { ...fresh.doc }
   for (const key of keys) {
     if (key === 'progress') {
@@ -292,6 +360,25 @@ async function mergeWithServer(keys: string[], progressKeys: string[]): Promise<
         else delete out[entry]
       }
       merged.progress = out
+    } else if (key === 'favorites') {
+      // 按条目合并：只应用本标签页动过的收藏，别人的新增/删除原样保留
+      merged.favorites = mergeTouchedItems(
+        merged.favorites, favoritesById(doc.favorites), favIds, idOfFavorite,
+      )
+    } else if (key === SOURCE_FAV_KEY) {
+      merged[SOURCE_FAV_KEY] = mergeTouchedItems(
+        merged[SOURCE_FAV_KEY], sourceFavoritesById(doc[SOURCE_FAV_KEY]), sourceFavKeys, idOfSourceFavorite,
+      )
+    } else if (key === 'subjectProgress') {
+      // 与 progress 同构：只把本标签页动过的条目贴上去
+      const theirs = asMap(merged.subjectProgress)
+      const mine = asMap(doc.subjectProgress)
+      const out: Record<string, unknown> = { ...theirs }
+      for (const k of subjectKeys) {
+        if (k in mine) out[k] = mine[k]
+        else delete out[k]
+      }
+      merged.subjectProgress = out
     } else if (Object.prototype.hasOwnProperty.call(doc, key)) {
       merged[key] = doc[key]
     } else {
@@ -324,6 +411,25 @@ export function writeJson(key: string, value: unknown): void {
   scheduleFlush(key)
 }
 
+/** 写收藏，并记下这次动过哪几个条目（冲突合并只应用这几条） */
+function writeFavorites(next: FavoriteSubject[], touched: readonly number[]): void {
+  doc.favorites = next
+  touched.forEach((id) => pendingFavIds.add(id))
+  scheduleFlush('favorites')
+}
+
+function writeSourceFavorites(next: SourceFavorite[], touched: readonly string[]): void {
+  doc[SOURCE_FAV_KEY] = next
+  touched.forEach((k) => pendingSourceFavKeys.add(k))
+  scheduleFlush(SOURCE_FAV_KEY)
+}
+
+function writeSubjectProgress(next: Record<string, unknown>, touched: readonly string[]): void {
+  doc.subjectProgress = next
+  touched.forEach((k) => pendingSubjectKeys.add(k))
+  scheduleFlush('subjectProgress')
+}
+
 function removeKey(key: string): void {
   if (!(key in doc)) return
   delete doc[key]
@@ -338,6 +444,78 @@ function progressMap(): Record<string, unknown> {
 
 function asMap(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+}
+
+// ---------- 收藏的条目级索引（冲突合并用）----------
+
+function asItemList(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter((v): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v))
+    : []
+}
+
+function idOfFavorite(item: unknown): number | null {
+  const id = asMap(item).id
+  return typeof id === 'number' ? id : null
+}
+
+function favoritesById(list: unknown): Map<number, unknown> {
+  const out = new Map<number, unknown>()
+  for (const item of asItemList(list)) {
+    const id = idOfFavorite(item)
+    if (id !== null) out.set(id, item)
+  }
+  return out
+}
+
+function idOfSourceFavorite(item: unknown): string | null {
+  const m = asMap(item)
+  return typeof m.source === 'string' && typeof m.url === 'string' ? `${m.source}|${m.url}` : null
+}
+
+function sourceFavoritesById(list: unknown): Map<string, unknown> {
+  const out = new Map<string, unknown>()
+  for (const item of asItemList(list)) {
+    const id = idOfSourceFavorite(item)
+    if (id !== null) out.set(id, item)
+  }
+  return out
+}
+
+/**
+ * 把「本标签页动过的条目」应用到服务端刚读回来的列表上：
+ * 本地有的就覆盖/补进去，本地已经删掉的就从服务端列表里删掉。
+ * 没动过的条目一个都不碰 —— 那正是另一个标签页/另一台设备的改动。
+ */
+function mergeTouchedItems(
+  serverList: unknown,
+  mine: Map<string | number, unknown>,
+  touched: (string | number)[],
+  idOf: (item: unknown) => string | number | null,
+): unknown[] {
+  const out = Array.isArray(serverList) ? [...serverList] : []
+  for (const id of touched) {
+    const local = mine.get(id)
+    if (local !== undefined) {
+      // 本地还有这条：就地覆盖（重复的旧副本一并清掉 —— 手改过的文档里可能有两份同 id）
+      let placed = false
+      for (let i = out.length - 1; i >= 0; i--) {
+        if (idOf(out[i]) !== id) continue
+        if (placed) out.splice(i, 1)
+        else {
+          out[i] = local
+          placed = true
+        }
+      }
+      if (!placed) out.unshift(local)
+    } else {
+      // 本地已经删了：服务端列表里的同 id 条目全部删掉
+      for (let i = out.length - 1; i >= 0; i--) {
+        if (idOf(out[i]) === id) out.splice(i, 1)
+      }
+    }
+  }
+  return out
 }
 
 function writeProgressMap(map: Record<string, unknown>, entryKey: string): void {
@@ -487,10 +665,10 @@ export function setSubjectProgress(subjectId: number, ep: number): void {
     entries.slice(0, MAX_PROGRESS_ENTRIES).forEach(([k, v]) => {
       kept[k] = v
     })
-    writeJson('subjectProgress', kept)
+    writeSubjectProgress(kept, [key])
     return
   }
-  writeJson('subjectProgress', next)
+  writeSubjectProgress(next, [key])
 }
 
 // ---------- 播放方式（设备偏好，不进服务端文档）----------
@@ -639,7 +817,7 @@ export function toggleFavorite(
   const next = exists
     ? list.filter((f) => f.id !== subject.id)
     : [{ ...subject, status: subject.status ?? 'wish' }, ...list]
-  writeJson('favorites', next)
+  writeFavorites(next, [subject.id])
   return !exists
 }
 
@@ -648,9 +826,9 @@ export function setFavoriteStatus(id: number, status: FavStatus): boolean {
   const list = listFavorites()
   const target = list.find((f) => f.id === id)
   if (!target) return false
-  writeJson(
-    'favorites',
+  writeFavorites(
     list.map((f) => (f.id === id ? { ...f, status } : f)),
+    [id],
   )
   return true
 }
@@ -701,7 +879,7 @@ export function toggleSourceFavorite(item: SourceFavorite): boolean {
   const list = listSourceFavorites()
   const exists = list.some((f) => sourceFavKeyOf(f.source, f.url) === key)
   const next = exists ? list.filter((f) => sourceFavKeyOf(f.source, f.url) !== key) : [item, ...list]
-  writeJson(SOURCE_FAV_KEY, next)
+  writeSourceFavorites(next, [key])
   return !exists
 }
 
@@ -778,6 +956,9 @@ export function markUserDataStale(): void {
   }
   pendingKeys.clear()
   pendingProgressKeys.clear()
+  pendingFavIds.clear()
+  pendingSourceFavKeys.clear()
+  pendingSubjectKeys.clear()
   loaded = false
   setDoc({})
   baseEtag = ''
@@ -860,7 +1041,7 @@ export function importUserData(text: string): ImportSummary {
       added.push(fav)
     }
     if (added.length > 0) {
-      writeJson('favorites', [...added, ...local])
+      writeFavorites([...added, ...local], added.map((f) => f.id))
       summary.favorites = added.length
     }
   }
@@ -889,7 +1070,7 @@ export function importUserData(text: string): ImportSummary {
       added.push(fav)
     }
     if (added.length > 0) {
-      writeJson(SOURCE_FAV_KEY, [...added, ...local])
+      writeSourceFavorites([...added, ...local], added.map((f) => sourceFavKeyOf(f.source, f.url)))
       summary.sourceFavorites = added.length
     }
   }
