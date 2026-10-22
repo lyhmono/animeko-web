@@ -40,6 +40,14 @@ interface Props {
  * 单击动作必须等这么久才执行：否则双击的第一下就会先把控制条切掉、第二下再快进 ——
  * 用户看到的是一次双击同时干了两件事（实测复现过）。双击窗口内的第二次点击会取消它。
  */
+/** Safari / iOS 的 webkit 全屏接口（标准 lib.dom 里没有） */
+type WebkitFullscreenDoc = {
+  webkitFullscreenElement?: Element | null
+  webkitExitFullscreen?: () => Promise<void> | void
+}
+type WebkitFullscreenTarget = HTMLElement & { webkitRequestFullscreen?: () => Promise<void> | void }
+type WebkitFullscreenVideo = HTMLVideoElement & { webkitEnterFullscreen?: () => void }
+
 const DOUBLE_TAP_MS = 300
 
 function formatTime(seconds: number): string {
@@ -165,6 +173,8 @@ export default function VideoPlayer({
 
   // 加载源
   const startAtAppliedRef = useRef(false)
+  /** 换源（直连失败回退、410 重解析）时要续上的播放位置；由上一份源的清理逻辑写入 */
+  const resumeAtRef = useRef(0)
   useEffect(() => {
     const video = videoRef.current
     if (!video || !activeSrc) return
@@ -212,6 +222,10 @@ export default function VideoPlayer({
     }
 
     return () => {
+      // 换源前记住当前位置：直接回退/410 重解析换的是同一集的另一条地址，
+      // 不能再用最初的续播点重新定位（那会把看到一半的视频倒回起点）
+      const at = video.currentTime
+      if (Number.isFinite(at) && at > 0) resumeAtRef.current = at
       hls?.destroy()
       video.removeAttribute('src')
       video.load()
@@ -221,12 +235,16 @@ export default function VideoPlayer({
   // 断点续播：加载后定位一次
   useEffect(() => {
     const video = videoRef.current
-    if (!video || !startAt || startAtAppliedRef.current) return
+    if (!video || startAtAppliedRef.current) return
+    if (!startAt && resumeAtRef.current <= 0) return
     const apply = () => {
       if (startAtAppliedRef.current) return
+      // 同一次播放中途换源时优先续上换源前的位置；首次加载才用 URL 里的续播点
+      const target = resumeAtRef.current > 0 ? resumeAtRef.current : (startAt ?? 0)
       try {
-        video.currentTime = startAt
+        video.currentTime = target
         startAtAppliedRef.current = true
+        resumeAtRef.current = 0
       } catch {
         // 元数据未就绪时忽略，等待下一次 loadedmetadata
       }
@@ -235,6 +253,12 @@ export default function VideoPlayer({
     video.addEventListener('loadedmetadata', apply)
     return () => video.removeEventListener('loadedmetadata', apply)
   }, [startAt, activeSrc])
+
+  // 只有同一集的备用地址切换才续上当前位置；主地址换了（换集）必须清掉，
+  // 否则会把上一集的秒数用到新一集上。
+  useEffect(() => {
+    resumeAtRef.current = 0
+  }, [src])
 
   // ---------- 影院化控制层 ----------
 
@@ -335,7 +359,16 @@ export default function VideoPlayer({
       setError(msg)
       onErrorRef.current?.(msg)
     }
-    const onFs = () => setFullscreen(document.fullscreenElement != null)
+    // 标准全屏 + Safari 的 webkit 变体都要认，否则按钮状态会停在旧值
+    const onFs = () =>
+      setFullscreen(
+        document.fullscreenElement != null ||
+          (document as Document & WebkitFullscreenDoc).webkitFullscreenElement != null,
+      )
+    // iOS 原生播放器全屏（webkitEnterFullscreen）不触发 fullscreenchange，
+    // 只在这两个事件里通知
+    const onNativeFsBegin = () => setFullscreen(true)
+    const onNativeFsEnd = () => setFullscreen(false)
     video.addEventListener('timeupdate', onTime)
     video.addEventListener('loadedmetadata', onMeta)
     video.addEventListener('durationchange', onMeta)
@@ -347,6 +380,9 @@ export default function VideoPlayer({
     video.addEventListener('waiting', onWaiting)
     video.addEventListener('playing', onPlaying)
     document.addEventListener('fullscreenchange', onFs)
+    document.addEventListener('webkitfullscreenchange', onFs)
+    video.addEventListener('webkitbeginfullscreen', onNativeFsBegin)
+    video.addEventListener('webkitendfullscreen', onNativeFsEnd)
     return () => {
       video.removeEventListener('timeupdate', onTime)
       video.removeEventListener('loadedmetadata', onMeta)
@@ -359,6 +395,9 @@ export default function VideoPlayer({
       video.removeEventListener('waiting', onWaiting)
       video.removeEventListener('playing', onPlaying)
       document.removeEventListener('fullscreenchange', onFs)
+      document.removeEventListener('webkitfullscreenchange', onFs)
+      video.removeEventListener('webkitbeginfullscreen', onNativeFsBegin)
+      video.removeEventListener('webkitendfullscreen', onNativeFsEnd)
     }
   }, [])
 
@@ -417,8 +456,30 @@ export default function VideoPlayer({
     // 只全屏本组件会把舞台里的占位/提示排除在画面外。
     const target = fullscreenTargetRef.current?.current ?? containerRef.current
     if (!target) return
-    if (document.fullscreenElement) void document.exitFullscreen()
-    else void target.requestFullscreen().catch(() => {})
+    const doc = document as Document & WebkitFullscreenDoc
+    const video = videoRef.current as WebkitFullscreenVideo | null
+    // iPhone Safari 没有 Element.requestFullscreen：视频只能进原生播放器全屏
+    // （video.webkitEnterFullscreen）。原先这里直接调 target.requestFullscreen()，
+    // 在那种环境里是一句 TypeError —— 双击中间、按钮、F 键三条路都静默失效。
+    const nativeVideoFullscreen = () => video?.webkitEnterFullscreen?.()
+    if (document.fullscreenElement || doc.webkitFullscreenElement) {
+      if (typeof document.exitFullscreen === 'function') {
+        void document.exitFullscreen().catch(() => {})
+      } else if (typeof doc.webkitExitFullscreen === 'function') {
+        void Promise.resolve(doc.webkitExitFullscreen()).catch(() => {})
+      }
+      return
+    }
+    if (typeof target.requestFullscreen === 'function') {
+      void target.requestFullscreen().catch(nativeVideoFullscreen)
+      return
+    }
+    const anyTarget = target as WebkitFullscreenTarget
+    if (typeof anyTarget.webkitRequestFullscreen === 'function') {
+      void Promise.resolve(anyTarget.webkitRequestFullscreen()).catch(nativeVideoFullscreen)
+      return
+    }
+    nativeVideoFullscreen()
   }
 
   // ---- 键盘快捷键（绑一次，回调经 ref 读取，避免重绑监听） ----
@@ -545,6 +606,7 @@ export default function VideoPlayer({
       const wasMoved = g.moved
       g.active = false
       if (wasMoved) {
+        g.lastTap = 0
         // 拖动收尾仍要同步一次：否则进度条会弹回拖之前的位置
         const video = videoRef.current
         if (video) setCurrent(video.currentTime)
@@ -582,45 +644,32 @@ export default function VideoPlayer({
     }
   }
 
-  /** 双击左右三分区：复用键盘那套 seekBy，只额外给出与滑动手势一致的提示条 */
-  const seekStep = (delta: number) => {
-    seekBy(delta)
-    const video = videoRef.current
-    const total = video?.duration || 0
-    showToast({
-      kind: 'seek',
-      text: `${delta > 0 ? '+' : ''}${delta} 秒`,
-      level: total > 0 && video ? video.currentTime / total : 0,
-    })
-  }
-
-  const onPointerUp = (e: ReactPointerEvent<HTMLVideoElement>) => {
+  const onPointerUp = (_e: ReactPointerEvent<HTMLVideoElement>) => {
     const g = gestureRef.current
     if (!g.active) return
     g.active = false
     if (g.moved) {
+      // 一次拖动之后不能把上一次单击还留着：否则「点一下 → 拖一下 → 马上再点」
+      // 的第三下会被当成双击，直接进全屏
+      g.lastTap = 0
       // 拖动收尾：把最终位置同步进 React 状态，进度条不会弹回去
       const video = videoRef.current
       if (video) setCurrent(video.currentTime)
       revealControls()
       return
     }
-    // 单击 vs 双击：DOUBLE_TAP_MS 内的第二次点击算双击。
-    // 三分区（与主流播放器一致）：左 1/3 快退 10 秒、右 1/3 快进 10 秒、中间 全屏。
-    // 单击动作（显隐控制条）**延后**到双击窗口结束才执行，双击时取消 ——
-    // 原先第一下立刻切控制条、第二下再快进，用户看到的是「一次双击干了两件事」。
+    // 单击 vs 双击：DOUBLE_TAP_MS 内的第二次点击算双击，动作是**全屏/退出全屏**。
+    // 双击不再承担快进/快退（按用户要求删掉了）：画面任意位置双击都是全屏；
+    // 单击动作（显隐控制条）延后到双击窗口结束才执行，双击时取消 ——
+    // 否则一次双击会先切一次控制条再进全屏。
     const now = Date.now()
-    const rect = e.currentTarget.getBoundingClientRect()
-    const rel = rect.width > 0 ? (e.clientX - rect.left) / rect.width : 0.5
     if (now - g.lastTap < DOUBLE_TAP_MS) {
       g.lastTap = 0
       if (tapTimerRef.current) {
         clearTimeout(tapTimerRef.current)
         tapTimerRef.current = undefined
       }
-      if (rel < 1 / 3) seekStep(-10)
-      else if (rel > 2 / 3) seekStep(10)
-      else toggleFullscreen()
+      toggleFullscreen()
       return
     }
     g.lastTap = now
@@ -648,7 +697,9 @@ export default function VideoPlayer({
     <div
       ref={containerRef}
       className={`video-shell${theater ? ' theater' : ''}${controlsVisible ? '' : ' hide-controls'}`}
-      onPointerMove={() => controlsVisible && revealControls()}
+      // 隐藏之后也必须能被鼠标移动唤出：之前写成 `controlsVisible && revealControls()`，
+      // 一旦自动收起，移动鼠标就再也不会显示控制条，只能先点一下画面
+      onPointerMove={() => revealControls()}
     >
       <video
         ref={videoRef}

@@ -468,7 +468,7 @@ export default function PlayerPage() {
               <span className="keys">
                 <span className="kbd">双击</span>
               </span>
-              画面左 / 右侧快退 / 快进 10 秒 · 中间全屏
+              画面任意位置：全屏 / 退出全屏
             </div>
             <div className="row">
               <span className="keys">

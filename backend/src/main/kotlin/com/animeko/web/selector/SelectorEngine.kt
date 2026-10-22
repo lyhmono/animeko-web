@@ -18,6 +18,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
+import java.util.regex.Pattern
 
 // 以下模型会经 Ktor call.respond(...) 做 JSON 序列化，必须标注 @Serializable，
 // 否则运行时报 "Serializer for class ... is not found"（成功路径 500）
@@ -134,9 +135,9 @@ class SelectorEngine(
             put("Referer", referer)
             if (cookies.isNotBlank()) put("Cookie", cookies)
         }
-        val videoRegex = runCatching { Regex(mv.matchVideoUrl) }.getOrNull()
+        val videoRegex = SafeRegex.compile(mv.matchVideoUrl)
             ?: throw SelectorException("matchVideoUrl 正则无效")
-        val nestedRegex = runCatching { Regex(mv.matchNestedUrl) }.getOrNull()
+        val nestedRegex = SafeRegex.compile(mv.matchNestedUrl)
 
         val html = fetchPage(cfg, target, headers, "播放页")
         // 源自己的 matchVideoUrl 始终优先；兜底要等所有页面都试完才采用，
@@ -156,7 +157,7 @@ class SelectorEngine(
             // 与 videoCandidates 同一条规则：长度先判，正则后判，顺序不能颠倒
             // （`&&` 是短路的，反过来就等于没挡）。
             val nested = candidates.filter {
-                it.length in 11..MAX_CANDIDATE_URL_LEN && it.startsWith("http") && nestedRegex.containsMatchIn(it)
+                it.length in 11..MAX_CANDIDATE_URL_LEN && it.startsWith("http") && SafeRegex.contains(nestedRegex, it)
             }.take(MAX_NESTED_PAGES)
             val deadline = System.currentTimeMillis() + NESTED_BUDGET_MS
             for (n in nested) {
@@ -369,7 +370,7 @@ class SelectorEngine(
 
     private fun selectNoChannel(doc: Document, cfg: SelectorSearchConfig, base: String): EpisodesResult {
         val c = cfg.selectorChannelFormatNoChannel
-        val regex = runCatching { Regex(c.matchEpisodeSortFromName) }.getOrNull()
+        val regex = SafeRegex.compile(c.matchEpisodeSortFromName)
             ?: return EpisodesResult(emptyList(), emptyList(), emptyList())
         val elements = queryAll(doc, c.selectEpisodes) ?: return EpisodesResult(emptyList(), emptyList(), emptyList())
         val links = if (c.selectEpisodeLinks.isNotBlank()) {
@@ -398,14 +399,15 @@ class SelectorEngine(
         val channelRegex = if (c.matchChannelName.isBlank()) {
             null
         } else {
-            runCatching { Regex(c.matchChannelName) }.getOrNull()
+            SafeRegex.compile(c.matchChannelName)
         }
-        val epRegex = runCatching { Regex(c.matchEpisodeSortFromName) }.getOrNull()
+        val epRegex = SafeRegex.compile(c.matchEpisodeSortFromName)
             ?: return EpisodesResult(emptyList(), emptyList(), emptyList())
         val channelNames = queryAll(doc, c.selectChannelNames)
             ?.mapNotNull { e ->
                 val text = e.text().trim().ifBlank { return@mapNotNull null }
-                if (channelRegex == null) text else channelRegex.findGroupOrNull(text, "ch")
+                if (channelRegex == null || text.length > MAX_REGEX_TEXT_LEN) text
+                else SafeRegex.groupOrText(channelRegex, text, "ch", text)
             }
             ?: emptyList()
         val lists = queryAll(doc, c.selectEpisodeLists)
@@ -436,8 +438,8 @@ class SelectorEngine(
 
     // ---------- 视频地址提取 ----------
 
-    private fun findVideoUrl(html: String, pageUrl: String, videoRegex: Regex): String? =
-        videoCandidates(html, pageUrl).firstOrNull { videoRegex.containsMatchIn(it) }
+    private fun findVideoUrl(html: String, pageUrl: String, videoRegex: Pattern): String? =
+        videoCandidates(html, pageUrl).firstOrNull { SafeRegex.contains(videoRegex, it) }
 
     /**
      * 通用兜底：源配置里的 matchVideoUrl 是一份 **CDN 域名白名单**，而源站换 CDN 比
@@ -605,13 +607,15 @@ class SelectorEngine(
         return absUrl(base, link)
     }
 
-    private fun sortText(name: String, regex: Regex): String {
-        val m = regex.find(name) ?: return name
-        val group = runCatching { m.groups["ep"]?.value }.getOrNull()
+    private fun sortText(name: String, regex: Pattern): String {
+        // 历史长度上限保留（正常剧集名远短于此），真正的回溯保护在 SafeRegex：
+        // `(a+)+$` 即使只有 100 个字符也能跑 2^100 步，单靠长度上限救不了。
+        if (name.length > MAX_REGEX_TEXT_LEN) return name
+        val group = SafeRegex.group(regex, name, "ep")
         return group?.trim()?.takeIf { it.isNotBlank() } ?: name
     }
 
-    private fun sortNum(name: String, regex: Regex): Int? {
+    private fun sortNum(name: String, regex: Pattern): Int? {
         val raw = sortText(name, regex)
         raw.toIntOrNull()?.let { return it }
         if (isPossiblyMovie(name)) return 1
@@ -625,6 +629,12 @@ class SelectorEngine(
         /** 单个候选 URL 的长度上限，见 candidateUrls */
         private const val MAX_CANDIDATE_URL_LEN = 4096
 
+        /**
+         * 第三方正则（matchEpisodeSortFromName / matchChannelName）能看到的文本上限。
+         * 剧集名/线路名远短于此；超过就按「没匹配到」处理，不让回溯型正则卡住采集。
+         */
+        private const val MAX_REGEX_TEXT_LEN = 512
+
         /** 第三方配置里 requestInterval 的可用上限，见 effectiveInterval */
         const val MAX_REQUEST_INTERVAL_MS: Long = 15_000
 
@@ -637,7 +647,8 @@ class SelectorEngine(
          */
         internal fun urlForLog(raw: String): String = runCatching {
             val u = URI(raw)
-            val authority = u.rawAuthority?.let { "://$it" } ?: ""
+            // userinfo 也可能是凭据（订阅地址常写成 https://user:token@host/…），一并去掉
+            val authority = u.rawAuthority?.substringAfterLast('@')?.let { "://$it" } ?: ""
             "${u.scheme}$authority${u.rawPath.orEmpty()}"
         }.getOrElse { raw.substringBefore('?').take(120) }
         private const val MAX_PAGE_REDIRECTS = 5
@@ -712,10 +723,5 @@ class SelectorEngine(
             }
         }
 
-        private fun Regex.findGroupOrNull(text: String, group: String): String? {
-            val m = find(text) ?: return null
-            val value = runCatching { m.groups[group]?.value }.getOrNull()
-            return value?.trim()?.takeIf { it.isNotBlank() } ?: text
-        }
     }
 }

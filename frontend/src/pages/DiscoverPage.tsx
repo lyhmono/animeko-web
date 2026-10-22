@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import Poster from '../components/Poster'
 import { api, errMsg } from '../api'
-import { favoriteIdSet } from '../lib/storage'
+import { favoriteIdSet, onDocChange } from '../lib/storage'
 import { IconHeartFilled, IconStar } from '../lib/icons'
 import type { BgmSubject } from '../types'
 
@@ -46,10 +46,9 @@ export default function DiscoverPage() {
     return () => ctrl.abort()
   }, [load])
 
-  // 从条目页收藏后返回，徽章要跟上
-  useEffect(() => {
-    setFavIds(favoriteIdSet())
-  }, [items])
+  // 收藏变了要跟上：从条目页返回会重挂并重建初始值；整份文档被换掉
+  // （启动读取失败后点「重新读取」）则靠这个订阅。
+  useEffect(() => onDocChange(() => setFavIds(favoriteIdSet())), [])
 
   const coverOf = (s: BgmSubject) =>
     s.images?.large ?? s.images?.common ?? s.images?.medium ?? s.images?.small ?? ''

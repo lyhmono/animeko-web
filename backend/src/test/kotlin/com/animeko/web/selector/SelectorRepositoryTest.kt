@@ -91,10 +91,28 @@ class SelectorRepositoryTest {
         }
     }
 
+    /**
+     * 写入时先落 `<名字>.json.tmp` 再 rename，所以名字上限必须把 `.tmp` 的 4 字节算进去。
+     * 之前只按正式文件名判：82 个汉字能存、83 个汉字通过校验却在 open 临时文件时
+     * ENAMETOOLONG，用户看到的是一句「写入失败」，看不出是名字太长。
+     */
+    @Test
+    fun `filename limit accounts for the temporary suffix`() {
+        val r = repo()
+        val fits = "汉".repeat(82)
+        r.save(args(fits))
+        assertEquals(1, r.list().size)
+
+        val tooLong = "汉".repeat(83)
+        val e = assertFailsWith<IllegalArgumentException> { r.save(args(tooLong)) }
+        assertTrue(e.message.orEmpty().contains("临时文件名"), e.message.orEmpty())
+        assertTrue(e.message.orEmpty().contains("字节"), e.message.orEmpty())
+        assertEquals(1, r.list().size, "被拒的名字不该留下任何文件")
+    }
+
     /** 原子写不该在工作目录里留下临时文件；残留会让下一次导入看到一堆「没有的源」 */
     @Test
-    fun `saving leaves no temporary files behind`() {
-        val dir = Files.createTempDirectory("animeko-repo-tmp")
+    fun `saving leaves no temporary files behind`() {        val dir = Files.createTempDirectory("animeko-repo-tmp")
         val r = SelectorRepository(dir)
         repeat(5) { r.save(args("源 $it")) }
         r.setEnabled("源 0", false)

@@ -2,10 +2,10 @@ package com.animeko.web.data
 
 import com.animeko.web.appLog
 import com.animeko.web.ioReason
+import com.animeko.web.writeFully
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import java.io.IOException
-import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
@@ -124,7 +124,7 @@ class UserDataStore(
                     StandardOpenOption.WRITE,
                     StandardOpenOption.TRUNCATE_EXISTING,
                 ).use { ch ->
-                    ch.write(ByteBuffer.wrap(bytes))
+                    ch.writeFully(bytes)
                     ch.force(true)
                 }
                 // 备份必须是「复制」而不是「挪走」：原来是先 move 走旧文件再 rename 新的，

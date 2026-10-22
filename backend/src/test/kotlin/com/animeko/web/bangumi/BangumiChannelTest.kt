@@ -61,6 +61,16 @@ class BangumiChannelTest {
     private fun store(): BgmChannelStore = BgmChannelStore(Files.createTempDirectory("bgmchan").resolve("c.json"))
 
     @Test
+    fun `an oversized saved custom channel falls back to auto`() {
+        val store = store()
+        store.save(BgmChannelConfig(BgmChannel.CUSTOM, (1..20).map { "https://relay$it.test" }))
+        val client = BangumiClient(StubFetcher(emptyMap()), channelStore = store)
+        // 手工改出来的超长列表在启动时就退回 AUTO，而不是留着让每次请求逐条 DNS
+        assertEquals(BgmChannel.AUTO, client.channelState().channel)
+        assertEquals(BgmChannel.AUTO, store.load().channel, "退回结果要落盘，否则下次启动还会读到老配置")
+    }
+
+    @Test
     fun `official channel uses only official base`() {
         val client = BangumiClient(StubFetcher(emptyMap()), channelStore = store())
         val saved = client.setChannel(BgmChannelConfig(BgmChannel.OFFICIAL))

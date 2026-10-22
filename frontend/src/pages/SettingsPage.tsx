@@ -233,7 +233,14 @@ export default function SettingsPage() {
             style={{
               marginTop: 10,
               fontSize: 12,
-              color: backupMsg.startsWith('导入失败') ? 'var(--danger)' : 'var(--success)',
+              // 导出失败以前也落在成功色里（只匹配了「导入失败」）；而导入成功但
+              // 回写服务器失败时，尾注写着失败却仍是绿色，同样会误导
+              color:
+                backupMsg.startsWith('导入失败') ||
+                backupMsg.startsWith('导出失败') ||
+                backupMsg.includes('保存到服务器失败')
+                  ? 'var(--danger)'
+                  : 'var(--success)',
             }}
           >
             {backupMsg}

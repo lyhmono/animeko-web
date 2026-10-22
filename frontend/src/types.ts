@@ -19,6 +19,8 @@ export interface BgmEpisode {
   name: string
   name_cn: string
   sort?: number | null
+  /** 0=本篇，1=SP，2=OP，3=ED，4=预告，5=MAD，6=其他（Bangumi 的 type） */
+  type?: number
   duration?: string | null
   airdate?: string | null
 }

@@ -117,6 +117,8 @@ data class BgmEpisode(
     val sort: Double? = null,
     val duration: String? = null,
     val airdate: String? = null,
+    /** 0=本篇 1=SP 2=OP 3=ED 4=预告 5=MAD 6=其他；前端据此区分非正片剧集 */
+    val type: Int = 0,
 )
 
 /**
@@ -150,9 +152,16 @@ class BangumiClient(
         // 也不能让服务端带着一个内网地址跑起来。
         val loaded = channel
         if (loaded.channel == BgmChannel.CUSTOM) {
-            val bad = loaded.customUrls.firstOrNull { !isAllowedChannelTarget(it) }
-            if (bad != null) {
-                appLog.warn("Bangumi 通道配置里的地址不被允许，已退回自动：{}", bad)
+            // 数量超限时**不要**先跑 firstOrNull：那会对几万条地址逐条做 DNS，
+            // 正好是这条检查要避免的启动卡死
+            val tooMany = loaded.customUrls.size > MAX_CUSTOM_URLS
+            val bad = if (tooMany) null else loaded.customUrls.firstOrNull { !isAllowedChannelTarget(it) }
+            if (tooMany || bad != null) {
+                appLog.warn(
+                    "Bangumi 通道配置里的地址不被允许（数量 {}，首个非法 {}），已退回自动",
+                    loaded.customUrls.size,
+                    bad ?: "无",
+                )
                 channel = BgmChannelConfig()
                 runCatching { channelStore?.save(channel) }
             }
@@ -206,15 +215,22 @@ class BangumiClient(
             // 校验口径与代理/抓取一致：requireAllowed 会真做 DNS 解析并拒绝内网/保留段。
             // 只约束 CUSTOM：AUTO 走环境变量（要能改容器才改得动，是站长本人的权限），
             // OFFICIAL/MIRROR 是写死的公网常量。
-            .let { list -> if (!enforce) list else list.map { url ->
-                runCatching { UrlGuard.requireAllowed("$url/v0/calendar", allowPrivateTargets) }
-                    .getOrElse {
-                        // 不回显 Blocked 原文（里面是「主机名 -> 内网 IP」的映射），
-                        // 细节只进日志；调用方拿到的是 403 + 一句通用原因
-                        appLog.warn("Bangumi 自定义通道地址不被允许: {} ({})", url, it.message)
-                        throw UrlGuard.Blocked("自定义通道地址不被允许")
-                    }
-                url
+            .let { list -> if (!enforce) list else {
+                // 探测接口的 target 来自请求体，没有经过 setChannel：上限必须在这里也挡一次，
+                // 否则一份带几万条地址的请求会让服务端逐条做阻塞 DNS（鉴权默认关闭时人人可发）
+                require(list.size <= MAX_CUSTOM_URLS) {
+                    "自定义通道最多支持 $MAX_CUSTOM_URLS 个地址（当前 ${list.size} 个）"
+                }
+                list.map { url ->
+                    runCatching { UrlGuard.requireAllowed("$url/v0/calendar", allowPrivateTargets) }
+                        .getOrElse {
+                            // 不回显 Blocked 原文（里面是「主机名 -> 内网 IP」的映射），
+                            // 细节只进日志；调用方拿到的是 403 + 一句通用原因
+                            appLog.warn("Bangumi 自定义通道地址不被允许: {} ({})", url, it.message)
+                            throw UrlGuard.Blocked("自定义通道地址不被允许")
+                        }
+                    url
+                }
             } }
     }
 
@@ -233,6 +249,11 @@ class BangumiClient(
         if (next.channel == BgmChannel.CUSTOM) {
             val urls = next.customUrls.map { it.trim().removeSuffix("/") }.filter { it.isNotBlank() }
             require(urls.isNotEmpty()) { "自定义通道至少需要一个 Bangumi API 地址" }
+            // 每个地址都会做一次真实 DNS 校验；不封顶的话一个请求就能让调用线程
+            // 对着几万条地址逐条解析（体积极限 1MB，塞得下）。
+            require(urls.size <= MAX_CUSTOM_URLS) {
+                "自定义通道最多支持 $MAX_CUSTOM_URLS 个地址（当前 ${urls.size} 个）"
+            }
             // 形参必须显式命名成 url：下面 onFailure 的 lambda 参数是 Throwable
             // 且默认名也叫 it，会**遮蔽**外层 forEach 的 it —— 之前写成 $it 时，
             // 拼进错误消息的是 Blocked 异常原文（含「主机名 -> 内网 IP」映射），
@@ -308,7 +329,9 @@ class BangumiClient(
         // 核心能力探针：取一个必定存在的条目（凉宫春日的忧郁）。只关心状态码，
         // 不解析响应体，避免把「能连上」和「字段变了」混为一谈。
         val core = runCatching {
-            fetcher.fetch("$base/v0/subjects/$PROBE_SUBJECT_ID", headers(), followRedirects = false).status
+            // 必须带上限：探测地址可以由任何能打开设置页的人填写（默认部署无鉴权），
+            // 指向一个高带宽的大文件时，ofByteArray 会按 45 秒超时把整份响应读进堆
+            fetcher.fetchBounded("$base/v0/subjects/$PROBE_SUBJECT_ID", headers(), MAX_METADATA_BYTES).status
         }
         val coreOk = core.getOrNull()?.let { it in 200..299 } == true
         // 放送表探针：只在核心可用时才值得问（否则已经知道整体不通了）。
@@ -319,7 +342,7 @@ class BangumiClient(
             null
         } else {
             runCatching {
-                fetcher.fetch("$base/v0/calendar", headers(), followRedirects = false).status
+                fetcher.fetchBounded("$base/v0/calendar", headers(), MAX_METADATA_BYTES).status
             }
         }
         val calendarStatus = calendarProbe?.getOrNull()
@@ -375,7 +398,7 @@ class BangumiClient(
     suspend fun ranking(limit: Int = 24, offset: Int = 0): BgmSearchResponse = withFallback { base ->
         val path = "/v0/subjects?type=$TYPE_ANIME&sort=rank&limit=$limit&offset=$offset"
         decode(
-            text("$base$path") { fetcher.fetch("$base$path", headers(), followRedirects = false) },
+            text("$base$path") { fetcher.fetchBounded("$base$path", headers(), MAX_METADATA_BYTES) },
             BgmSearchResponse.serializer(),
             "Bangumi 排行榜",
         )
@@ -412,7 +435,7 @@ class BangumiClient(
                 // 不能复用普通的 text()：它把 404 解释成「条目不存在」
                 // （那是 /v0/subjects/{id} 的语义）。放送表上的 404 只有一个含义 ——
                 // 这个地址没有该端点。分开处理，日志与前端提示才不会指错方向。
-                val result = fetcher.fetch("$base/v0/calendar", headers(), followRedirects = false)
+                val result = fetcher.fetchBounded("$base/v0/calendar", headers(), MAX_METADATA_BYTES)
                 when {
                     result.status in 200..299 ->
                         decode(result.text, BgmCalendarResponseList, "每日放送")
@@ -430,7 +453,7 @@ class BangumiClient(
         val subject = withFallback { base ->
             decode(
                 text("$base/v0/subjects/$id") {
-                    fetcher.fetch("$base/v0/subjects/$id?responseGroup=large", headers(), followRedirects = false)
+                    fetcher.fetchBounded("$base/v0/subjects/$id?responseGroup=large", headers(), MAX_METADATA_BYTES)
                 },
                 BgmSubject.serializer(),
                 "Bangumi 条目",
@@ -452,7 +475,7 @@ class BangumiClient(
         while (collected.size < MAX_EPISODES) {
             val pageUrl = "$base/v0/episodes?subject_id=$id&limit=$EPISODES_PAGE&offset=$offset"
             val resp = decode(
-                text(pageUrl) { fetcher.fetch(pageUrl, headers(), followRedirects = false) },
+                text(pageUrl) { fetcher.fetchBounded(pageUrl, headers(), MAX_METADATA_BYTES) },
                 BgmEpisodesResponse.serializer(),
                 "Bangumi 剧集列表",
             )
@@ -589,6 +612,16 @@ class BangumiClient(
 
         /** v0 episodes 接口单次上限 200 条 */
         private const val EPISODES_PAGE = 200
+
+        /** 自定义通道的候选地址上限：超过这个数没有真实用途，只会变成 DNS 放大器 */
+        private const val MAX_CUSTOM_URLS = 8
+
+        /**
+         * 元数据响应体上限。真实响应（搜索/条目/剧集/放送表）都是几十 KB 量级；
+         * 8MB 只为挡住「第三方地址回了一个大文件」这种把堆吃光的情况，
+         * 尤其是探测接口的目标可以由任何能打开设置页的人填写。
+         */
+        private const val MAX_METADATA_BYTES = 8L * 1024 * 1024
 
         /** 拉取总上限，避免 total 字段异常时翻页翻不停 */
         private const val MAX_EPISODES = 2000

@@ -27,8 +27,11 @@ object UrlGuard {
         if (scheme != "http" && scheme != "https") throw Blocked("仅允许 http/https 协议")
         val host = hostOf(uri) ?: throw Blocked("URL 缺少主机名")
         if (allowPrivate) return raw
-        if (isLocalName(host)) throw Blocked("目标是本机/内网名，已拒绝: $host")
-        val addresses = runCatching { InetAddress.getAllByName(host).toList() }.getOrNull()
+        // 结尾的点是 DNS 的根标签（`localhost.` 与 `localhost` 是同一台机器），
+        // 不归一化会让按字符串比较的本机名判断失配
+        val normalized = host.removeSuffix(".")
+        if (isLocalName(normalized)) throw Blocked("目标是本机/内网名，已拒绝: $host")
+        val addresses = runCatching { InetAddress.getAllByName(normalized).toList() }.getOrNull()
         addresses?.firstOrNull { isInternalAddress(it) }?.let {
             throw Blocked("目标地址属于内网/保留地址，已拒绝: $host -> ${it.hostAddress}")
         }
@@ -46,10 +49,11 @@ object UrlGuard {
         if (scheme != "http" && scheme != "https") throw Blocked("仅允许 http/https 协议")
         val host = hostOf(uri) ?: throw Blocked("URL 缺少主机名")
         if (allowPrivate) return raw
-        if (isLocalName(host)) throw Blocked("目标是本机/内网名，已拒绝: $host")
+        val normalized = host.removeSuffix(".")
+        if (isLocalName(normalized)) throw Blocked("目标是本机/内网名，已拒绝: $host")
         // 只对字面 IP 求值：Java 认得 2130706433 这类十进制写法，会解析成 127.0.0.1
-        if (isIpLiteral(host)) {
-            val literal = runCatching { InetAddress.getByName(host) }.getOrNull()
+        if (isIpLiteral(normalized)) {
+            val literal = runCatching { InetAddress.getByName(normalized) }.getOrNull()
             if (literal != null && isInternalAddress(literal)) {
                 throw Blocked("目标地址属于内网/保留地址，已拒绝: $host")
             }
@@ -91,10 +95,15 @@ object UrlGuard {
      * 只在「确定是 IP 写法」时才交给 InetAddress 求值。
      * 判据必须严格：把普通域名误判成 IP 字面量会触发真实 DNS 查询，
      * 让本不该解析的轻量校验路径变得又慢又不确定。
+     *
+     * 单个全数字标签也算：`2130706433` 会被 JVM 直接解析成 127.0.0.1，
+     * 而它既没有点、也不匹配十六进制写法（DNS 的顶级标签不允许纯数字，
+     * 所以不存在误伤正常域名的问题）。
      */
     private fun isIpLiteral(host: String): Boolean =
         host.contains(':') || host.matches(Regex("""\d{1,3}(\.\d{1,3}){0,3}""")) ||
-            host.matches(Regex("""0[xX][0-9a-fA-F]+(\.0[xX][0-9a-fA-F]+){0,3}"""))
+            host.matches(Regex("""0[xX][0-9a-fA-F]+(\.0[xX][0-9a-fA-F]+){0,3}""")) ||
+            host.matches(Regex("""\d{1,10}"""))
 
     private fun isInternalAddress(addr: InetAddress): Boolean {
         if (
@@ -118,7 +127,7 @@ object UrlGuard {
         }
     }
 
-    /** IPv4 保留段：0/8、100.64/10（CGNAT）、198.18/15（基准测试）、以及三个 TEST-NET */
+    /** IPv4 保留段：0/8、100.64/10（CGNAT）、198.18/15（基准测试）、240/4（含广播）、以及三个 TEST-NET */
     private fun isReservedIpv4(b: ByteArray): Boolean {
         fun oct(i: Int) = b[i].toInt() and 0xff
         val a0 = oct(0)
@@ -130,6 +139,7 @@ object UrlGuard {
             a0 == 192 && a1 == 0 && (oct(2) == 2 || oct(2) == 3) -> true // TEST-NET-1 / 保留
             a0 == 198 && a1 == 51 && oct(2) == 100 -> true               // TEST-NET-2
             a0 == 203 && a1 == 0 && oct(2) == 113 -> true                // TEST-NET-3
+            a0 >= 240 -> true                     // 240.0.0.0/4 保留 + 255.255.255.255 广播
             else -> false
         }
     }

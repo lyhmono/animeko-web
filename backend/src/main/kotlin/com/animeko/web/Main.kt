@@ -33,6 +33,7 @@ import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.request.path
 import io.ktor.server.response.respond
 import io.ktor.server.routing.routing
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 
@@ -134,15 +135,18 @@ fun Application.module(
     val userData = UserDataStore(cfg.userDataFile)
     val subscriptions = SubscriptionService(fetcher, repo, cfg.allowPrivateTargets)
 
-    // 示例源先落地（纯本地文件操作，不开网络），保证列表立刻非空；
-    // 默认订阅随后异步导入 —— 绝不在模块初始化里做网络 I/O：订阅站慢或挂了会把
+    // 默认订阅在后台协程里异步导入 —— 绝不在模块初始化里做网络 I/O：订阅站慢或挂了会把
     // 启动卡住，而端口还没监听时连健康检查都过不去。
-    repo.seedIfEmpty()
+    // （不再预置「示例站点」：那两条指 example-*.test、本来也搜不出东西，
+    //  只是把空列表伪装成有内容；首次安装就直接是空列表，由用户导入自己的源。）
     if (cfg.autoImportUrls.isNotEmpty()) {
         launch {
-            val summaries = runCatching {
+            val summaries = try {
                 subscriptions.autoImport(cfg.autoImportUrls, cfg.subscriptionAutoTiers)
-            }.getOrElse { e ->
+            } catch (e: CancellationException) {
+                // 关停/取消要原样上抛；runCatching 会把它当普通失败记一条 warning
+                throw e
+            } catch (e: Exception) {
                 appLog.warn("自动导入订阅异常：{}", e.message ?: e::class.simpleName)
                 emptyList()
             }

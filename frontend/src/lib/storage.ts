@@ -207,17 +207,24 @@ function changedKeys(round: Round): string[] {
   return round.keys.filter((key) => {
     if (key === 'progress') {
       const progress = asMap(doc.progress)
+      // 本轮没带走、但飞行期间新加进来的条目同样要再发一轮。
+      // 只看 round.progressKeys 会漏掉「新 key」，而那时 pendingKeys 会被清掉，
+      // 这一条进度就永远等不到下一次 flush（暂停/关页后就丢了）。
+      if ([...pendingProgressKeys].some((entry) => !round.progressKeys.includes(entry))) return true
       return round.progressKeys.some((entry) => progress[entry] !== round.sentProgress.get(entry))
     }
     if (key === 'favorites') {
+      if ([...pendingFavIds].some((id) => !round.favIds.includes(id))) return true
       const now = favoritesById(doc.favorites)
       return round.favIds.some((id) => now.get(id) !== round.sentFavs.get(id))
     }
     if (key === SOURCE_FAV_KEY) {
+      if ([...pendingSourceFavKeys].some((k) => !round.sourceFavKeys.includes(k))) return true
       const now = sourceFavoritesById(doc[SOURCE_FAV_KEY])
       return round.sourceFavKeys.some((k) => now.get(k) !== round.sentSourceFavs.get(k))
     }
     if (key === 'subjectProgress') {
+      if ([...pendingSubjectKeys].some((k) => !round.subjectKeys.includes(k))) return true
       const now = asMap(doc.subjectProgress)
       return round.subjectKeys.some((k) => now[k] !== round.sentSubjects.get(k))
     }
@@ -259,7 +266,6 @@ async function pushOnce(): Promise<void> {
         : ''
       // 只清「发出去之后没再被动过」的键：await 期间新产生的改动必须留给下一轮
       const changed = changedKeys(round)
-      const changedProgress = changed.includes('progress')
       round.keys.forEach((k) => { if (!changed.includes(k)) pendingKeys.delete(k) })
       round.progressKeys.forEach((k) => {
         if (asMap(doc.progress)[k] === round.sentProgress.get(k)) pendingProgressKeys.delete(k)
@@ -285,7 +291,7 @@ async function pushOnce(): Promise<void> {
       // 纯靠这里补定时器的那条路径上，这个窗口才是 800 毫秒。
       // 结论：这是**状态标注的正确性**修复（顺带让文件头第 3 条说得通），
       // 不是一个可以稳定复现给用户看的缺陷 —— 别在注释里把它写成后者。
-      if (changed.length > 0 || changedProgress) {
+      if (changed.length > 0) {
         scheduleFollowUp()
         setSync({ status: 'pending', kind: null, error: '' })
       } else {
@@ -962,6 +968,8 @@ export function markUserDataStale(): void {
   loaded = false
   setDoc({})
   baseEtag = ''
+  // 体积提醒属于上一份文档：不清掉的话，换账号后页脚还会说「接近上限」
+  sizeNote = ''
   setSync({  status: 'ready', kind: null, error: ''  })
 }
 
@@ -1078,18 +1086,24 @@ export function importUserData(text: string): ImportSummary {
   if (incoming.subjectProgress && typeof incoming.subjectProgress === 'object' && !Array.isArray(incoming.subjectProgress)) {
     const local = asMap(readJson<Record<string, unknown>>('subjectProgress', {}))
     const merged: Record<string, unknown> = { ...local }
+    const applied: string[] = []
     for (const [id, raw] of Object.entries(incoming.subjectProgress as Record<string, unknown>)) {
       const ep = numOr(asMap(raw).ep, 0)
       if (!(ep > 0)) continue
       if (ep <= numOr(asMap(merged[id]).ep, 0)) continue
       merged[id] = { ep, ts: numOr(asMap(raw).ts, Date.now()) }
+      applied.push(id)
       summary.subjectProgress += 1
     }
-    if (summary.subjectProgress > 0) writeJson('subjectProgress', merged)
+    // 与 progress 同理：导入必须把**真正改过的条目**记进待写集合，
+    // 否则 409 合并时会按服务端版本整键覆盖，这次导入静默丢失。
+    // 之前这里用 writeJson 连条目级标记都没有，正是在这条路上丢的。
+    if (applied.length > 0) writeSubjectProgress(merged, applied)
   }
 
   if (incoming.progress && typeof incoming.progress === 'object' && !Array.isArray(incoming.progress)) {
     const merged: Record<string, unknown> = { ...progressMap() }
+    const applied: string[] = []
     for (const [key, raw] of Object.entries(incoming.progress as Record<string, unknown>)) {
       const entry = asMap(raw)
       const time = numOr(entry.time, 0)
@@ -1097,13 +1111,14 @@ export function importUserData(text: string): ImportSummary {
       // 同一个播放地址上，取进度更新的一条
       if (numOr(entry.ts, 0) <= numOr(asMap(merged[key]).ts, -1)) continue
       merged[key] = entry
+      applied.push(key)
       summary.progress += 1
     }
-    if (summary.progress > 0) {
+    if (applied.length > 0) {
       doc.progress = merged
-      // 批量导入要把每个条目都记进待写集合：冲突合并时按 progressKeys 判断
-      // 「哪些是我改的」，漏记会导致这次导入在 409 重试时被服务端版本盖掉
-      for (const key of Object.keys(merged)) pendingProgressKeys.add(key)
+      // 只标记这次真正写进去的键。把**全部本地键**都记成「我改的」会在 409 合并时
+      // 把另一台设备刚删掉的旧进度又贴回服务端（复活）。
+      for (const key of applied) pendingProgressKeys.add(key)
       scheduleFlush('progress')
     }
   }

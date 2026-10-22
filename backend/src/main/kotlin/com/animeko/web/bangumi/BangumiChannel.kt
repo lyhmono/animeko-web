@@ -1,7 +1,7 @@
 package com.animeko.web.bangumi
 
 import com.animeko.web.appLog
-import java.nio.ByteBuffer
+import com.animeko.web.writeFully
 import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.Path
@@ -67,7 +67,7 @@ class BgmChannelStore(private val file: Path) {
             StandardOpenOption.WRITE,
             StandardOpenOption.TRUNCATE_EXISTING,
         ).use { ch ->
-            ch.write(ByteBuffer.wrap(text.toByteArray(Charsets.UTF_8)))
+            ch.writeFully(text.toByteArray(Charsets.UTF_8))
             ch.force(true)
         }
         runCatching { Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING) }

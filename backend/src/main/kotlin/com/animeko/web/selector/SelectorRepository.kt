@@ -2,10 +2,10 @@ package com.animeko.web.selector
 
 import com.animeko.web.appLog
 import com.animeko.web.ioReason
+import com.animeko.web.writeFully
 import java.nio.file.InvalidPathException
 import kotlinx.serialization.json.Json
 import java.io.IOException
-import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
@@ -149,7 +149,7 @@ class SelectorRepository(private val dir: Path) {
                 StandardOpenOption.WRITE,
                 StandardOpenOption.TRUNCATE_EXISTING,
             ).use { ch ->
-                ch.write(ByteBuffer.wrap(text.toByteArray(Charsets.UTF_8)))
+                ch.writeFully(text.toByteArray(Charsets.UTF_8))
                 ch.force(true)
             }
             try {
@@ -245,24 +245,6 @@ class SelectorRepository(private val dir: Path) {
         }
     }
 
-    /** 首次运行时把内置示例数据源拷贝到数据目录 */
-    fun seedIfEmpty(seedResourceDir: String = "/selectors") {
-        if (list().isNotEmpty()) return
-        // 通过 classpath 逐个拷贝（resource 目录无列表 API，这里用已知文件名）
-        val seeds = listOf("example-json-site.json", "example-css-site.json")
-        seeds.forEach { fileName ->
-            val stream = javaClass.getResourceAsStream("$seedResourceDir/$fileName") ?: return@forEach
-            val content = stream.bufferedReader().use { it.readText() }
-            // 不能静默吞掉：示例源没了，用户只会看到一个空列表，
-            // 而真实原因（比如文件名字符集不支持中文）藏在异常里
-            try {
-                save(importJson(content))
-            } catch (e: Exception) {
-                appLog.error("内置示例数据源 {} 初始化失败：{}", fileName, e.message ?: e::class.simpleName)
-            }
-        }
-    }
-
     private fun fileFor(name: String): Path {
         val safe = name.map { ch ->
             if (ch.isLetterOrDigit() || ch in "-_.") ch else '_'
@@ -273,9 +255,14 @@ class SelectorRepository(private val dir: Path) {
         // 看不出是名字的问题，更没有「短多少才够」的说法（实测导入中文长名订阅必踩）。
         // 所以在碰磁盘之前先按字节判一次，并把差额说清楚。
         val fileName = "$safe.json"
-        val bytes = fileName.toByteArray(Charsets.UTF_8).size
+        // 上限要对**临时文件**生效：writeAtomic 先写 `<名字>.json.tmp`（比正式名长
+        // 4 字节）再 rename。只按正式名判的话，正好 252~255 字节的名字能通过这里，
+        // 却在打开临时文件时 ENAMETOOLONG —— 用户看到的又是那句「写入失败」，
+        // 与这段校验本来要消灭的困惑一模一样。
+        val tmpName = "$fileName.tmp"
+        val bytes = tmpName.toByteArray(Charsets.UTF_8).size
         require(bytes <= MAX_FILE_NAME_BYTES) {
-            "数据源名称「$name」转成文件名后是 $bytes 字节，超过文件系统单名 ${MAX_FILE_NAME_BYTES} 字节的限制" +
+            "数据源名称「$name」转成临时文件名后是 $bytes 字节，超过文件系统单名 ${MAX_FILE_NAME_BYTES} 字节的限制" +
                 "（汉字按 3 字节算）：请改成不超过约 ${(MAX_FILE_NAME_BYTES - 9) / 3} 个汉字长度的名字，" +
                 "或在导入前先缩短"
         }

@@ -49,11 +49,28 @@ class UrlGuardTest {
             "http://192.0.2.1/x",
             "http://198.51.100.7/x",
             "http://203.0.113.9/x",
+            "http://240.0.0.1/x",
+            "http://255.255.255.255/x",
             "http://[100::1]/x",
             "http://[2001:db8::1]/x",
             "http://[2002:c000:204::]/x",
         ).forEach { url ->
             assertTrue(blocked(url).isNotBlank(), "$url 属于保留地址段，应当被拒绝")
+        }
+    }
+
+    @Test
+    fun `light guard recognizes JVM numeric hosts and trailing dots`() {
+        // Java 会把 2130706433 解析成 127.0.0.1；结尾点是 DNS 根标签（localhost. 就是 localhost）。
+        // 严格路径本来就靠真实 DNS 拦住它们，但轻量路径是数据源抓取的第一道闸，不能漏。
+        listOf(
+            "http://2130706433/x",
+            "http://127.0.0.1./x",
+            "http://localhost./x",
+        ).forEach { url ->
+            assertFailsWith<UrlGuard.Blocked>("$url 应当被拒绝") {
+                UrlGuard.requireNotLiteralInternal(url)
+            }
         }
     }
 
@@ -71,6 +88,7 @@ class UrlGuardTest {
             "http://100.128.0.1/x",      // 上边界之外
             "http://198.17.255.255/x",   // 198.18.0.0/15 之下
             "http://198.20.0.1/x",       // 之上
+            "http://223.255.255.255/x",  // 240.0.0.0/4 之下（仍属公网单播）
         ).forEach { url ->
             assertEquals(url, UrlGuard.requireAllowed(url), "$url 在保留段之外，不该被拦")
         }
@@ -82,6 +100,8 @@ class UrlGuardTest {
             "http://100.127.255.255/x" to "100.127.255.255",
             "http://198.18.0.1/x" to "198.18.0.1",
             "http://198.19.255.255/x" to "198.19.255.255",
+            "http://240.0.0.1/x" to "240.0.0.1",
+            "http://255.255.255.255/x" to "255.255.255.255",
         ).forEach { (url, ip) ->
             val message = blocked(url)
             assertTrue(message.contains("内网/保留"), "$url 应按保留段被拒，实际原因：$message")

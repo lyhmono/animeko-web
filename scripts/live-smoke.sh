@@ -28,8 +28,12 @@ start() { # dataDir port [nolang] [extraEnv...]
   fi
   # 额外变量放在 `env` 之后而不是和前面那些赋值并列：shell 只认命令字之前
   # 字面写出来的赋值，变量展开出来的 A=b 会被当成命令名（No such file or directory）
+  # 自动导入必须显式清空：脚本若在设了 ANIMEKO_SUBSCRIPTION_AUTO_IMPORT 的终端里跑，
+  # 后台导入会悄悄往「全新目录」里塞源，后面「没有预置数据源」那条就会偶发失败。
+  # 第 13 节要通过 $extra 主动打开它，env 参数会覆盖这里的空值。
   ( ANIMEKO_DATA_DIR=$d ANIMEKO_AUTH_USER=me ANIMEKO_AUTH_PASSWORD='s3cret-pass' \
     ANIMEKO_PORT=$p ANIMEKO_HOST=127.0.0.1 ANIMEKO_FRONTEND_DIR=$DIST \
+    ANIMEKO_SUBSCRIPTION_AUTO_IMPORT='' ANIMEKO_SEED_SUBSCRIPTION_URL='' \
     $pre $extra $BIN ) > "$d/server.log" 2>&1 &
   echo $! > "$d/pid"
   for _ in $(seq 1 80); do
@@ -130,6 +134,8 @@ BIG=$(python3 -c "print('{\"username\":\"me\",\"password\":\"' + 'a'*40000 + '\"
 check "登录请求体超过 32KB 被拒" "400" "$(curl -sS -o /dev/null -w '%{http_code}' -m 5 -X POST "$BASE/api/session/login" -d "$BIG")"
 contains "响应不回显口令" 'NOLEAK' "$(printf '%s' "$R$HDR" | grep -ci 's3cret-pass' | sed 's/^0$/NOLEAK/')"
 check "登录后取数据源" "200" "$(curl -sS -b "$JAR" -o /dev/null -w '%{http_code}' -m 5 "$BASE/api/selector/sources")"
+# 全新数据目录里不该有任何源：以前会预置两条指向 example-*.test 的示例源
+check "全新安装没有预置数据源" "[]" "$(curl -sS -b "$JAR" -m 5 "$BASE/api/selector/sources" | tr -d '[:space:]')"
 contains "登录后 health 已认证" '"authenticated":true' "$(curl -sS -b "$JAR" -m 5 "$BASE/api/health")"
 check "跨站写仍被拒（带会话也一样）" "403" "$(curl -sS -b "$JAR" -o /dev/null -w '%{http_code}' -m 5 -X PUT "$BASE/api/data" -H 'Origin: https://evil.example' -d '{}')"
 check "登录页自身可跨站？不应可" "403" "$(curl -sS -o /dev/null -w '%{http_code}' -m 5 -X POST "$BASE/api/session/login" -H 'Origin: https://evil.example' -d '{"username":"me","password":"s3cret-pass"}')"
@@ -178,11 +184,12 @@ if [ "${CNT:-0}" -gt 3 ] 2>/dev/null; then
   I=$(curl -sS -b "$JAR" -m 60 -X POST "$BASE/api/selector/subscriptions/import" -d "{\"url\":\"$SUB\",\"names\":[\"$FIRST\"]}")
   ADDED=$(printf '%s' "$I" | python3 -c 'import json,sys;print(",".join(json.load(sys.stdin)["added"]))' 2>/dev/null || echo ERR)
   check "导入返回 added" "$FIRST" "$ADDED"
-  check "源文件已落盘" "3" "$(ls "$A/selectors" | wc -l | tr -d ' ')"
+  # 数据目录里只有导入的那一个源（不再预置两条示例源）
+  check "源文件已落盘" "1" "$(ls "$A/selectors" | wc -l | tr -d ' ')"
   contains "列表里能看到" "$FIRST" "$(curl -sS -b "$JAR" -m 10 "$BASE/api/selector/sources")"
   U=$(curl -sS -b "$JAR" -m 60 -X POST "$BASE/api/selector/subscriptions/import" -d "{\"url\":\"$SUB\",\"names\":[\"$FIRST\"]}")
   check "再导入同一条报 updated" "$FIRST" "$(printf '%s' "$U" | python3 -c 'import json,sys;print(",".join(json.load(sys.stdin)["updated"]))')"
-  check "重复导入不新增文件" "3" "$(ls "$A/selectors" | wc -l | tr -d ' ')"
+  check "重复导入不新增文件" "1" "$(ls "$A/selectors" | wc -l | tr -d ' ')"
 fi
 
 echo "== 5. 静态资源与缓存"
@@ -233,7 +240,7 @@ curl -sS -m 5 -c $JB -X POST $BB/api/session/login -d '{"username":"me","passwor
 E=$(curl -sS -b $JB -m 5 -X POST $BB/api/selector/sources -d '{"factoryId":"web-selector","version":2,"arguments":{"name":"中文源名测试","searchConfig":{"searchUrl":"https://a.test/s"}}}')
 contains "坏字符集下给出可读 remedy" 'LANG=C.UTF-8' "$E"
 contains "启动日志里也有自检结论" 'sun.jnu.encoding' "$(cat "$B/server.log")"
-check "示例源没被静默丢光：列表仍可读" "200" "$(curl -sS -b $JB -o /dev/null -w '%{http_code}' -m 5 $BB/api/selector/sources)"
+check "坏字符集下列表接口仍可用" "200" "$(curl -sS -b $JB -o /dev/null -w '%{http_code}' -m 5 $BB/api/selector/sources)"
 stop $B
 
 echo "== 9. 门控与预言机（用一个干净的实例：限速表是进程内存，前面章节已经把 A 打到限速了）"
@@ -252,7 +259,8 @@ done
 # 反面对照：归一化之后这些写法确实还是同一个接口，否则上面的 401 只是「没匹配上」
 GOOD=$(curl -sS -m5 -c "$C/j.txt" -X POST "$CB/api/session/login" -d '{"username":"me","password":"s3cret-pass"}')
 contains "  对照：登录可用" '"authenticated":true' "$GOOD"
-contains "  对照：//api 带凭据仍打到接口" 'factoryId' "$(curl -sS --path-as-is -b "$C/j.txt" -m5 "$CB//api/selector/sources")"
+# 数据源列表在全新目录里是空数组（不再预置示例源），对照要精确比 JSON 而不是找某个字段
+check "  对照：//api 带凭据仍打到接口" "[]" "$(curl -sS --path-as-is -b "$C/j.txt" -m5 "$CB//api/selector/sources" | tr -d '[:space:]')"
 
 echo "== 10. 免鉴权接口不能当口令预言机"
 contains "错误口令：健康检查说不" '"authenticated":false' "$(curl -sS -m5 -u me:totally-wrong "$CB/api/health")"

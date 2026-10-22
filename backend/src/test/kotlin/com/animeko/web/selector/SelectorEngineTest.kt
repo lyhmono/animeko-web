@@ -192,6 +192,11 @@ class SelectorEngineTest {
             SelectorEngine.urlForLog("https://cdn.example.com/hls/seg1.m3u8?sign=abc123&t=1700000000"),
         )
         assertEquals("https://cdn.example.com/a/b", SelectorEngine.urlForLog("https://cdn.example.com/a/b#frag"))
+        // userinfo 里也可能是凭据（订阅地址常见写法），同样不能进日志
+        assertEquals(
+            "https://sub.example.com/path",
+            SelectorEngine.urlForLog("https://user:token@sub.example.com/path?sign=SECRET"),
+        )
         // 解析不了的畸形地址也不能把查询串原样带出去
         val odd = SelectorEngine.urlForLog("http://bad host/x?token=SECRET")
         assertTrue(!odd.contains("SECRET"), "泄露了查询串：$odd")
@@ -352,9 +357,27 @@ class SelectorEngineTest {
         assertNull(first.channel)
     }
 
+    /**
+     * 剧集名/线路名的正则来自第三方配置，文本来自第三方页面。超过 512 字符的「名字」
+     * 不可能是正常剧集名，却足以让回溯型正则永远跑不完 —— 这一类输入不进正则。
+     */
     @Test
-    fun `episodes with index-grouped format`() = runTest {
-        val fetcher = StubFetcher(mapOf("$base/anime/1.html" to fixture("detail_grouped.html")))
+    fun `a monstrous episode name is not fed to the config regex`() = runTest {
+        val longName = "第1话 " + "a".repeat(600)
+        val page = """<html><body><div id="plist"><a href="/play/long.html">$longName</a></div></body></html>"""
+        val cfg = config().copy(
+            selectorChannelFormatNoChannel = ChannelFormatNoChannel.Config(selectEpisodes = "#plist a"),
+        )
+        val fetcher = StubFetcher(mapOf("$base/anime/long.html" to page))
+        val result = SelectorEngine(fetcher).episodes(cfg, "$base/anime/long.html")
+        val ep = result.episodes.single()
+        // 名称原样保留（界面还能显示），但不解析集号
+        assertEquals(longName, ep.name)
+        assertNull(ep.sortNum, "超长文本不该再交给配置正则")
+    }
+
+    @Test
+    fun `episodes with index-grouped format`() = runTest {        val fetcher = StubFetcher(mapOf("$base/anime/1.html" to fixture("detail_grouped.html")))
         val result = SelectorEngine(fetcher).episodes(
             config(channelFormatId = ChannelFormatIndexGrouped.ID),
             "$base/anime/1.html",

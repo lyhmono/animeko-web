@@ -27,6 +27,9 @@ class BangumiStubFetcher(
     /** 元数据链路必须逐调用关掉自动跳转（这条链路没有 UrlGuard 兜着），记录实际传参 */
     val getFollowFlags = mutableListOf<Boolean>()
 
+    /** 带体积上限的读取走了哪些地址（探测接口的目标可以由任何访问者填写，必须有上限） */
+    val boundedGets = mutableListOf<Pair<String, Long>>()
+
     override suspend fun fetch(
         url: String,
         headers: Map<String, String>,
@@ -49,6 +52,17 @@ class BangumiStubFetcher(
             ?: getRoutes.entries.firstOrNull { url.startsWith(it.key) }?.value
             ?: throw IllegalStateException("no fixture for $url")
         return HttpResult(200, mapOf("content-type" to listOf("application/json")), body.toByteArray())
+    }
+
+    override suspend fun fetchBounded(
+        url: String,
+        headers: Map<String, String>,
+        maxBytes: Long,
+    ): HttpResult {
+        boundedGets.add(url to maxBytes)
+        val result = fetch(url, headers, followRedirects = false)
+        if (result.body.size > maxBytes) throw UpstreamException("超过 $maxBytes 字节上限")
+        return result
     }
 
     override suspend fun post(
@@ -102,6 +116,27 @@ class BangumiClientTest {
         assertTrue(fetcher.requests.isEmpty(), "被拦下之前已经发出过上游请求：${fetcher.requests}")
     }
 
+    /**
+     * 自定义通道的每个地址都会做一次真实 DNS 校验；探测接口的目标来自任意访问者，
+     * 一个请求塞几万条地址就能把工作线程按在 DNS 上。上限必须在**校验之前**判。
+     */
+    @Test
+    fun `an oversized custom channel is rejected before any dns or fetch`() = runTest {
+        val fetcher = BangumiStubFetcher()
+        val client = BangumiClient(fetcher, listOf("https://api.bgm.tv"))
+        val urls = (1..9).map { "https://relay$it.test" }
+
+        val saveError = assertFailsWith<IllegalArgumentException> {
+            client.setChannel(BgmChannelConfig(BgmChannel.CUSTOM, urls))
+        }
+        assertTrue(saveError.message.orEmpty().contains("最多"), saveError.message.orEmpty())
+
+        assertFailsWith<IllegalArgumentException> {
+            client.probe(BgmChannelConfig(BgmChannel.CUSTOM, urls))
+        }
+        assertTrue(fetcher.requests.isEmpty(), "超限配置不该走到任何网络请求：${fetcher.requests}")
+    }
+
     private val searchResponse = """
         {"data":[{"id":328609,"name":"ぼっち・ざ・ろっく！","name_cn":"孤独摇滚！","date":"2022-10-07",
         "platform":"TV","images":{"large":"https://img.example/l/xx.jpg"},
@@ -117,8 +152,8 @@ class BangumiClientTest {
 
     private val episodesPage1 = """
         {"data":[
-          {"id":1128641,"name":"転がるぼっち","name_cn":"翻转孤独","sort":1,"duration":"00:23:40","airdate":"2022-10-08"},
-          {"id":1128642,"name":"","name_cn":"","sort":2,"airdate":"2022-10-15"}
+          {"id":1128641,"name":"転がるぼっち","name_cn":"翻转孤独","sort":1,"duration":"00:23:40","airdate":"2022-10-08","type":0},
+          {"id":1128642,"name":"","name_cn":"","sort":2,"airdate":"2022-10-15","type":6}
         ],"total":4,"limit":200,"offset":0}
     """.trimIndent()
 
@@ -159,6 +194,35 @@ class BangumiClientTest {
         // total=4 而单页只有 2 条：旧实现固定单次请求，长篇番剧第 200 集之后会整段丢失
         assertEquals(4, eps.size)
         assertEquals(2, fetcher.requests.count { it.contains("/v0/episodes") })
+        // type 必须原样带到前端：点特别篇时靠它避开正片线路
+        assertEquals("6", (eps[1] as kotlinx.serialization.json.JsonObject)["type"].toString())
+        // 元数据读取也要有体积上限：不能让第三方地址的响应体无界进堆
+        assertTrue(fetcher.boundedGets.any { it.first.contains("/v0/subjects/328609") })
+        assertTrue(fetcher.boundedGets.any { it.first.contains("/v0/episodes") })
+    }
+
+    /**
+     * 探测接口的 CUSTOM 目标由任何能打开设置页的人填写（默认部署无鉴权）。
+     * 它以前走的是 `fetch`（ofByteArray）：对方回一个大文件就能把堆吃光。
+     */
+    @Test
+    fun `probe reads arbitrary targets through the bounded path`() = runTest {
+        val fetcher = BangumiStubFetcher(
+            getRoutes = mapOf(
+                "https://api.bgm.tv/v0/subjects/290980" to "{}",
+                "https://api.bgm.tv/v0/calendar" to "[]",
+            ),
+        )
+        val client = BangumiClient(fetcher, listOf("https://api.bgm.tv"))
+        val results = client.probe()
+        assertEquals(1, results.size)
+        assertTrue(results.single().ok)
+        assertEquals(
+            setOf("https://api.bgm.tv/v0/subjects/290980", "https://api.bgm.tv/v0/calendar"),
+            fetcher.boundedGets.map { it.first }.toSet(),
+            "探测必须走 fetchBounded，而不是无上限的 fetch",
+        )
+        assertTrue(fetcher.boundedGets.all { it.second > 0 })
     }
 
     /**

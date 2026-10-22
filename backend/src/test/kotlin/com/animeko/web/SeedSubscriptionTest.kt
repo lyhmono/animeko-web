@@ -17,9 +17,9 @@ import kotlin.test.assertTrue
 /**
  * 开机导入默认订阅的接线（module() 这一层）。
  *
- * 这里曾经测的是另一套机制：「仓库为空时同步阻塞启动拉一次，成功就不种示例源」。
- * 现在统一成「示例源先落地，订阅在后台协程里异步导入」，所以断言跟着改：
- * 示例源**始终**在，订阅源是**追加**进来的，而订阅挂了不影响启动。
+ * 曾经有两代设计：「仓库为空时同步阻塞启动拉一次」，以及「先种两条示例源，订阅异步追加」。
+ * 现在示例源已经删掉（它们指向 example-*.test、本来就搜不出东西），全新数据目录就是空的；
+ * 订阅在后台协程里异步导入，订阅挂了不影响启动。
  * 异步意味着必须轮询等待，不能假设 application {} 返回时已经导完。
  */
 class SeedSubscriptionTest {
@@ -146,8 +146,8 @@ class SeedSubscriptionTest {
         val names = awaitSources(client, "订阅源甲", "订阅源乙")
         assertTrue(names.contains("订阅源甲"), names)
         assertTrue(names.contains("订阅源乙"), names)
-        // 示例源不再被订阅「取代」：它先落地，订阅是追加
-        assertTrue(names.contains("示例站点"), "示例源应当仍在列表里：$names")
+        // 不再预置「示例站点」：全新数据目录里只有订阅导入的这两条
+        assertEquals(2, Regex("\"name\"").findAll(names).count(), "列表里应当只有订阅带来的两条：$names")
         assertTrue(stub.fetchCount >= 1, "订阅地址应被拉取过")
     }
 
@@ -159,7 +159,8 @@ class SeedSubscriptionTest {
         }
         val resp = client.get("/api/selector/sources")
         assertEquals(HttpStatusCode.OK, resp.status, "订阅站挂了不能把服务一起带走")
-        assertTrue(resp.bodyAsText().contains("示例站点-CSS"), resp.bodyAsText())
+        // 不再预置示例源：数据目录是空的，列表就该是空数组（而不是一条假数据）
+        assertEquals("[]", resp.bodyAsText().trim(), resp.bodyAsText())
     }
 
     @Test
@@ -169,7 +170,7 @@ class SeedSubscriptionTest {
         application { module(config(dataDir), fetcherOverride = stub) }
         val resp = client.get("/api/selector/sources")
         assertEquals(HttpStatusCode.OK, resp.status)
-        assertTrue(resp.bodyAsText().contains("示例站点-CSS"), resp.bodyAsText())
+        assertEquals("[]", resp.bodyAsText().trim(), resp.bodyAsText())
         assertEquals(0, stub.fetchCount, "没配订阅就不该在启动时打外网")
     }
 

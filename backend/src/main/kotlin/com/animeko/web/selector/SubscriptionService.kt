@@ -113,7 +113,10 @@ class SubscriptionService(
     }
 
     private fun requireSuccess(target: String, result: HttpResult): String {
-        if (result.status !in 200..299) throw UpstreamException("订阅返回 ${result.status}（$target）")
+        if (result.status !in 200..299) {
+            // 日志只该出现 scheme://host/path：订阅地址常把 token 放在查询串里
+            throw UpstreamException("订阅返回 ${result.status}（${SelectorEngine.urlForLog(target)}）")
+        }
         return String(result.body, Charsets.UTF_8)
     }
 
@@ -131,21 +134,35 @@ class SubscriptionService(
             val (items, _) = parse(body)
             val wanted = items.filter { tiers.isEmpty() || displayTier(it.tier) in tiers }
             if (wanted.isEmpty()) {
-                appLog.warn("订阅 {} 没有匹配 tier={} 的数据源，跳过", url, tiers)
+                appLog.warn("订阅 {} 没有匹配 tier={} 的数据源，跳过", SelectorEngine.urlForLog(url), tiers)
             }
             var ok = 0
             val known = repo.list().associate { it.arguments.name to it.enabled }
             wanted.forEach { args ->
                 runCatching { repo.save(args, known[args.name] ?: true) }
                     .onSuccess { ok++ }
-                    .onFailure { appLog.warn("自动导入 {} 的「{}」失败：{}", url, args.name, it.message) }
+                    .onFailure {
+                        appLog.warn(
+                            "自动导入 {} 的「{}」失败：{}",
+                            SelectorEngine.urlForLog(url),
+                            args.name,
+                            it.message ?: it::class.simpleName,
+                        )
+                    }
             }
             "$ok/${wanted.size}"
+        } catch (e: CancellationException) {
+            // 关停/超时取消必须原样上抛，不能被当成「这个订阅失败」继续跑下一个
+            throw e
         } catch (e: Exception) {
-            appLog.warn("自动导入订阅 {} 失败：{}", url, e.message ?: e::class.simpleName)
+            appLog.warn(
+                "自动导入订阅 {} 失败：{}",
+                SelectorEngine.urlForLog(url),
+                e.message ?: e::class.simpleName,
+            )
             "失败"
         }
-        "$url → $label 个"
+        "${SelectorEngine.urlForLog(url)} → $label 个"
     }
 
     suspend fun preview(url: String?, text: String?, label: String = ""): PreviewResponse {
@@ -276,8 +293,16 @@ class SubscriptionService(
     }
 
     private fun decode(el: JsonElement): SelectorSourceArguments? {
-        runCatching { json.decodeFromJsonElement(SelectorConfigFile.serializer(), el).arguments }
-            .getOrNull()?.takeIf { it.name.isNotBlank() }?.let { return it }
+        val wrapper = runCatching { json.decodeFromJsonElement(SelectorConfigFile.serializer(), el) }
+            .getOrNull()
+        if (wrapper != null) {
+            // 与 SelectorRepository.importJson 同一条规则。订阅里同时打包了 web 与
+            // BT/PikPak 源；丢掉 factoryId 后，只要那条恰好带 searchUrl 就会被当成
+            // 网页源导入 —— 列表里看着正常，搜索永远 0 结果，也看不出它原本不是这个类型
+            val factory = wrapper.factoryId.trim()
+            if (factory.isNotEmpty() && !factory.equals("web-selector", ignoreCase = true)) return null
+            return wrapper.arguments.takeIf { it.name.isNotBlank() }
+        }
         return runCatching { json.decodeFromJsonElement(SelectorSourceArguments.serializer(), el) }
             .getOrNull()?.takeIf { it.name.isNotBlank() }
     }
@@ -306,7 +331,9 @@ class SubscriptionService(
     private fun siteOf(args: SelectorSourceArguments): String {
         val cfg = args.searchConfig
         val raw = listOf(cfg.rawBaseUrl, cfg.searchUrl).firstOrNull { it.isNotBlank() } ?: return ""
-        return runCatching { java.net.URI(raw).host }.getOrNull()?.lowercase() ?: raw.take(60)
+        // 解析不出主机名时也不能把带 token 的原文整个展示出来
+        return runCatching { java.net.URI(raw).host }.getOrNull()?.lowercase()
+            ?: SelectorEngine.urlForLog(raw).take(60)
     }
 
     private companion object {

@@ -2,9 +2,13 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import Poster from '../components/Poster'
 import { api, errMsg } from '../api'
+import { pickBestHit, pickEpisode } from '../lib/titleMatch'
 import type { BgmEpisode, BgmSubject, EpisodesResult, StoredSource } from '../types'
 import { getSubjectProgress, isFavorite, toggleFavorite } from '../lib/storage'
 import { IconHeart, IconHeartFilled } from '../lib/icons'
+
+/** Bangumi 剧集 type：0 本篇，1 SP，2 OP，3 ED，4 预告，5 MAD，6 其他 */
+const EP_TYPE_TAG: Record<number, string> = { 1: 'SP', 2: 'OP', 3: 'ED', 4: 'CM', 5: 'MAD', 6: '其他' }
 
 /** 播放弹窗状态 */
 interface PlayFlow {
@@ -178,15 +182,27 @@ export default function SubjectPage() {
           )
           return
         }
-        const result = await api.sourceEpisodes(sourceName, hits[0].url)
+        // 不能直接拿 hits[0]：数据源按相关度排，第一条常常是别的季或番外合集
+        // （用户点第一季第一集、播出来却是最终季/番外，就是这么来的）。
+        // 按「季号 + 类型 + 标题相似度」挑最像这个条目的那一条。
+        const best = pickBestHit(hits, [subject.name_cn, subject.name]) ?? hits[0]
+        const result = await api.sourceEpisodes(sourceName, best.url)
         if (!alive()) return
         const want = ep.sort ?? 1
-        const matched =
-          result.episodes.find((e) => e.sortNum === want) ??
-          result.episodes.find((e) => e.sortNum != null && e.sortNum >= want) ??
-          null
+        // 选集同理：优先「非番外」线路，并按条目的季号在同页多季里挑对那一路；
+        // 点的剧集本身是 SP/OP/ED 时（type != 0）改为只认番外线路
+        const matched = pickEpisode(
+          result,
+          want,
+          ep.name_cn || ep.name,
+          [subject.name_cn, subject.name],
+          (ep.type ?? 0) !== 0,
+        )
         if (matched) {
-          const idx = result.episodes.indexOf(matched)
+          // 不能用 indexOf：分组源里 pickEpisode 返回的是 group.episodes 里的对象，
+          // 经 JSON 反序列化后与扁平 episodes 中的对象不是同一个引用，indexOf 恒为 -1，
+          // 连播的「下一集」会错误地落到整表第 1 条（常常是番外第 1 集）。
+          const idx = result.episodes.findIndex((e) => e.playUrl === matched.playUrl)
           goPlay(
             sourceName,
             matched.playUrl,
@@ -194,13 +210,13 @@ export default function SubjectPage() {
             want,
             matched.name,
             nextOf(sourceName, result.episodes, idx, animeName),
-            hits[0].url,
+            best.url,
           )
           return
         }
         // 无法自动确定集数：交给用户手动选
         setFlow((f) =>
-          f ? { ...f, matching: false, pickingEpisodes: result, matchedSource: sourceName, sourceSubjectUrl: hits[0].url } : f,
+          f ? { ...f, matching: false, pickingEpisodes: result, matchedSource: sourceName, sourceSubjectUrl: best.url } : f,
         )
       } catch (e) {
         // 这里也必须判 alive：用户取消后**又开了一个新的选集弹窗**时，
@@ -280,11 +296,20 @@ export default function SubjectPage() {
       <div className="episode-list">
         {episodes.map((ep) => (
           <div
-            className={`episode-row${watchedEp > 0 && ep.sort != null && ep.sort <= watchedEp ? ' watched' : ''}`}
+            className={`episode-row${
+              (ep.type ?? 0) === 0 && watchedEp > 0 && ep.sort != null && ep.sort <= watchedEp ? ' watched' : ''
+            }`}
             key={ep.id}
           >
             <span className="ep-sort">{ep.sort ?? '-'}</span>
             <span className="ep-title">{ep.name_cn || ep.name || `第${ep.sort}话`}</span>
+            {/* 非正片剧集要和正片区分开：同一部番里 SP 和本篇的 sort 都从 1 开始，
+                不标出来用户点「1」时根本不知道会播哪一个 */}
+            {ep.type ? (
+              <span className="tag" title="非正片剧集，自动匹配只走番外线路">
+                {EP_TYPE_TAG[ep.type] ?? 'SP'}
+              </span>
+            ) : null}
             {ep.airdate && <span className="ep-date">{ep.airdate}</span>}
             <button
               className="btn btn-sm"

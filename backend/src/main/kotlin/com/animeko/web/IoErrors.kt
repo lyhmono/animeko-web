@@ -1,6 +1,8 @@
 package com.animeko.web
 
 import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
 import java.nio.file.AccessDeniedException
 import java.nio.file.FileSystemException
 import java.nio.file.NoSuchFileException
@@ -18,4 +20,13 @@ internal fun ioReason(e: IOException): String = when (e) {
     is NoSuchFileException -> "目标或父目录不存在"
     is FileSystemException -> e.reason ?: e.message ?: "文件系统错误"
     else -> e.message ?: e::class.simpleName ?: "未知错误"
+}
+
+/**
+ * 写满整个缓冲区。`FileChannel.write` 的契约允许只写一部分（NFS/CIFS 上真实存在），
+ * 单次调用后直接 force 会得到一个被截断的配置文件 —— 而且不报错。
+ */
+internal fun FileChannel.writeFully(bytes: ByteArray) {
+    val buffer = ByteBuffer.wrap(bytes)
+    while (buffer.hasRemaining()) write(buffer)
 }

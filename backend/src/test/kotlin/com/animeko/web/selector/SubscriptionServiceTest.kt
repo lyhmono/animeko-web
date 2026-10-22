@@ -37,6 +37,24 @@ class SubscriptionServiceTest {
         searchConfig = SelectorSearchConfig(searchUrl = "https://existing.test/?wd={keyword}"),
     )
 
+    /**
+     * 订阅里混着 web 与 BT/PikPak 源。单文件导入（SelectorRepository.importJson）早就会拒绝
+     * 非 web-selector 的 factoryId，而订阅这条路径把 factoryId 丢掉后，只要 BT 条目
+     * 恰好带 searchUrl 就会被当成网页源列出来并可导入 —— 搜不出任何东西，也看不出原因。
+     */
+    @Test
+    fun `subscription entries from non-web factories are not offered`() = runTest {
+        val body = """{"exportedMediaSourceDataList":{"mediaSources":[
+            {"factoryId":"bt","version":1,"arguments":{"name":"BT源","searchConfig":{"searchUrl":"https://bt.test/s?wd={keyword}"}}},
+            {"factoryId":"web-selector","version":2,"arguments":{"name":"网页源","searchConfig":{"searchUrl":"https://web.test/s?wd={keyword}"}}},
+            {"name":"裸源","searchConfig":{"searchUrl":"https://bare.test/s?wd={keyword}"}}
+        ]}}"""
+        val (svc, _) = service(body)
+        val preview = svc.preview(url = "https://sub.example.test/css.json", text = null)
+        assertEquals(listOf("网页源", "裸源"), preview.candidates.map { it.name }, preview.rejected.toString())
+        assertEquals(1, preview.rejected.size, preview.rejected.toString())
+    }
+
     @Test
     fun `preview lists usable sources without shipping whole configs`() = runTest {
         val (svc, _) = service(aggregate)

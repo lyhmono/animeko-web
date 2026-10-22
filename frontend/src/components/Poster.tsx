@@ -21,8 +21,12 @@ export default function Poster({
   className?: string
   sizes?: string
 }) {
-  const [viaProxy, setViaProxy] = useState(false)
-  const [dead, setDead] = useState(false)
+  // 失败状态按地址记，而不是一个布尔：列表复用组件时（同一个 key 换了 src）
+  // 布尔会跟着旧地址留下来 —— 新图直接走代理，甚至直接显示占位块
+  const [failedSrc, setFailedSrc] = useState<string | null>(null)
+  const [deadSrc, setDeadSrc] = useState<string | null>(null)
+  const viaProxy = failedSrc === src
+  const dead = deadSrc === src
 
   if (!src || dead) return <div className={`${className} cover-empty`} aria-hidden />
 
@@ -43,8 +47,8 @@ export default function Poster({
       // （防盗链的站点直连失败后本来就会走本站代理那条路）。
       referrerPolicy="no-referrer"
       onError={() => {
-        if (viaProxy) setDead(true)
-        else setViaProxy(true)
+        if (viaProxy) setDeadSrc(src)
+        else setFailedSrc(src)
       }}
     />
   )
