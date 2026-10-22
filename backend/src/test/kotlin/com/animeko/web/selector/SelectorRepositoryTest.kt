@@ -14,6 +14,19 @@ class SelectorRepositoryTest {
     private fun args(name: String) = SelectorSourceArguments(name = name)
 
     @Test
+    fun `an unavailable data dir does not stop startup and writes fail loudly`() {
+        // 只读挂载时入口脚本承诺「服务继续运行，给只读浏览留活路」，
+        // 而 init 里的 createDirectories 原先会让进程启动即崩（实测 AccessDeniedException）。
+        val dir = Files.createTempDirectory("animeko-repo-ro")
+        val blocker = dir.resolve("not-a-dir")
+        Files.writeString(blocker, "x")
+        val repo = SelectorRepository(blocker.resolve("selectors")) // 构造不能抛
+        assertEquals(emptyList(), repo.list())
+        val e = assertFailsWith<IllegalArgumentException> { repo.save(args("源")) }
+        assertTrue(e.message.orEmpty().isNotBlank(), e.message.orEmpty())
+    }
+
+    @Test
     fun `save list find round trip`() {
         val r = repo()
         r.save(args("测试源"))

@@ -84,6 +84,19 @@ class UserDataStoreTest {
     }
 
     @Test
+    fun `an unwritable location is reported as a write failure, not a raw io exception`() {
+        // 只读挂载/磁盘满/父路径被普通文件占住时，IOException 原来会穿到兜底变成 500，
+        // 前端把它当瞬时故障每 5 秒重试一次，永远重试下去，文案里也没有线索。
+        // 现在换成 IllegalArgumentException（→ 400）+ 说得清的原因。
+        val dir = Files.createTempDirectory("animeko-data-ro")
+        val blocker = dir.resolve("not-a-dir")
+        Files.writeString(blocker, "x")
+        val store = UserDataStore(blocker.resolve("userdata.json"))
+        val e = assertFailsWith<IllegalArgumentException> { store.write("""{"a":1}""") }
+        assertTrue(e.message.orEmpty().contains("无法写入"), e.message.orEmpty())
+    }
+
+    @Test
     fun `a corrupt file is quarantined and reading degrades to empty`() {
         val (s, file) = store()
         Files.createDirectories(file.parent)

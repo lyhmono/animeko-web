@@ -1,8 +1,10 @@
 package com.animeko.web.data
 
 import com.animeko.web.appLog
+import com.animeko.web.ioReason
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.AtomicMoveNotSupportedException
@@ -111,33 +113,44 @@ class UserDataStore(
             // 之间还能挤进另一个写者，检查就只是装饰
             val current = currentEtagLocked()
             if (!ifMatchAllows(ifMatch, current)) throw Stale()
-            Files.createDirectories(file.parent)
             val tmp = sib("tmp")
-            // 先写临时文件、fsync、再 rename：写入中途被 kill 或被断电都不会留下半个文件。
-            // 少了 fsync，rename 只保证元数据进了目录项，掉电后文件可能存在但内容是旧的/全零。
-            FileChannel.open(
-                tmp,
-                StandardOpenOption.CREATE,
-                StandardOpenOption.WRITE,
-                StandardOpenOption.TRUNCATE_EXISTING,
-            ).use { ch ->
-                ch.write(ByteBuffer.wrap(bytes))
-                ch.force(true)
-            }
-            // 备份必须是「复制」而不是「挪走」：原来是先 move 走旧文件再 rename 新的，
-            // 两次操作之间进程被 kill，userdata.json 就不存在了（只剩 .bak）。
-            // 现在读的一侧会认这份 .bak（见 restoreFromBackup），两头合起来才真的不丢数据。
-            if (Files.isRegularFile(file)) {
-                runCatching { Files.copy(file, sib("bak"), StandardCopyOption.REPLACE_EXISTING) }
-            }
-            // 先写临时文件再 rename：写入中途被 kill 也不会留下半个文件
             try {
-                Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE)
-            } catch (e: AtomicMoveNotSupportedException) {
-                // NFS/CIFS 这类挂载不支持原子 rename；退回普通 move 也比丢掉这次写入好
-                Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING)
+                Files.createDirectories(file.parent)
+                // 先写临时文件、fsync、再 rename：写入中途被 kill 或被断电都不会留下半个文件。
+                // 少了 fsync，rename 只保证元数据进了目录项，掉电后文件可能存在但内容是旧的/全零。
+                FileChannel.open(
+                    tmp,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.WRITE,
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                ).use { ch ->
+                    ch.write(ByteBuffer.wrap(bytes))
+                    ch.force(true)
+                }
+                // 备份必须是「复制」而不是「挪走」：原来是先 move 走旧文件再 rename 新的，
+                // 两次操作之间进程被 kill，userdata.json 就不存在了（只剩 .bak）。
+                // 现在读的一侧会认这份 .bak（见 restoreFromBackup），两头合起来才真的不丢数据。
+                if (Files.isRegularFile(file)) {
+                    runCatching { Files.copy(file, sib("bak"), StandardCopyOption.REPLACE_EXISTING) }
+                }
+                // 先写临时文件再 rename：写入中途被 kill 也不会留下半个文件
+                try {
+                    Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE)
+                } catch (e: AtomicMoveNotSupportedException) {
+                    // NFS/CIFS 这类挂载不支持原子 rename；退回普通 move 也比丢掉这次写入好
+                    Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING)
+                }
+                syncDirOf(file)
+            } catch (e: IOException) {
+                // 只读挂载/磁盘满这类「写不进去」原来会一路穿到兜底 500 INTERNAL_ERROR，
+                // 前端把它当瞬时故障每 5 秒重试一次，永远重试下去；文案里也没有任何线索。
+                // 这里换成一条说得清的错误（→ 400），前端把它当不可重试的失败停下。
+                runCatching { Files.deleteIfExists(tmp) }
+                throw IllegalArgumentException(
+                    "个人数据无法写入：${ioReason(e)}（文件：$file）",
+                    e,
+                )
             }
-            syncDirOf(file)
         }
         return Snapshot(text, sha256Hex(bytes))
     }

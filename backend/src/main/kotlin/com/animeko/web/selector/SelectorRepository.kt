@@ -1,6 +1,7 @@
 package com.animeko.web.selector
 
 import com.animeko.web.appLog
+import com.animeko.web.ioReason
 import java.nio.file.InvalidPathException
 import kotlinx.serialization.json.Json
 import java.io.IOException
@@ -46,7 +47,19 @@ class SelectorRepository(private val dir: Path) {
     private val cache = java.util.concurrent.ConcurrentHashMap<String, Cached>()
 
     init {
-        if (!dir.exists()) dir.createDirectories()
+        // 数据目录可能是只读挂载（NAS/NFS root-squash、编排层挂错权限）。这时服务仍应能起来：
+        // 浏览、搜索、播放都不需要写这个目录，入口脚本也明确承诺「服务继续运行，给只读浏览
+        // 留活路」。原先这里直接 createDirectories，AccessDeniedException 会让进程启动即崩
+        // （实测：nobody + 只读 /data → ClassNotFound 之后紧接着的 AccessDeniedException），
+        // 容器于是进入 restart 循环，连登录页都打不开 —— 比「不能导入数据源」严重得多。
+        runCatching {
+            if (!dir.exists()) dir.createDirectories()
+        }.onFailure {
+            appLog.error(
+                "数据源目录不可用（只读挂载或权限不对）：{}。数据源导入/编辑会失败，浏览与播放不受影响：{}",
+                dir, it.message ?: it::class.simpleName,
+            )
+        }
     }
 
     fun list(): List<StoredSource> {
@@ -152,12 +165,12 @@ class SelectorRepository(private val dir: Path) {
                     syncDirOf(target)
                 } catch (e2: IOException) {
                     runCatching { Files.deleteIfExists(tmp) }
-                    throw IllegalArgumentException("写入数据源文件失败：${e2.message ?: e2::class.simpleName}", e2)
+                    throw IllegalArgumentException("写入数据源文件失败：${ioReason(e2)}", e2)
                 }
             }
         } catch (e: IOException) {
             runCatching { Files.deleteIfExists(tmp) }
-            throw IllegalArgumentException("写入数据源文件失败：${e.message ?: e::class.simpleName}", e)
+            throw IllegalArgumentException("写入数据源文件失败：${ioReason(e)}", e)
         }
     }
 
