@@ -55,6 +55,10 @@ export default function SourceDetailPage() {
       anime: title,
       ep: epSort,
     })
+    // 数据源详情页地址也要带过去：播放页的连播在 URL 里没带下一集时靠它重新取列表。
+    // 不带的话，从这条入口（数据源搜索结果 → 详情页）进去的连播只能连一集 ——
+    // 和条目页那条入口的行为不一致，而两处用的是同一个播放页。
+    q.set('surl', subjectUrl)
     if (nextEp) {
       q.set(
         'next',

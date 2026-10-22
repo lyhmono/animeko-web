@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import Poster from './Poster'
 import { api } from '../api'
-import { favoriteIdSet } from '../lib/storage'
+import { favoriteIdSet, onDocChange } from '../lib/storage'
 import { IconHeartFilled } from '../lib/icons'
 import type { BgmCalendarDay } from '../types'
 
@@ -23,9 +23,11 @@ export default function AiringCalendar() {
   const [selected, setSelected] = useState<number>(-1)
   /** 只看已收藏：放送表的真正价值是「我追的今天更新了吗」，不是资讯墙 */
   const [onlyFav, setOnlyFav] = useState(false)
-  // 只取值：收藏在本页不会被修改（改收藏去条目页），所以不需要 setter。
-  // 每次进首页组件都会重新挂载，这里读到的就是最新收藏。
-  const [favIds] = useState<Set<number>>(() => favoriteIdSet())
+  // 收藏在本页不会被修改（改收藏去条目页），但整份文档可能被换掉
+  // （启动读取失败后点「重新读取」）—— 那时必须重抄，否则心形一直停在旧集合上。
+  const [favIds, setFavIds] = useState<Set<number>>(() => favoriteIdSet())
+
+  useEffect(() => onDocChange(() => setFavIds(favoriteIdSet())), [])
 
   useEffect(() => {
     const ctrl = new AbortController()
