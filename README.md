@@ -169,6 +169,11 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 | PUT | `/api/data` | 需要 | 整份覆盖。带 `If-Match` 时版本不符回 `409 DATA_STALE`；请求体 ≤1MB，文档 ≤512KB |
 | GET | `/api/bangumi/search?q=` | 需要 | Bangumi 搜索 |
 | GET | `/api/bangumi/subjects/{id}` | 需要 | 条目详情；已删除的条目回 `404`（不是 502） |
+| GET | `/api/bangumi/calendar` | 需要 | 每日放送表（只有官方端点有；通道是镜像时回 `502`，前端按可选区块处理） |
+| GET | `/api/bangumi/ranking?limit=&offset=` | 需要 | 评分排行榜（`limit` 夹在 1–50，`offset` ≤ 5000） |
+| GET | `/api/bangumi/channel` | 需要 | 当前通道、自定义地址、实际生效的 base 列表、是否支持每日放送 |
+| PUT | `/api/bangumi/channel` | 需要 | 切换通道 `{channel, customUrls}`；`CUSTOM` 至少一个公网 http(s) 地址，否则 `400` |
+| POST | `/api/bangumi/channel/probe` | 需要 | 探测候选通道的连通性与是否支持每日放送（保存前先看结果） |
 | GET | `/api/selector/sources` | 需要 | 已导入的数据源列表 |
 | POST | `/api/selector/sources` | 需要 | 导入单个源：`{factoryId,version,arguments}` 包装或裸 `arguments` |
 | POST | `/api/selector/sources/{name}/enable` | 需要 | `{"enabled":true/false}` —— 必须是显式布尔值，缺字段或类型不对回 `400` |
