@@ -4,7 +4,7 @@ import AiringCalendar from '../components/AiringCalendar'
 import ContinueWatching from '../components/ContinueWatching'
 import { api } from '../api'
 import type { StoredSource } from '../types'
-import { addSearchHistory, clearSearchHistory, listSearchHistory } from '../lib/storage'
+import { addSearchHistory, clearSearchHistory, listSearchHistory, onDocChange } from '../lib/storage'
 import {
   IconClock,
   IconHistory,
@@ -37,6 +37,9 @@ export default function HomePage() {
     api.sources().then(setSources).catch(() => setSources([]))
     setHistory(listSearchHistory())
   }, [])
+
+  // 启动读取失败后「重新读取」成功会整份换档，历史 chips 要跟着刷新
+  useEffect(() => onDocChange(() => setHistory(listSearchHistory())), [])
 
   const enabledCount = sources.filter((s) => s.enabled).length
 

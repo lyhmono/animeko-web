@@ -197,9 +197,11 @@ export default function PlayerPage() {
     try {
       const result = await api.sourceEpisodes(source, subjectUrl)
       if (seq !== chainSeqRef.current) return
-      const list = result.episodes.length > 0
-        ? result.episodes
-        : result.groups.flatMap((g) => g.episodes)
+      // 当前这一集属于哪条线路，就只在那条线路里续播。原实现优先用扁平列表，
+      // 当前线路最后一集会连到另一条线路的第一集（正片完结后自动跳番外/下一季）。
+      const group = result.groups.find((g) => g.episodes.some((e) => e.playUrl === playUrl))
+      const list = group?.episodes
+        ?? (result.episodes.length > 0 ? result.episodes : result.groups.flatMap((g) => g.episodes))
       const i = list.findIndex((e) => e.playUrl === playUrl)
       if (i < 0) return
       const mk = (e: (typeof list)[number]): NextEpisode => ({

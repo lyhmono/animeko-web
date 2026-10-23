@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { api, errMsg } from '../api'
 import type { EpisodeHit, EpisodesResult } from '../types'
-import { isSourceFavorite, toggleSourceFavorite, type SourceFavorite } from '../lib/storage'
+import { isSourceFavorite, onDocChange, toggleSourceFavorite, type SourceFavorite } from '../lib/storage'
 import { IconHeart, IconHeartFilled } from '../lib/icons'
 
 export default function SourceDetailPage() {
@@ -45,6 +45,12 @@ export default function SourceDetailPage() {
     return () => {
       cancelled = true
     }
+  }, [name, subjectUrl])
+
+  // 整份文档换档时重抄收藏态（启动读取失败后重试、冲突合并）
+  useEffect(() => {
+    if (!name || !subjectUrl) return
+    return onDocChange(() => setFaved(isSourceFavorite(name, subjectUrl)))
   }, [name, subjectUrl])
 
   const goPlay = (playUrl: string, epName: string, epSort: string, nextEp?: EpisodeHit) => {

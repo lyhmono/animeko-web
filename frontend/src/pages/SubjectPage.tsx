@@ -4,7 +4,7 @@ import Poster from '../components/Poster'
 import { api, errMsg } from '../api'
 import { pickBestHit, pickEpisode } from '../lib/titleMatch'
 import type { BgmEpisode, BgmSubject, EpisodesResult, StoredSource } from '../types'
-import { getSubjectProgress, isFavorite, toggleFavorite } from '../lib/storage'
+import { getSubjectProgress, isFavorite, onDocChange, toggleFavorite } from '../lib/storage'
 import { IconHeart, IconHeartFilled } from '../lib/icons'
 
 /** Bangumi 剧集 type：0 本篇，1 SP，2 OP，3 ED，4 预告，5 MAD，6 其他 */
@@ -97,6 +97,16 @@ export default function SubjectPage() {
       // 卸载后那条在飞的匹配同样不许再跳转（它做的是整页 location.assign）
       matchGenRef.current++
     }
+  }, [subjectId])
+
+  // 整份文档换档（启动读取失败后「重新读取」、冲突合并）时重抄收藏与条目进度，
+  // 否则心形和「看到第几话」会停在上一次的空文档上。
+  useEffect(() => {
+    if (!subjectId) return
+    return onDocChange(() => {
+      setFaved(isFavorite(subjectId))
+      setWatchedEp(getSubjectProgress(subjectId)?.ep ?? 0)
+    })
   }, [subjectId])
 
   const enabledSources = sources
@@ -202,14 +212,19 @@ export default function SubjectPage() {
           // 不能用 indexOf：分组源里 pickEpisode 返回的是 group.episodes 里的对象，
           // 经 JSON 反序列化后与扁平 episodes 中的对象不是同一个引用，indexOf 恒为 -1，
           // 连播的「下一集」会错误地落到整表第 1 条（常常是番外第 1 集）。
-          const idx = result.episodes.findIndex((e) => e.playUrl === matched.playUrl)
+          // 也不能直接在扁平列表里取 idx+1：当前线路的最后一集之后会跨到另一条线路
+          // （正片播完跳番外/下一季）。只在同一 channel 内找下一集。
+          const chain = matched.channel
+            ? result.episodes.filter((e) => e.channel === matched.channel)
+            : result.episodes
+          const idx = chain.findIndex((e) => e.playUrl === matched.playUrl)
           goPlay(
             sourceName,
             matched.playUrl,
             animeName,
             want,
             matched.name,
-            nextOf(sourceName, result.episodes, idx, animeName),
+            nextOf(sourceName, chain, idx, animeName),
             best.url,
           )
           return
@@ -407,26 +422,26 @@ export default function SubjectPage() {
               <>
                 <h3>未能自动确定集数，请手动选择剧集</h3>
                 <div className="hit-list" style={{ maxHeight: 300, overflow: 'auto' }}>
-                  {flow.pickingEpisodes.episodes.map((ep, idx) => (
+                  {flow.pickingEpisodes.episodes.map((ep) => (
                     <button
                       key={ep.playUrl}
                       className="source-pick"
-                      onClick={() =>
+                      onClick={() => {
+                        // 与自动匹配同一条规则：下一集只在当前 channel 内找，
+                        // 否则手动选的线路最后一集会连到另一条线路的第一集
+                        const flat = flow.pickingEpisodes?.episodes ?? []
+                        const chain = ep.channel ? flat.filter((x) => x.channel === ep.channel) : flat
+                        const at = chain.findIndex((x) => x.playUrl === ep.playUrl)
                         goPlay(
                           flow.matchedSource,
                           ep.playUrl,
                           subject.name_cn || subject.name,
                           flow.episode.sort ?? 1,
                           ep.name,
-                          nextOf(
-                            flow.matchedSource,
-                            flow.pickingEpisodes?.episodes ?? [],
-                            idx,
-                            subject.name_cn || subject.name,
-                          ),
+                          nextOf(flow.matchedSource, chain, at, subject.name_cn || subject.name),
                           flow.sourceSubjectUrl,
                         )
-                      }
+                      }}
                     >
                       <div>
                         [{ep.channel ?? '默认线路'}] {ep.name}
