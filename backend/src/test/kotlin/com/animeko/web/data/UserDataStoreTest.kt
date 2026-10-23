@@ -97,6 +97,18 @@ class UserDataStoreTest {
     }
 
     @Test
+    fun `a path that exists but is not a readable regular file fails instead of reading empty`() {
+        // 这条是数据安全的分界：读不出来 ≠ 服务器上没有数据。
+        // 若返回空文档，前端下一次保存就会覆盖掉原文件。
+        val dir = Files.createTempDirectory("animeko-data-baddir")
+        val file = dir.resolve("userdata.json")
+        Files.createDirectory(file)
+        val store = UserDataStore(file)
+        assertFailsWith<UserDataStore.ReadFailed> { store.read() }
+        assertFailsWith<UserDataStore.ReadFailed> { store.write("""{"a":1}""", null) }
+    }
+
+    @Test
     fun `a corrupt file is quarantined and reading degrades to empty`() {
         val (s, file) = store()
         Files.createDirectories(file.parent)

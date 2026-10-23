@@ -8,6 +8,8 @@ import com.animeko.web.http.UrlGuard
 import com.animeko.web.http.UpstreamException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
 import kotlinx.serialization.Serializable
@@ -18,6 +20,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
+import java.nio.charset.Charset
 import java.util.regex.Pattern
 
 // 以下模型会经 Ktor call.respond(...) 做 JSON 序列化，必须标注 @Serializable，
@@ -143,21 +146,28 @@ class SelectorEngine(
         // 源自己的 matchVideoUrl 始终优先；兜底要等所有页面都试完才采用，
         // 否则一个通用扩展名会把配置里更精确的线路抢掉
         var fallback: String? = null
-        findVideoUrl(html, target, videoRegex)?.let {
+        // 所有候选共用同一份字符预算：预算是「一次解析」的额度，不是每条 URL 的额度。
+        // 后者会让几千条畸形候选各自烧满 2M 次回溯，把一次解析按在 CPU 上几十秒。
+        val budget = SafeRegex.Budget()
+        // 候选只解析一次：findVideoUrl 与 genericVideoUrl 原先各自 Jsoup.parse + 扫 URL，
+        // 8MB 页面等于白做两遍解析与两遍正则。
+        val pageCandidates = videoCandidates(html, target)
+        findVideoUrl(pageCandidates, videoRegex, budget)?.let {
             return ResolvedTarget(it, referer, ua, cookies)
         }
-        genericVideoUrl(html, target)?.let { fallback = it }
+        genericVideoUrl(pageCandidates)?.let { fallback = it }
         if (mv.enableNestedUrl && nestedRegex != null) {
             // 嵌套候选：DOM 中的 iframe/a/video/source 绝对地址 + 原文中的绝对 URL
             val doc = Jsoup.parse(html, target)
-            val candidates = LinkedHashSet<String>()
-            doc.select("iframe[src]").forEach { candidates.add(it.absUrl("src")) }
-            doc.select("a[href]").forEach { candidates.add(it.absUrl("href")) }
-            candidateUrls(html).forEach { candidates.add(it) }
+            val nestedCandidates = LinkedHashSet<String>()
+            doc.select("iframe[src]").forEach { nestedCandidates.add(it.absUrl("src")) }
+            doc.select("a[href]").forEach { nestedCandidates.add(it.absUrl("href")) }
+            candidateUrls(html).forEach { nestedCandidates.add(it) }
             // 与 videoCandidates 同一条规则：长度先判，正则后判，顺序不能颠倒
             // （`&&` 是短路的，反过来就等于没挡）。
-            val nested = candidates.filter {
-                it.length in 11..MAX_CANDIDATE_URL_LEN && it.startsWith("http") && SafeRegex.contains(nestedRegex, it)
+            val nested = nestedCandidates.filter {
+                it.length in 11..MAX_CANDIDATE_URL_LEN && it.startsWith("http") &&
+                    SafeRegex.contains(nestedRegex, it, budget = budget)
             }.take(MAX_NESTED_PAGES)
             val deadline = System.currentTimeMillis() + NESTED_BUDGET_MS
             for (n in nested) {
@@ -168,17 +178,26 @@ class SelectorEngine(
                     // 嵌套地址来自页面内容，同样要过校验：否则播放页里塞一个
                     // iframe="http://127.0.0.1:..." 就能借服务端去敲内网。非法候选直接跳过，
                     // 不让它把整次解析打断。
+                    // Cookie 只在「与播放页同主机」时才带：iframe 可以指向任意第三方，
+                    // 那等于把源站 Cookie 送给页面作者指定的地方。
+                    val nestedHost = UrlGuard.hostOf(n)
+                    val nestedHeaders = if (nestedHost != null && nestedHost == UrlGuard.hostOf(target)) {
+                        headers
+                    } else {
+                        headers - "Cookie"
+                    }
                     fetchPage(
                         cfg,
                         UrlGuard.requireNotLiteralInternal(n, allowPrivateTargets),
-                        headers,
+                        nestedHeaders,
                         "嵌套播放页",
                     )
                 }.getOrNull() ?: continue
-                findVideoUrl(sub, n, videoRegex)?.let {
+                val subCandidates = videoCandidates(sub, n)
+                findVideoUrl(subCandidates, videoRegex, budget)?.let {
                     return ResolvedTarget(it, referer, ua, cookies)
                 }
-                if (fallback == null) fallback = genericVideoUrl(sub, n)
+                if (fallback == null) fallback = genericVideoUrl(subCandidates)
             }
         }
         fallback?.let {
@@ -368,7 +387,7 @@ class SelectorEngine(
 
     // ---------- 线路/剧集格式实现 ----------
 
-    private fun selectNoChannel(doc: Document, cfg: SelectorSearchConfig, base: String): EpisodesResult {
+    private suspend fun selectNoChannel(doc: Document, cfg: SelectorSearchConfig, base: String): EpisodesResult {
         val c = cfg.selectorChannelFormatNoChannel
         val regex = SafeRegex.compile(c.matchEpisodeSortFromName)
             ?: return EpisodesResult(emptyList(), emptyList(), emptyList())
@@ -378,23 +397,27 @@ class SelectorEngine(
         } else {
             null
         }
+        // 一次解析共享一份预算：否则每集各拿 2M，几千集就能把一次请求按在 CPU 上几十秒。
+        val budget = SafeRegex.Budget()
         val eps = elements.mapIndexedNotNull { index, e ->
+            ensureAliveEvery(index)
             val name = e.text().trim()
             if (name.isBlank()) return@mapIndexedNotNull null
             val href = links?.getOrNull(index) ?: e.attr("href")
             if (href.isBlank()) return@mapIndexedNotNull null
+            val parsed = parseEpisodeSort(name, regex, budget)
             EpisodeHit(
                 channel = null,
                 name = name,
-                sort = sortText(name, regex),
-                sortNum = sortNum(name, regex),
+                sort = parsed.text,
+                sortNum = parsed.num,
                 playUrl = absUrl(base, href),
             )
         }
         return EpisodesResult(emptyList(), eps, emptyList())
     }
 
-    private fun selectIndexGrouped(doc: Document, cfg: SelectorSearchConfig, base: String): EpisodesResult {
+    private suspend fun selectIndexGrouped(doc: Document, cfg: SelectorSearchConfig, base: String): EpisodesResult {
         val c = cfg.selectorChannelFormatFlattened
         val channelRegex = if (c.matchChannelName.isBlank()) {
             null
@@ -403,43 +426,66 @@ class SelectorEngine(
         }
         val epRegex = SafeRegex.compile(c.matchEpisodeSortFromName)
             ?: return EpisodesResult(emptyList(), emptyList(), emptyList())
+        // 线路名与剧集名共享同一份预算：都属于「一次剧集页解析」。
+        val budget = SafeRegex.Budget()
         val channelNames = queryAll(doc, c.selectChannelNames)
-            ?.mapNotNull { e ->
-                val text = e.text().trim().ifBlank { return@mapNotNull null }
-                if (channelRegex == null || text.length > MAX_REGEX_TEXT_LEN) text
-                else SafeRegex.groupOrText(channelRegex, text, "ch", text)
+            ?.mapIndexed { index, e ->
+                val text = e.text().trim()
+                when {
+                    // 空线路名不能丢：丢了之后 lists.zip(channelNames) 会让后面所有线路左移，
+                    // 剧集挂到别人的线路名下（连播跟着串线）。占位名保住下标。
+                    text.isBlank() -> "线路 ${index + 1}"
+                    channelRegex == null || text.length > MAX_REGEX_TEXT_LEN -> text
+                    else -> SafeRegex.groupOrText(channelRegex, text, "ch", text, budget = budget) ?: text
+                }
             }
             ?: emptyList()
         val lists = queryAll(doc, c.selectEpisodeLists)
             ?: return EpisodesResult(channelNames, emptyList(), emptyList())
-        val groups = lists.zip(channelNames).mapNotNull { (list, channelName) ->
+        if (channelNames.size != lists.size) {
+            appLog.warn(
+                "index-grouped 线路名与播放列表数量不一致（names={} lists={}），按下标对齐，缺失的一侧用占位名补齐",
+                channelNames.size,
+                lists.size,
+            )
+        }
+        // 用 lists 驱动而不是 zip：列表多于名字时 zip 会静默丢掉多出来的整条线路
+        val groups = lists.mapIndexed { index, list ->
+            val channelName = channelNames.getOrNull(index) ?: "线路 ${index + 1}"
             val links = if (c.selectEpisodeLinksFromList.isNotBlank()) {
                 queryAll(list, c.selectEpisodeLinksFromList)?.map { it.attr("href") }
             } else {
                 null
             }
             val eps = (queryAll(list, c.selectEpisodesFromList) ?: emptyList()).mapIndexedNotNull { index, e ->
+                ensureAliveEvery(index)
                 val name = e.text().trim()
                 if (name.isBlank()) return@mapIndexedNotNull null
                 val href = links?.getOrNull(index) ?: e.attr("href")
                 if (href.isBlank()) return@mapIndexedNotNull null
+                val parsed = parseEpisodeSort(name, epRegex, budget)
                 EpisodeHit(
                     channel = channelName,
                     name = name,
-                    sort = sortText(name, epRegex),
-                    sortNum = sortNum(name, epRegex),
+                    sort = parsed.text,
+                    sortNum = parsed.num,
                     playUrl = absUrl(base, href),
                 )
             }
             ChannelGroupHit(channelName, eps)
         }
-        return EpisodesResult(channelNames, groups.flatMap { it.episodes }, groups)
+        return EpisodesResult(groups.map { it.name }, groups.flatMap { it.episodes }, groups)
     }
 
     // ---------- 视频地址提取 ----------
 
-    private fun findVideoUrl(html: String, pageUrl: String, videoRegex: Pattern): String? =
-        videoCandidates(html, pageUrl).firstOrNull { SafeRegex.contains(videoRegex, it) }
+    private fun findVideoUrl(
+        candidates: List<String>,
+        videoRegex: Pattern,
+        budget: SafeRegex.Budget,
+    ): String? = candidates.firstOrNull {
+        !budget.exhausted && SafeRegex.contains(videoRegex, it, budget = budget)
+    }
 
     /**
      * 通用兜底：源配置里的 matchVideoUrl 是一份 **CDN 域名白名单**，而源站换 CDN 比
@@ -447,13 +493,13 @@ class SelectorEngine(
      * 的源，表现是一律 NO_VIDEO_URL_FOUND）。所以在配置彻底没命中时，
      * 按扩展名再认一次 —— 只认 m3u8/mp4/mkv/flv 这几个明确是视频后缀的，
      * 并且永远排在配置正则之后，不抢配置已经选好的线路。
+     *
+     * 这里只用本项目自己的正则，不再花第三方配置的预算，所以配置正则被
+     * 恶意页面耗尽预算后，通用后缀兜底仍然有效。
      */
-    private fun genericVideoUrl(html: String, pageUrl: String): String? {
-        val candidates = videoCandidates(html, pageUrl)
-        // m3u8 优先：同页常同时挂着一条 mp4 预览小样和真正的分片清单
-        return candidates.firstOrNull { GENERIC_M3U8.containsMatchIn(it) }
+    private fun genericVideoUrl(candidates: List<String>): String? =
+        candidates.firstOrNull { GENERIC_M3U8.containsMatchIn(it) }
             ?: candidates.firstOrNull { GENERIC_VIDEO.containsMatchIn(it) }
-    }
 
     private fun videoCandidates(html: String, pageUrl: String): List<String> {
         val doc = Jsoup.parse(html, pageUrl)
@@ -468,6 +514,7 @@ class SelectorEngine(
         // 而这条链路的正则与页面内容都是别人写的。实测代价：一次解析 6 秒起步，
         // 且完全取决于机器忙不忙（这类只会抖出来说明它本来就挡不住）。
         return candidates.filter { it.length in 11..MAX_CANDIDATE_URL_LEN && it.startsWith("http") }
+            .take(MAX_VIDEO_CANDIDATES)
     }
 
     private fun candidateUrls(html: String): List<String> {
@@ -569,7 +616,7 @@ class SelectorEngine(
             }
             if (result.status !in 301..399) {
                 if (result.status !in 200..299) throw UpstreamException("$source 返回 ${result.status}")
-                return String(result.body, Charsets.UTF_8)
+                return decodePage(result)
             }
             val location = result.header("location")
                 ?: throw UpstreamException("$source 返回 ${result.status} 但没有 Location")
@@ -602,24 +649,64 @@ class SelectorEngine(
             UrlGuard.requireAllowed(url, allowPrivateTargets)
         }
 
+    /**
+     * 按 BOM / Content-Type / `<meta charset>` 解码源站页面。
+     *
+     * 一律按 UTF-8 解是错的：国内仍有不少 GBK/GB2312 源站，标题与链接会整片乱码，
+     * 表现为「搜索能返回条目但名字是乱码、详情链路一个都对不上」。三层判据与浏览器一致：
+     * BOM 最高，其次响应头，最后页面里的 meta（只看前 4KB，避免大页面白扫）。
+     */
+    private fun decodePage(result: HttpResult): String {
+        val bytes = result.body
+        val bom = when {
+            bytes.size >= 3 && bytes[0] == 0xEF.toByte() && bytes[1] == 0xBB.toByte() && bytes[2] == 0xBF.toByte() ->
+                Charsets.UTF_8 to 3
+            bytes.size >= 2 && bytes[0] == 0xFF.toByte() && bytes[1] == 0xFE.toByte() ->
+                Charsets.UTF_16LE to 2
+            bytes.size >= 2 && bytes[0] == 0xFE.toByte() && bytes[1] == 0xFF.toByte() ->
+                Charsets.UTF_16BE to 2
+            else -> null to 0
+        }
+        val charset = bom.first
+            ?: charsetNamed(result.contentType?.let { CHARSET_PARAM.find(it)?.groupValues?.getOrNull(1) })
+            ?: charsetFromHtmlMeta(bytes)
+            ?: Charsets.UTF_8
+        return String(bytes, bom.second, bytes.size - bom.second, charset)
+    }
+
+    private fun charsetFromHtmlMeta(bytes: ByteArray): Charset? {
+        val head = String(bytes, 0, minOf(bytes.size, 4096), Charsets.ISO_8859_1)
+        return charsetNamed(META_CHARSET.find(head)?.groupValues?.getOrNull(1))
+    }
+
+    private fun charsetNamed(name: String?): Charset? =
+        name?.takeIf { it.isNotBlank() }?.let { runCatching { Charset.forName(it) }.getOrNull() }
+
     private fun applyLink(template: String?, raw: String, base: String): String {
         val link = if (template.isNullOrBlank()) raw else template.replace("{value}", raw)
         return absUrl(base, link)
     }
 
-    private fun sortText(name: String, regex: Pattern): String {
+    private data class ParsedEpisodeSort(val text: String, val num: Int?)
+
+    /**
+     * 每集只解析一次。旧实现 sortText + sortNum 各调一次正则，等于把一次解析
+     * 的预算翻倍；现在文本与数字来自同一次匹配，并共用调用方的 budget。
+     */
+    private fun parseEpisodeSort(name: String, regex: Pattern, budget: SafeRegex.Budget): ParsedEpisodeSort {
         // 历史长度上限保留（正常剧集名远短于此），真正的回溯保护在 SafeRegex：
         // `(a+)+$` 即使只有 100 个字符也能跑 2^100 步，单靠长度上限救不了。
-        if (name.length > MAX_REGEX_TEXT_LEN) return name
-        val group = SafeRegex.group(regex, name, "ep")
-        return group?.trim()?.takeIf { it.isNotBlank() } ?: name
+        if (name.length > MAX_REGEX_TEXT_LEN) {
+            return ParsedEpisodeSort(name, name.toIntOrNull() ?: if (isPossiblyMovie(name)) 1 else null)
+        }
+        val group = SafeRegex.group(regex, name, "ep", budget = budget)
+        val text = group?.trim()?.takeIf { it.isNotBlank() } ?: name
+        val num = text.toIntOrNull() ?: if (isPossiblyMovie(name)) 1 else null
+        return ParsedEpisodeSort(text, num)
     }
 
-    private fun sortNum(name: String, regex: Pattern): Int? {
-        val raw = sortText(name, regex)
-        raw.toIntOrNull()?.let { return it }
-        if (isPossiblyMovie(name)) return 1
-        return null
+    private suspend fun ensureAliveEvery(index: Int) {
+        if (index % 128 == 0) currentCoroutineContext().ensureActive()
     }
 
     companion object {
@@ -628,6 +715,15 @@ class SelectorEngine(
 
         /** 单个候选 URL 的长度上限，见 candidateUrls */
         private const val MAX_CANDIDATE_URL_LEN = 4096
+
+        /** 单页参与正则匹配的候选数上限：8MB 页面能塞几十万条链接，没必要全扫 */
+        private const val MAX_VIDEO_CANDIDATES = 5_000
+
+        private val CHARSET_PARAM = Regex("""charset\s*=\s*["']?([A-Za-z0-9._-]+)""", RegexOption.IGNORE_CASE)
+        private val META_CHARSET = Regex(
+            """<meta[^>]+charset\s*=\s*["']?\s*([A-Za-z0-9._-]+)""",
+            RegexOption.IGNORE_CASE,
+        )
 
         /**
          * 第三方正则（matchEpisodeSortFromName / matchChannelName）能看到的文本上限。
@@ -711,12 +807,16 @@ class SelectorEngine(
         /** CSS / XPath 自适应查询；JSoup 1.18+ 原生支持 selectXpath */
         fun queryAll(root: Element, selector: String): List<Element>? {
             if (selector.isBlank()) return null
-            val xpath = looksLikeXPath(selector)
+            val raw = selector.trim()
+            val xpath = looksLikeXPath(raw)
+            // `xpath:` 是配置里常见的显式前缀，但 Jsoup 的 selectXpath 只接受裸 XPath。
+            // 以前把它原样传进去，带前缀的写法必然失败，README 宣称的 XPath 支持形同虚设。
+            val xpathExpr = if (raw.startsWith("xpath:")) raw.removePrefix("xpath:").trim() else raw
             return try {
-                if (xpath) root.selectXpath(selector).toList() else root.select(selector).toList()
+                if (xpath) root.selectXpath(xpathExpr).toList() else root.select(raw).toList()
             } catch (e: Exception) {
                 try {
-                    if (xpath) root.select(selector).toList() else root.selectXpath(selector).toList()
+                    if (xpath) root.select(raw).toList() else root.selectXpath(raw).toList()
                 } catch (e2: Exception) {
                     null
                 }

@@ -188,8 +188,12 @@ data class MatchVideoConfig(
 @Serializable
 data class VideoHeaders(
     val referer: String = "",
-    val userAgent: String =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
+    /**
+     * 留空表示沿用 searchConfig.userAgent。这里以前写死了一个非空默认 UA，
+     * 于是 `userAgent.ifBlank { cfg.userAgentOrDefault() }` 的兜底永远不生效，
+     * 配置里给整个数据源指定的 UA 对视频请求没有作用。
+     */
+    val userAgent: String = "",
 )
 
 @Serializable

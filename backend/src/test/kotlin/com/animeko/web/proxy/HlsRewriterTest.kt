@@ -32,6 +32,21 @@ class HlsRewriterTest {
     }
 
     @Test
+    fun `rewriteDetailed reports only hosts that were actually rewritten`() {
+        val body = """
+            # 一条评论里提到 /api/proxy?url=https%3A%2F%2Fcomment.example%2Fx 不该扩权
+            #EXT-X-KEY:METHOD=AES-128,URI="https://key.example.com/k.bin"
+            #EXTINF:10,
+            https://cdn.example.com/hls/seg.ts
+        """.trimIndent()
+
+        val result = HlsRewriter.rewriteDetailed(body, "https://cdn.example.com/hls/index.m3u8")
+
+        assertEquals(setOf("key.example.com", "cdn.example.com"), result.hosts)
+        assertFalse("comment.example" in result.hosts, "评论里的代理字符串不能登记主机")
+    }
+
+    @Test
     fun `rewrites ext-x-key uri attribute`() {
         val body = """#EXT-X-KEY:METHOD=AES-128,URI="https://key.example.com/k.bin",IV=0x1234"""
         val result = HlsRewriter.rewrite(body, "https://cdn.example.com/hls/index.m3u8")

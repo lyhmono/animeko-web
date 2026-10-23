@@ -29,6 +29,22 @@ class JsonPathEvalTest {
         assertEquals(1, JsonPathEval.evaluate("$..a", Json.parseToJsonElement("""{"a":{"b":1}}"""))?.size)
     }
 
+    /**
+     * `[*]` 之后再取属性会把「中间结果数 × 每个元素的扇出」乘起来。旧实现先 flatMap
+     * 出完整列表、再判 MAX_NODES，峰值可以达到 2 万 × 2 万个引用；这里用 300×300
+     * 验证有界累加生效（新版在超过 2 万时就返回 null，不会把整张笛卡尔积装进内存）。
+     */
+    @Test
+    fun `a large flatMap fan-out is rejected without materializing the full list`() {
+        val row = (0 until 300).joinToString(",", "[", "]") { """{"a":$it}""" }
+        val rows = (0 until 300).joinToString(",", "[", "]") { row }
+        val root = Json.parseToJsonElement(rows)
+        val started = System.nanoTime()
+        assertNull(JsonPathEval.evaluate("\$[*].a", root))
+        val ms = (System.nanoTime() - started) / 1_000_000
+        assertTrue(ms < 2_000, "花了 ${ms}ms，扇出限额没有在分配前生效")
+    }
+
     private val json = Json { ignoreUnknownKeys = true }
 
     private fun parse(text: String): JsonObject = json.parseToJsonElement(text).let { it as JsonObject }

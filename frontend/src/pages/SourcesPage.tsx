@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, errMsg } from '../api'
 import type { StoredSource, SubscriptionCandidate, SubscriptionPreview } from '../types'
 import { IconLink } from '../lib/icons'
@@ -24,6 +24,7 @@ export default function SourcesPage() {
   const [picked, setPicked] = useState<Record<string, boolean>>({})
   const [previewing, setPreviewing] = useState(false)
   const [subImporting, setSubImporting] = useState(false)
+  const previewSeqRef = useRef(0)
   // 关键词按数据源名分别保存：共用一个 state 会让所有输入框互相覆盖
   const [testKeyword, setTestKeyword] = useState<Record<string, string>>({})
   /** 批量健康检查进行中（按钮文案与禁用） */
@@ -50,6 +51,15 @@ export default function SourcesPage() {
 
   useEffect(reload, [reload])
 
+  useEffect(() => {
+    if (!pendingDelete) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setPendingDelete(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [pendingDelete])
+
   const doImport = async () => {
     if (!importText.trim()) return
     setImporting(true)
@@ -72,18 +82,32 @@ export default function SourcesPage() {
     [preview, picked],
   )
 
+  /**
+   * 输入变了就让在飞的预览作废：否则旧请求晚到会把旧清单/旧指纹覆盖到新 URL 上，
+   * 用户随后按新 URL 导入，服务端的指纹校验会莫名失败。
+   */
+  const invalidatePreview = () => {
+    previewSeqRef.current++
+    setPreviewing(false)
+    setPreview(null)
+    setPicked({})
+  }
+
   /** 拉订阅：只做「看清楚有哪些源」，写不写进仓库由下一步的勾选决定 */
   const fetchPreview = async () => {
+    if (previewing) return
     const source = subSource(subUrl, subText)
     if (!source) {
       setError('填一个聚合订阅地址，或展开「贴订阅正文」直接粘 JSON')
       return
     }
+    const seq = ++previewSeqRef.current
     setPreviewing(true)
     setError('')
     setNotice('')
     try {
       const result = await api.previewSubscription(source)
+      if (seq !== previewSeqRef.current) return
       setPreview(result)
       // 默认勾选「本机还没有」的条目：已存在的源很可能是自己改过的，
       // 默认把它们勾上等于诱导一次静默覆盖
@@ -94,10 +118,12 @@ export default function SourcesPage() {
         setError(`这个订阅里没有可用的数据源${result.rejected.length ? `（${result.rejected.length} 条被跳过）` : ''}`)
       }
     } catch (e) {
-      setError(errMsg(e))
-      setPreview(null)
+      if (seq === previewSeqRef.current) {
+        setError(errMsg(e))
+        setPreview(null)
+      }
     } finally {
-      setPreviewing(false)
+      if (seq === previewSeqRef.current) setPreviewing(false)
     }
   }
 
@@ -294,13 +320,20 @@ export default function SourcesPage() {
 
       {pendingDelete && (
         <div className="modal-mask" onClick={() => setPendingDelete(null)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 400 }}>
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="确认删除数据源"
+            onClick={(e) => e.stopPropagation()}
+            style={{ maxWidth: 400 }}
+          >
             <h3>删除数据源</h3>
             <p style={{ fontSize: 13, color: 'var(--text-secondary)', margin: '10px 0 18px' }}>
               确认删除数据源「{pendingDelete}」？删除后不可恢复，需要重新导入。
             </p>
             <div className="modal-actions">
-              <button className="btn btn-secondary" onClick={() => setPendingDelete(null)}>
+              <button className="btn btn-secondary" autoFocus onClick={() => setPendingDelete(null)}>
                 取消
               </button>
               <button className="btn btn-danger" onClick={() => void confirmDelete()}>
@@ -330,7 +363,10 @@ export default function SourcesPage() {
           <input
             value={subUrl}
             placeholder="订阅地址，例如 https://sub.example.org/v1/css1.json"
-            onChange={(e) => setSubUrl(e.target.value)}
+            onChange={(e) => {
+              setSubUrl(e.target.value)
+              invalidatePreview()
+            }}
             onKeyDown={(e) => e.key === 'Enter' && void fetchPreview()}
           />
           <button
@@ -349,7 +385,10 @@ export default function SourcesPage() {
             className="sub-text"
             placeholder='粘贴订阅 JSON，例如 {"exportedMediaSourceDataList":{"mediaSources":[…]}}'
             value={subText}
-            onChange={(e) => setSubText(e.target.value)}
+            onChange={(e) => {
+              setSubText(e.target.value)
+              invalidatePreview()
+            }}
           />
         )}
 

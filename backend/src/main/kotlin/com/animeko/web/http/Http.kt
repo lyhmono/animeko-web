@@ -1,6 +1,7 @@
 package com.animeko.web.http
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.InputStream
 import java.net.URI
@@ -9,6 +10,8 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /** 上游返回非 2xx，或返回的内容无法按预期解析。映射为 502，避免与「本服务自己的错误」混成 500。 */
 class UpstreamException(message: String) : Exception(message)
@@ -58,6 +61,9 @@ interface Fetcher {
      * 请求体就此丢失；一个 JSON API 本来也不该靠跳转工作；
      * 而自动跳转意味着镜像站点可以把这台服务器的请求引到内网地址上 ——
      * 这条链路没有 UrlGuard（代理与抓取那两条有，见各自的逐跳校验）。
+     *
+     * 实现必须对响应体限长：默认 base 列表里含社区镜像，镜像异常或恶意返回
+     * 一个巨大响应时，`ofByteArray()` 会先把整份内容吃进堆里再谈限制。
      */
     suspend fun post(
         url: String,
@@ -120,7 +126,7 @@ class JdkFetcher(
     ): HttpResult = withContext(Dispatchers.IO) {
         val request = buildRequest(url, headers)
         val cl = if (followRedirects) client else noRedirectClient
-        val resp = cl.send(request, HttpResponse.BodyHandlers.ofByteArray())
+        val resp = cl.sendCancellable(request, HttpResponse.BodyHandlers.ofByteArray())
         HttpResult(
             status = resp.statusCode(),
             headers = resp.headers().map().mapValues { it.value.toList() },
@@ -147,12 +153,13 @@ class JdkFetcher(
                 builder.header(k, v)
             }
         }
-        // 见接口上的注释：POST 永不自动跳转
-        val resp = noRedirectClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray())
+        // 见接口上的注释：POST 永不自动跳转；响应体边读边限，不能先 ofByteArray 再检查。
+        val resp = noRedirectClient.sendCancellable(builder.build(), HttpResponse.BodyHandlers.ofInputStream())
+        val bytes = resp.body().use { readCapped(it, MAX_POST_BYTES) }
         HttpResult(
             status = resp.statusCode(),
             headers = resp.headers().map().mapValues { it.value.toList() },
-            body = resp.body(),
+            body = bytes,
         )
     }
 
@@ -163,7 +170,7 @@ class JdkFetcher(
     ): StreamResult = withContext(Dispatchers.IO) {
         val request = buildRequest(url, headers, streamTimeoutMs)
         val cl = if (followRedirects) client else noRedirectClient
-        val resp = cl.send(request, HttpResponse.BodyHandlers.ofInputStream())
+        val resp = cl.sendCancellable(request, HttpResponse.BodyHandlers.ofInputStream())
         StreamResult(
             status = resp.statusCode(),
             headers = resp.headers().map().mapValues { it.value.toList() },
@@ -179,13 +186,40 @@ class JdkFetcher(
         val request = buildRequest(url, headers)
         // ofInputStream + 逐块读：上限要能在「读到的那一刻」生效。
         // ofByteArray 的话，上限只能在整份响应进堆之后检查，等于没有上限。
-        val resp = noRedirectClient.send(request, HttpResponse.BodyHandlers.ofInputStream())
+        val resp = noRedirectClient.sendCancellable(request, HttpResponse.BodyHandlers.ofInputStream())
         val bytes = resp.body().use { readCapped(it, maxBytes) }
         HttpResult(
             status = resp.statusCode(),
             headers = resp.headers().map().mapValues { it.value.toList() },
             body = bytes,
         )
+    }
+
+    /**
+     * 可取消的发送。
+     *
+     * `HttpClient.send()` 是阻塞的，而 `withContext(Dispatchers.IO)` 只是换线程，
+     * **不会**在协程取消时打断它。Bangumi 的地址竞速靠 cancel 输家来把总耗时
+     * 压到「最快的那个」，用阻塞 send 时输家仍会跑满 45 秒超时，coroutineScope
+     * 也要等它结束才返回 —— 竞速在真实的黑洞地址上等于没做。
+     *
+     * sendAsync 的 future 在协程取消时会被 cancel，JDK 随即关闭这次交换，
+     * 竞速与 withTimeout 才能按时返回。
+     */
+    private suspend fun <T> HttpClient.sendCancellable(
+        request: HttpRequest,
+        handler: HttpResponse.BodyHandler<T>,
+    ): HttpResponse<T> = suspendCancellableCoroutine { cont ->
+        val future = sendAsync(request, handler)
+        cont.invokeOnCancellation { future.cancel(true) }
+        future.whenComplete { response, error ->
+            // 取消之后 future 也会回调；此时 continuation 已取消，不能再 resume
+            if (!cont.isActive) return@whenComplete
+            when {
+                error != null -> cont.resumeWithException(error)
+                response != null -> cont.resume(response)
+            }
+        }
     }
 
     private fun readCapped(input: InputStream, maxBytes: Long): ByteArray {
@@ -227,6 +261,9 @@ class JdkFetcher(
     }
 
     companion object {
+        /** Bangumi 搜索/POST 响应体上限；真实响应只有几十 KB，8MB 只防异常/恶意大包。 */
+        private const val MAX_POST_BYTES = 8L * 1024 * 1024
+
         const val DEFAULT_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
 

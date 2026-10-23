@@ -16,8 +16,12 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8080',
-        changeOrigin: true,
+        // 用 127.0.0.1 避免 localhost 在某些环境解析到 ::1，而后端只监听 IPv4。
+        target: 'http://127.0.0.1:8080',
+        // 必须保留浏览器发来的 Host。后端对写请求比较 Origin 与 Host 的
+        // host+port 来拦 CSRF；changeOrigin=true 会把 Host 改成 8080，
+        // 于是 dev 页面（5173）的登录、收藏、导入数据源全部被判成跨站 403。
+        changeOrigin: false,
       },
     },
   },

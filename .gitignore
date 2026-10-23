@@ -26,3 +26,7 @@ Thumbs.db
 
 # 浏览器 E2E 每跑一次都往仓库里写截图，别让它们混进提交
 e2e/*.png
+
+# Python（e2e 冒烟脚本的字节码缓存）
+__pycache__/
+*.pyc

@@ -38,7 +38,10 @@ export default function SubjectPage() {
   const [subject, setSubject] = useState<BgmSubject | null>(null)
   const [error, setError] = useState('')
   const [sources, setSources] = useState<StoredSource[]>([])
+  const [sourcesError, setSourcesError] = useState('')
+  const [sourcesRetry, setSourcesRetry] = useState(0)
   const [flow, setFlow] = useState<PlayFlow | null>(null)
+  const modalRef = useRef<HTMLDivElement | null>(null)
   const [faved, setFaved] = useState(false)
   /** 「看到第几话」：由播放页在保存进度时回写（见 lib/storage 的 subjectProgress） */
   const [watchedEp, setWatchedEp] = useState(0)
@@ -58,6 +61,22 @@ export default function SubjectPage() {
     setFlow(null)
   }, [])
 
+  // 弹窗打开时把焦点移进来，并支持 Esc 关闭；matching 状态也保留一个可聚焦的取消按钮。
+  // 只依赖「是否打开」而不是整个 flow：匹配状态更新时不该反复抢走焦点。
+  const flowOpen = flow != null
+  useEffect(() => {
+    if (!flowOpen) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        closeFlow()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    modalRef.current?.focus()
+    return () => window.removeEventListener('keydown', onKey)
+  }, [flowOpen, closeFlow])
+
   useEffect(() => {
     // cancelled 守卫：切换条目时旧请求的响应不能覆盖新条目的数据
     let cancelled = false
@@ -66,6 +85,7 @@ export default function SubjectPage() {
     setSubject(null)
     setFaved(false)
     setWatchedEp(0)
+    setSourcesError('')
     // 换条目也要作废上一轮的自动匹配并收起弹窗：
     // 否则在 A 条目发起的匹配会在用户切到 B 条目之后把用户带进 A 的某一集
     matchGenRef.current++
@@ -88,8 +108,11 @@ export default function SubjectPage() {
         .then((list) => {
           if (!cancelled) setSources(list.filter((s) => s.enabled))
         })
-        .catch(() => {
-          if (!cancelled) setSources([])
+        .catch((e) => {
+          if (!cancelled) {
+            setSources([])
+            setSourcesError(errMsg(e))
+          }
         })
     }
     return () => {
@@ -97,7 +120,7 @@ export default function SubjectPage() {
       // 卸载后那条在飞的匹配同样不许再跳转（它做的是整页 location.assign）
       matchGenRef.current++
     }
-  }, [subjectId])
+  }, [subjectId, sourcesRetry])
 
   // 整份文档换档（启动读取失败后「重新读取」、冲突合并）时重抄收藏与条目进度，
   // 否则心形和「看到第几话」会停在上一次的空文档上。
@@ -132,8 +155,10 @@ export default function SubjectPage() {
       animeName: string,
       epSort: number,
       epLabel: string,
-      next?: { source: string; play: string; title: string; anime: string; ep: string } | null,
+      next?: { source: string; play: string; title: string; anime: string; ep: string; bep?: string } | null,
       subjectUrl?: string,
+      /** 正片才写条目级进度；SP/OP/ED 的 sort 也从 1 开始，写进去会把本篇标成已看 */
+      mainEpisode = true,
     ) => {
       const params = new URLSearchParams({
         source: sourceName,
@@ -144,12 +169,14 @@ export default function SubjectPage() {
         // 带上条目 id：播放页据此回写「看到第几话」，条目页才能标出进度
         subject: String(subjectId),
       })
+      // ep 是数据源侧集号（连播时会变），bep 才是条目侧的 Bangumi 集号
+      if (mainEpisode) params.set('bep', String(epSort))
       if (next) params.set('next', JSON.stringify(next))
       // 数据源详情页地址：连播链条在「URL 里没带下一集」时靠它重新取列表
       if (subjectUrl) params.set('surl', subjectUrl)
       window.location.assign(`/play?${params.toString()}`)
     },
-    [],
+    [subjectId],
   )
 
   /** 由数据源剧集列表构造「下一集」连播参数 */
@@ -159,6 +186,8 @@ export default function SubjectPage() {
       episodes: { name: string; playUrl: string; sortNum: number | null; sort: string }[],
       index: number,
       animeName: string,
+      /** 下一页对应的 Bangumi 集号；源站集号不能直接当条目进度用 */
+      nextBep?: number,
     ) => {
       const ep = episodes[index + 1]
       if (!ep) return null
@@ -168,14 +197,21 @@ export default function SubjectPage() {
         title: `${animeName} ${ep.name}`,
         anime: animeName,
         ep: String(ep.sortNum ?? ep.sort),
+        bep: nextBep != null ? String(nextBep) : undefined,
       }
     },
     [],
   )
 
-  /** 自动匹配：在数据源中搜番剧 → 取第一个命中 → 按集数选剧集 */
-  const autoMatch = useCallback(
-    async (sourceName: string, ep: BgmEpisode) => {
+  /**
+   * 在数据源中搜番剧 → 取最像的条目 → 取剧集。
+   * `auto=true` 自动选集并直接跳播放；`auto=false` 只把剧集列表交给用户手动选。
+   *
+   * 手动入口以前是带着空 play 参数跳播放页，那边没有解析逻辑，用户只看到
+   * 「等待视频地址」和一个手输框 —— 点了「手动」反而没有任何选集入口。
+   */
+  const matchSource = useCallback(
+    async (sourceName: string, ep: BgmEpisode, auto: boolean) => {
       if (!subject) return
       const animeName = subject.name_cn || subject.name
       const gen = ++matchGenRef.current
@@ -198,6 +234,26 @@ export default function SubjectPage() {
         const best = pickBestHit(hits, [subject.name_cn, subject.name]) ?? hits[0]
         const result = await api.sourceEpisodes(sourceName, best.url)
         if (!alive()) return
+        if (result.episodes.length === 0) {
+          setFlow((f) =>
+            f ? { ...f, matching: false, matchError: `数据源「${sourceName}」没有解析到剧集` } : f,
+          )
+          return
+        }
+        if (!auto) {
+          setFlow((f) =>
+            f
+              ? {
+                  ...f,
+                  matching: false,
+                  pickingEpisodes: result,
+                  matchedSource: sourceName,
+                  sourceSubjectUrl: best.url,
+                }
+              : f,
+          )
+          return
+        }
         const want = ep.sort ?? 1
         // 选集同理：优先「非番外」线路，并按条目的季号在同页多季里挑对那一路；
         // 点的剧集本身是 SP/OP/ED 时（type != 0）改为只认番外线路
@@ -218,14 +274,23 @@ export default function SubjectPage() {
             ? result.episodes.filter((e) => e.channel === matched.channel)
             : result.episodes
           const idx = chain.findIndex((e) => e.playUrl === matched.playUrl)
+          const nextSource = idx >= 0 ? chain[idx + 1] : undefined
+          // 只有源站集号与当前集连续时，才能确信下一页就是 Bangumi 的下一话。
+          const nextBep =
+            (ep.type ?? 0) === 0 &&
+            matched.sortNum != null &&
+            nextSource?.sortNum === matched.sortNum + 1
+              ? want + 1
+              : undefined
           goPlay(
             sourceName,
             matched.playUrl,
             animeName,
             want,
             matched.name,
-            nextOf(sourceName, chain, idx, animeName),
+            nextOf(sourceName, chain, idx, animeName, nextBep),
             best.url,
+            (ep.type ?? 0) === 0,
           )
           return
         }
@@ -240,7 +305,7 @@ export default function SubjectPage() {
         setFlow((f) => (f ? { ...f, matching: false, matchError: errMsg(e) } : f))
       }
     },
-    [subject, goPlay],
+    [subject, goPlay, nextOf],
   )
 
   if (error) return <div className="error-box">{error}</div>
@@ -299,7 +364,15 @@ export default function SubjectPage() {
 
       <h2 className="section-title">剧集列表</h2>
       {episodes.length === 0 && <div className="empty">该条目没有剧集信息（可能是电影/剧场版）</div>}
-      {enabledSources.length === 0 && episodes.length > 0 && (
+      {sourcesError && (
+        <div className="error-box">
+          数据源列表加载失败：{sourcesError}{' '}
+          <button className="btn btn-sm" onClick={() => setSourcesRetry((n) => n + 1)}>
+            重试
+          </button>
+        </div>
+      )}
+      {enabledSources.length === 0 && episodes.length > 0 && !sourcesError && (
         <div className="error-box">
           还没有启用的数据源。去{' '}
           <Link to="/sources" style={{ color: 'var(--accent)', textDecoration: 'underline' }}>
@@ -349,7 +422,15 @@ export default function SubjectPage() {
 
       {flow && (
         <div className="modal-mask" onClick={closeFlow}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="选择播放数据源"
+            tabIndex={-1}
+            ref={modalRef}
+            onClick={(e) => e.stopPropagation()}
+          >
             {flow.pickingSource && (
               <>
                 <h3>
@@ -365,24 +446,15 @@ export default function SubjectPage() {
                         </div>
                         <button
                           className="btn btn-sm"
-                          onClick={() => void autoMatch(s.arguments.name, flow.episode)}
+                          onClick={() => void matchSource(s.arguments.name, flow.episode, true)}
                         >
                           自动匹配
                         </button>
                         <button
                           className="btn btn-secondary btn-sm"
-                          onClick={() => {
-                            const params = new URLSearchParams({
-                              source: s.arguments.name,
-                              title: `${subject.name_cn || subject.name} ${flow.episode.name_cn || flow.episode.name}`,
-                              anime: subject.name_cn || subject.name,
-                              ep: String(flow.episode.sort ?? 1),
-                              subject: String(subjectId),
-                            })
-                            window.location.assign(`/play?${params.toString()}`)
-                          }}
+                          onClick={() => void matchSource(s.arguments.name, flow.episode, false)}
                         >
-                          手动
+                          手动选集
                         </button>
                       </div>
                     </div>
@@ -396,7 +468,16 @@ export default function SubjectPage() {
               </>
             )}
 
-            {flow.matching && <div className="loading">正在数据源中匹配…</div>}
+            {flow.matching && (
+              <>
+                <div className="loading">正在数据源中匹配…</div>
+                <div className="modal-actions">
+                  <button className="btn btn-secondary" onClick={closeFlow}>
+                    取消
+                  </button>
+                </div>
+              </>
+            )}
 
             {!flow.pickingSource && !flow.matching && flow.matchError && (
               <>
@@ -432,14 +513,23 @@ export default function SubjectPage() {
                         const flat = flow.pickingEpisodes?.episodes ?? []
                         const chain = ep.channel ? flat.filter((x) => x.channel === ep.channel) : flat
                         const at = chain.findIndex((x) => x.playUrl === ep.playUrl)
+                        const nextSource = at >= 0 ? chain[at + 1] : undefined
+                        const currentBep = flow.episode.sort ?? 1
+                        const nextBep =
+                          (flow.episode.type ?? 0) === 0 &&
+                          ep.sortNum != null &&
+                          nextSource?.sortNum === ep.sortNum + 1
+                            ? currentBep + 1
+                            : undefined
                         goPlay(
                           flow.matchedSource,
                           ep.playUrl,
                           subject.name_cn || subject.name,
-                          flow.episode.sort ?? 1,
+                          currentBep,
                           ep.name,
-                          nextOf(flow.matchedSource, chain, at, subject.name_cn || subject.name),
+                          nextOf(flow.matchedSource, chain, at, subject.name_cn || subject.name, nextBep),
                           flow.sourceSubjectUrl,
+                          (flow.episode.type ?? 0) === 0,
                         )
                       }}
                     >

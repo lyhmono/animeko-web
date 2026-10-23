@@ -251,9 +251,11 @@ CB=http://127.0.0.1:18095
 
 for pth in "//api/selector/sources" "/%61pi/selector/sources" "/api//selector/sources" "//api/data" "/%61pi/data" "//api/selector/subscriptions/preview" "//api/proxy?url=http://example.test/a.m3u8"; do
   code=$(curl -sS --path-as-is -o /dev/null -w '%{http_code}' -m 5 "$CB$pth")
+  # 只接受 401：404/405 既可能表示「路由被改名/删掉」，也可能表示门禁位置变了。
+  # 把它们当通过，等于只要路由不存在就永远绿。带凭据的正向对照仍在下面一条。
   case "$code" in
-    401|404|405) ok "$pth -> $code" ;;
-    *) bad "$pth 绕过了鉴权" "HTTP $code：$(curl -sS --path-as-is -m5 "$CB$pth" | head -c 120)" ;;
+    401) ok "$pth -> $code" ;;
+    *) bad "$pth 绕过了鉴权或路由不存在" "HTTP $code：$(curl -sS --path-as-is -m5 "$CB$pth" | head -c 120)" ;;
   esac
 done
 # 反面对照：归一化之后这些写法确实还是同一个接口，否则上面的 401 只是「没匹配上」

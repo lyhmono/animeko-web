@@ -1,5 +1,6 @@
 package com.animeko.web.proxy
 
+import com.animeko.web.http.UrlGuard
 import com.animeko.web.selector.SelectorEngine
 import java.net.URLEncoder
 
@@ -13,6 +14,9 @@ object HlsRewriter {
 
     private val uriAttrRegex = Regex("""URI="([^"]+)"""")
 
+    /** 改写结果：正文 + **实际改写出的**分片/密钥主机（供代理会话做主机绑定）。 */
+    data class RewriteResult(val body: String, val hosts: Set<String>)
+
     /**
      * @param sid 服务端会话号：UA/Referer/Cookie 存在 ProxySessionStore 里，
      *   分片地址只带这个号。清单能拉到、分片也必须能拉到（源站对分片同样做防盗链校验），
@@ -23,15 +27,30 @@ object HlsRewriter {
         playlistUrl: String,
         proxyPath: String = "/api/proxy",
         sid: String = "",
-    ): String {
+    ): String = rewriteDetailed(body, playlistUrl, proxyPath, sid).body
+
+    /**
+     * 与 [rewrite] 相同，但顺带返回真正被改写的 URI 主机。
+     *
+     * 不要再用正则回扫改写后的全文来登记主机：评论行里随便写一个
+     * `/api/proxy?url=...` 就能把任意主机加进会话白名单。主机必须来自
+     * 这里真正改写的那几条 URI。
+     */
+    fun rewriteDetailed(
+        body: String,
+        playlistUrl: String,
+        proxyPath: String = "/api/proxy",
+        sid: String = "",
+    ): RewriteResult {
+        val hosts = LinkedHashSet<String>()
         // 去掉开头的 BOM：U+FEFF 不是 isWhitespace，trim() 不会把它带走，
         // 于是 "\uFEFF#EXTM3U" 会被当成一行**分片地址**改写进代理，
         // 清单丢掉 #EXTM3U 头 → 播放器直接判定不是 m3u8（部分 Windows/国内打包站会带 BOM）
-        return body.removePrefix("\uFEFF").lines().joinToString("\n") { line ->
+        val rewritten = body.removePrefix("\uFEFF").lines().joinToString("\n") { line ->
             val t = line.trim()
             when {
                 t.isEmpty() -> line
-                t.startsWith("#") -> rewriteTagAttributes(line, playlistUrl, proxyPath, sid)
+                t.startsWith("#") -> rewriteTagAttributes(line, playlistUrl, proxyPath, sid, hosts)
                 else -> {
                     val abs = if (t.startsWith("http://") || t.startsWith("https://")) {
                         t
@@ -43,10 +62,16 @@ object HlsRewriter {
                     // 那种情况改写成 /api/proxy?url=seg.ts 会让代理直接 400 ——
                     // 每个分片都失败，还把原因藏进了一个看不懂的代理地址里。
                     // 原样透传至少让播放器自己去按清单地址解析一次。
-                    if (abs.startsWith("http")) proxyUrl(proxyPath, abs, sid) else t
+                    if (abs.startsWith("http")) {
+                        UrlGuard.hostOf(abs)?.let(hosts::add)
+                        proxyUrl(proxyPath, abs, sid)
+                    } else {
+                        t
+                    }
                 }
             }
         }
+        return RewriteResult(rewritten, hosts)
     }
 
     /** #EXT-X-KEY:METHOD=AES-128,URI="https://..." 等标签中的地址改写 */
@@ -55,6 +80,7 @@ object HlsRewriter {
         playlistUrl: String,
         proxyPath: String,
         sid: String,
+        hosts: MutableSet<String>,
     ): String =
         uriAttrRegex.replace(line) { m ->
             val url = m.groupValues[1]
@@ -67,7 +93,12 @@ object HlsRewriter {
             // 少了这一格，`URI="key%zz.bin"` 这类畸形密钥地址会被改写成
             // /api/proxy?url=key%zz.bin，而代理入口要求 url 必须以 http 开头 → 必然 400，
             // 症状是整条流黑屏且没有任何能看懂的错误。
-            if (!abs.startsWith("http")) m.value else """URI="${proxyUrl(proxyPath, abs, sid)}""""
+            if (!abs.startsWith("http")) {
+                m.value
+            } else {
+                UrlGuard.hostOf(abs)?.let(hosts::add)
+                """URI="${proxyUrl(proxyPath, abs, sid)}""""
+            }
         }
 
     fun proxyUrl(proxyPath: String, url: String, sid: String = ""): String {

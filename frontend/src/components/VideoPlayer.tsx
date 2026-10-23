@@ -24,6 +24,13 @@ interface Props {
   /** 加载后一次性定位到的秒数（断点续播） */
   startAt?: number
   /**
+   * 有历史进度时先不要自动开播：等用户在续播条上做出选择，
+   * 否则自动播放从 0 开始，第一个 timeupdate 就把服务器上的续播点覆盖成 0。
+   */
+  resumeGate?: boolean
+  /** 自增表示“用户已经做出续播选择，现在可以开始播放” */
+  playRequest?: number
+  /**
    * 当前这一集的稳定标识（源 + 播放页地址）。同一集换 CDN/重解析时不变，
    * 换手动地址或换集时变化 —— 只有前者需要沿用当前的播放位置。
    */
@@ -69,6 +76,8 @@ function formatTime(seconds: number): string {
 function isTypingTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false
   const tag = target.tagName
+  // range 滑条不是文字输入：点过进度/音量后空格/K/M/F 仍应生效（方向键留给滑条）
+  if (tag === 'INPUT' && (target as HTMLInputElement).type === 'range') return false
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable
 }
 
@@ -99,6 +108,8 @@ export default function VideoPlayer({
   src,
   fallbackSrc,
   startAt,
+  resumeGate = false,
+  playRequest = 0,
   playKey = '',
   fullscreenTarget,
   theater = false,
@@ -155,14 +166,11 @@ export default function VideoPlayer({
   /** 事件回调只绑一次，回退状态要经 ref 读取最新值（同上面几个回调的理由） */
   const fallbackSrcRef = useRef(fallbackSrc)
   const useFallbackRef = useRef(false)
-  useEffect(() => {
-    onErrorRef.current = onError
-    onProgressRef.current = onProgress
-    onEndedRef.current = onEnded
-    fullscreenTargetRef.current = fullscreenTarget
-    fallbackSrcRef.current = fallbackSrc
-    useFallbackRef.current = useFallback
-  })
+  const activeSrcRef = useRef(src)
+  /** 当前源是否交给 hls.js：原生 video 的 error 没有 HTTP 状态，需要单独判定代理会话过期 */
+  const hlsActiveRef = useRef(false)
+  const mediaRecoveredRef = useRef(false)
+  const resumeGateRef = useRef(resumeGate)
 
   /**
    * 直连优先：主地址失败（防盗链、CORS、网络）时切到服务端中转，只切一次。
@@ -176,6 +184,19 @@ export default function VideoPlayer({
     if (useFallback) setUseFallback(false)
   }
   const activeSrc = useFallback && fallbackSrc ? fallbackSrc : src
+
+  // 事件回调与“当前源/是否等待续播选择”只绑一次，经 ref 读取最新值。
+  // 放在 activeSrc 声明之后：activeSrc 是 render 阶段的派生值，ref 必须跟着最新一次渲染走。
+  useEffect(() => {
+    onErrorRef.current = onError
+    onProgressRef.current = onProgress
+    onEndedRef.current = onEnded
+    fullscreenTargetRef.current = fullscreenTarget
+    fallbackSrcRef.current = fallbackSrc
+    useFallbackRef.current = useFallback
+    activeSrcRef.current = activeSrc
+    resumeGateRef.current = resumeGate
+  })
 
   // 加载源
   const startAtAppliedRef = useRef(false)
@@ -193,6 +214,8 @@ export default function VideoPlayer({
     if (!video || !activeSrc) return
     loadedPlayKeyRef.current = playKey
     let hls: Hls | null = null
+    hlsActiveRef.current = false
+    mediaRecoveredRef.current = false
     setError(null)
     // 换源（切集）后要重新允许定位一次，否则第二集的断点续播永远不生效
     startAtAppliedRef.current = false
@@ -208,12 +231,22 @@ export default function VideoPlayer({
       video.src = activeSrc
     } else if (Hls.isSupported()) {
       hls = new Hls({ enableWorker: true, fragLoadingTimeOut: 30000 })
+      hlsActiveRef.current = true
       hls.loadSource(activeSrc)
       hls.attachMedia(video)
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (!data.fatal) return
-        // 直连的清单拿不到（CORS/防盗链）：先悄悄换成服务端中转，这不算最终失败
-        if (!useFallback && fallbackSrc) {
+        // 解码/缓冲类的 MEDIA_ERROR 先尝试 hls.js 自己的恢复；直接切代理对这类错误无效。
+        // 只给一次机会，避免不可恢复的源把播放器钉在恢复循环里。
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !mediaRecoveredRef.current) {
+          mediaRecoveredRef.current = true
+          hls?.recoverMediaError()
+          return
+        }
+        // 直连的清单拿不到（CORS/防盗链）：先悄悄换成服务端中转，这不算最终失败。
+        // 只有“备用地址确实不同”才值得切：关闭直连时 src === fallbackSrc，
+        // 再切一次 activeSrc 不变，effect 不会重跑，错误就会被静默吞掉。
+        if (!useFallback && fallbackSrc && fallbackSrc !== activeSrc) {
           setUseFallback(true)
           return
         }
@@ -242,6 +275,7 @@ export default function VideoPlayer({
         const at = video.currentTime
         if (Number.isFinite(at) && at > 0) resumeAtRef.current = at
       }
+      hlsActiveRef.current = false
       hls?.destroy()
       video.removeAttribute('src')
       video.load()
@@ -269,6 +303,17 @@ export default function VideoPlayer({
     video.addEventListener('loadedmetadata', apply)
     return () => video.removeEventListener('loadedmetadata', apply)
   }, [startAt, activeSrc])
+
+  // 用户在续播条上做出选择后开始播放。此时 resumeGate 已经放开，
+  // 但 canplay 早就过了，不会自己再触发一次自动开播。
+  useEffect(() => {
+    if (!playRequest) return
+    const video = videoRef.current
+    if (!video) return
+    autoplayTriedRef.current = true
+    setAutoplayBlocked(false)
+    void video.play().catch(() => setAutoplayBlocked(true))
+  }, [playRequest])
 
   // 同一集换源（直连→中转、410 重解析）要续上当前位置，靠 playKey 区分：
   // 它不变说明还是这一集，变了（手动换地址/换集）就不能沿用上一段的位置。
@@ -334,9 +379,10 @@ export default function VideoPlayer({
     if (!video) return
     const onTime = () => {
       setCurrent(video.currentTime)
-      onProgressRef.current?.(video.currentTime, video.duration || 0)
+      const total = Number.isFinite(video.duration) ? video.duration : 0
+      onProgressRef.current?.(video.currentTime, total)
     }
-    const onMeta = () => setDuration(video.duration || 0)
+    const onMeta = () => setDuration(Number.isFinite(video.duration) ? video.duration : 0)
     const onPlay = () => {
       setPlaying(true)
       setAutoplayBlocked(false)
@@ -351,6 +397,8 @@ export default function VideoPlayer({
       const v = videoRef.current
       // 没有 src（hls.js 还没 attach 上）时不记「已尝试」，否则这一次空转会吃掉整集的自动开播
       if (!v || autoplayTriedRef.current || !v.src) return
+      // 有历史进度时等用户选「继续/从头」：自动从 0 播会把续播点覆盖掉
+      if (resumeGateRef.current) return
       autoplayTriedRef.current = true
       // 断点续播的定位与这里并行没问题：currentTime 在播放中同样可以赋值
       v.play().catch(() => setAutoplayBlocked(true))
@@ -367,14 +415,28 @@ export default function VideoPlayer({
     const onMediaError = () => {
       // 没有 error 对象的 error 事件是切源/卸载清理时补发的，别当成播放失败
       if (!video.error) return
-      // 直连被源站拒绝（403/404/CORS）：先切服务端中转再试一次
-      if (!useFallbackRef.current && fallbackSrcRef.current) {
+      // 直连被源站拒绝（403/404/CORS）：先切服务端中转再试一次。
+      // fallback 与当前源相同时（关闭直连/混合内容）不能切：切了也不会触发重新加载，
+      // 只会吞掉错误，最后表现为黑屏且没有任何提示。
+      if (!useFallbackRef.current &&
+        fallbackSrcRef.current &&
+        fallbackSrcRef.current !== activeSrcRef.current
+      ) {
         setUseFallback(true)
         setError(null)
         return
       }
       const code = video.error.code
       const msg = `视频加载失败（MEDIA_ERROR_${code}），源站可能拒绝了代理请求，可尝试下方手动地址播放`
+      // 原生 <video> 的 error 只有 MediaError，没有 HTTP 状态；当前是代理地址时
+      // 最常见的原因是播放会话过期（410）。交给上层按 410 重新解析一次
+      // （PlayerPage 用 retriedKeyRef 限次），否则 mp4/ iOS 原生 HLS 永远只能手贴地址。
+      // hls.js 分支自己会带 data.response.code，不走这个猜测。
+      if (!hlsActiveRef.current && activeSrcRef.current.includes('/api/proxy?')) {
+        setError('播放会话可能已过期，正在重新解析地址…')
+        onErrorRef.current?.(msg, 410)
+        return
+      }
       setError(msg)
       onErrorRef.current?.(msg)
     }
@@ -653,13 +715,15 @@ export default function VideoPlayer({
     } else if (g.mode === 'brightness') {
       // 从起始快照算：上滑（dy<0）提亮，量程 300px 对应满幅
       const level = Math.round((g.startBrightness - g.dy / 300) * 100) / 100
-      applyBrightness(level)
-      showToast({ kind: 'brightness', text: `亮度 ${Math.round(level * 100)}%`, level: Math.min(1, level / 1.5) })
+      const clamped = Math.min(1.5, Math.max(0.3, level))
+      applyBrightness(clamped)
+      showToast({ kind: 'brightness', text: `亮度 ${Math.round(clamped * 100)}%`, level: Math.min(1, clamped / 1.5) })
     } else {
       const next = Math.round((g.startVolume - g.dy / 300) * 100) / 100
-      setVolume(Math.min(1, Math.max(0, next)))
-      setMuted(next <= 0)
-      showToast({ kind: 'volume', text: `音量 ${Math.round(next * 100)}%`, level: next })
+      const clamped = Math.min(1, Math.max(0, next))
+      setVolume(clamped)
+      setMuted(clamped <= 0)
+      showToast({ kind: 'volume', text: `音量 ${Math.round(clamped * 100)}%`, level: clamped })
     }
   }
 

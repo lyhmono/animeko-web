@@ -5,11 +5,10 @@ services:
     container_name: animeko-web
     restart: unless-stopped
     ports:
-      # 直接对外（只在本机或已有反代/防火墙兜底时用）
-      - "8080:8080"
-      # 更稳妥的姿势：只绑本机回环，访问时用 SSH 隧道
+      # 默认只绑本机回环，访问时用 SSH 隧道：
       #   ssh -N -L 8080:127.0.0.1:8080 user@your-vps
-      # - "127.0.0.1:8080:8080"
+      # 确认已有反代鉴权/防火墙兜底后，才改成 "8080:8080" 直接对外。
+      - "127.0.0.1:8080:8080"
     volumes:
       # 数据源配置 + 个人数据（收藏/进度）持久化（删除容器不丢）。
       # 容器进程以 app 用户（uid 10001）运行，入口脚本会把卷属主改给它；
@@ -41,11 +40,13 @@ services:
       # - ANIMEKO_TRUSTED_PROXY_HOPS=1
       # ---- Bangumi API（默认官方+社区镜像故障转移，可自定义）----
       # - ANIMEKO_BANGUMI_BASE_URLS=https://api.bgm.tv,https://bgmapi.anibt.net
-      # ---- 开机自动导入聚合订阅，省掉每次去界面里勾选 ----
+      # ---- 开机自动导入聚合订阅（可选，默认关闭）----
+      # 这是把第三方选择器配置直接装进服务，是否启用应由你明确决定；
+      # 默认不打开，避免一份被篡改的社区订阅在首次启动时就进入实例。
       # 逗号分隔可写多个地址。只覆盖同名源，不会删你手动加的源；
       # 你在界面上「关掉」的源会保持关闭（重启不会偷偷给你打开）。
       # 导入跑在后台协程里：订阅站挂了或很慢都不影响启动与端口监听。
-      - ANIMEKO_SUBSCRIPTION_AUTO_IMPORT=https://sub.creamycake.org/v1/css1.json
+      # - ANIMEKO_SUBSCRIPTION_AUTO_IMPORT=https://sub.creamycake.org/v1/css1.json
       # 只要某几个分级（tier 越低质量越好）。境外 VPS 上高 tier 常是 JS 加密源
       # 或只对国内 IP 开放的 CDN，导进来只会让每次搜索多打几个死站。留空 = 全导。
       # - ANIMEKO_SUBSCRIPTION_AUTO_TIERS=0,1

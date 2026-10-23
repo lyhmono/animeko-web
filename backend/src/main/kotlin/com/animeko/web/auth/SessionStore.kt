@@ -147,8 +147,19 @@ class LoginRateLimiter(
     /** 当前记账的客户端数量（只用于验证它有上界）。 */
     val trackedClients: Int get() = buckets.size
 
-    /** Retry-After 用：固定窗口剩余时间不会超过 windowMs。 */
+    /** Retry-After 用：固定窗口长度的上界（没有 bucket 时的兜底）。 */
     fun windowSeconds(): Long = (windowMs / 1000).coerceAtLeast(1)
+
+    /**
+     * Retry-After 的真实剩余秒数。旧实现固定回 300，哪怕只剩 1 秒也让客户端等满 5 分钟。
+     * 向上取整，最少 1 秒。
+     */
+    fun retryAfterSeconds(key: String): Long {
+        val bucket = buckets[key] ?: return windowSeconds()
+        val remainingMs = bucket.windowStart + windowMs - now()
+        if (remainingMs <= 0) return 1
+        return ((remainingMs + 999) / 1000).coerceAtLeast(1)
+    }
 
     private companion object {
         private const val DEFAULT_MAX_ATTEMPTS = 8

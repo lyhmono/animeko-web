@@ -38,11 +38,12 @@ jobs:
             echo "::error::package-lock.json 绑定了第三方 registry：${hosts:-<空>}（镜像抖动会直接让部署失败）"
             exit 1
           fi
-      - name: Frontend typecheck + build
+      - name: Frontend typecheck + build + unit tests
         working-directory: frontend
         run: |
           npm ci
           npm run build
+          npm run test
 
   # 镜像能构建 + 能启动，才算「部署没问题」。
   # 单独加这一步的理由：backend/frontend 两个 job 验的是源码，而用户真正跑的是
@@ -71,11 +72,11 @@ jobs:
       - name: Smoke test (container + frontend assets)
         run: |
           set -euo pipefail
-          # /data 用 tmpfs 并指定 uid/gid：entrypoint 会 chown 后降权到 app(10001)，
-          # 这样能同时验证「非 root 用户可写数据目录」
+          # /data 用 root 属主的 tmpfs：让 entrypoint 的 chown 真正有活干。
+          # 若这里预置 uid=10001，后面的属主断言即使 entrypoint 的 chown 被删掉也会通过。
           docker run -d --name animeko-ci \
             -p 18080:8080 \
-            --tmpfs /data:rw,uid=10001,gid=10001 \
+            --tmpfs /data:rw \
             animeko-web:ci
 
           for i in $(seq 1 60); do
@@ -183,6 +184,77 @@ jobs:
           curl -fsS http://127.0.0.1:18080/sw.js -o /tmp/sw.js
           grep -q 'animeko-shell' /tmp/sw.js || { echo "::error::sw.js 内容不对"; exit 1; }
           echo "PWA assets OK"
+
+      - name: HTTP gate smoke (auth + conditional write)
+        # 真实容器上验证环境变量接线与 HTTP 语义。完整 live-smoke 仍依赖外部社区订阅，
+        # 不作为 CI 门禁；这里覆盖最容易静默坏掉的三件事：鉴权门控、If-Match/409、
+        # 注销后会话不可复用，另外补一条 //api 归一化与缺失静态资源 404。
+        run: |
+          set -euo pipefail
+          docker run -d --name animeko-ci-auth \
+            -p 18081:8080 \
+            --tmpfs /data:rw \
+            -e ANIMEKO_AUTH_USER=ci \
+            -e ANIMEKO_AUTH_PASSWORD=ci-pass \
+            animeko-web:ci
+          trap 'docker logs animeko-ci-auth || true; docker rm -f animeko-ci-auth || true' EXIT
+
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:18081/api/health >/tmp/auth-health.json 2>/dev/null; then
+              break
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' animeko-ci-auth)" != "true" ]; then
+              echo "::error::鉴权容器启动后退出了"; docker logs animeko-ci-auth; exit 1
+            fi
+            if [ "$i" = "60" ]; then
+              echo "::error::60 秒内 /api/health 没有就绪"; docker logs animeko-ci-auth; exit 1
+            fi
+            sleep 1
+          done
+          cat /tmp/auth-health.json
+          grep -q '"authEnabled":true' /tmp/auth-health.json
+
+          expect_status() { # expected label method path [extra curl args...]
+            local expected=$1 label=$2; shift 2
+            local code
+            code=$(curl -sS -o /tmp/auth-body -w '%{http_code}' "$@")
+            if [ "$code" != "$expected" ]; then
+              echo "::error::$label: 期望 $expected，实际 $code"
+              cat /tmp/auth-body; exit 1
+            fi
+            echo "ok: $label -> $code"
+          }
+
+          expect_status 401 "未登录取个人数据" http://127.0.0.1:18081/api/data
+          expect_status 401 "路径归一化后仍未登录" --path-as-is http://127.0.0.1:18081//api/data
+          expect_status 404 "缺失静态资源" http://127.0.0.1:18081/assets/definitely-missing-42.js
+
+          LOGIN=$(curl -sS -c /tmp/auth.jar -X POST \
+            -H 'Origin: http://127.0.0.1:18081' \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"ci","password":"ci-pass"}' \
+            http://127.0.0.1:18081/api/session/login)
+          echo "$LOGIN" | grep -q '"authenticated":true'
+
+          HDR=$(curl -sS -b /tmp/auth.jar -D - -o /tmp/auth-data.json http://127.0.0.1:18081/api/data)
+          ETAG=$(printf '%s' "$HDR" | tr -d '\r' | awk -F': ' 'tolower($1)=="etag"{print $2}' | tr -d '\n')
+          [ -n "$ETAG" ] || { echo "::error::GET /api/data 没给 ETag"; exit 1; }
+
+          expect_status 200 "带当前 ETag 的条件写" -b /tmp/auth.jar -X PUT \
+            -H 'Content-Type: application/json' -H "If-Match: $ETAG" \
+            -d '{"favorites":[{"id":1}]}' http://127.0.0.1:18081/api/data
+          HDR2=$(curl -sS -b /tmp/auth.jar -D - -o /dev/null http://127.0.0.1:18081/api/data)
+          ETAG2=$(printf '%s' "$HDR2" | tr -d '\r' | awk -F': ' 'tolower($1)=="etag"{print $2}' | tr -d '\n')
+          [ -n "$ETAG2" ] && [ "$ETAG2" != "$ETAG" ] || { echo "::error::写入后 ETag 没前进"; exit 1; }
+
+          expect_status 409 "旧 ETag 覆盖被拒" -b /tmp/auth.jar -X PUT \
+            -H 'Content-Type: application/json' -H "If-Match: $ETAG" \
+            -d '{"favorites":[]}' http://127.0.0.1:18081/api/data
+          grep -q 'DATA_STALE' /tmp/auth-body
+
+          expect_status 200 "注销" -b /tmp/auth.jar -X POST http://127.0.0.1:18081/api/session/logout
+          expect_status 401 "注销后旧 Cookie 不可复用" -b /tmp/auth.jar http://127.0.0.1:18081/api/data
+          echo "auth/If-Match/static smoke OK"
 
       - name: Playwright smoke (real browser)
         # 复用上面那个还在跑的容器：镜像是同一个，不用重建。

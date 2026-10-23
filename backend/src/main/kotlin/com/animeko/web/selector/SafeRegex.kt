@@ -24,6 +24,20 @@ object SafeRegex {
 
     private class BudgetExceeded : RuntimeException()
 
+    /**
+     * 一次解析共享的字符预算。
+     *
+     * 每次 `contains` 都新建预算的话，一份页面里的 N 条候选 URL 就有 N 份 2M 的额度；
+     * 恶意页面可以塞几千条 4KB 的候选，每条都烧满预算，单次解析在 CPU 上停几十秒。
+     * 调用方在一次解析开始时创建一个 Budget，让所有候选一起花这笔钱。
+     * 非线程安全：只在单个请求/解析内使用。
+     */
+    class Budget(maxChecks: Int = MAX_CHECKS) {
+        internal val remaining = intArrayOf(maxChecks)
+
+        val exhausted: Boolean get() = remaining[0] <= 0
+    }
+
     private class BudgetedText(
         private val text: CharSequence,
         private val remaining: IntArray,
@@ -45,15 +59,26 @@ object SafeRegex {
     fun compile(pattern: String): Pattern? = runCatching { Pattern.compile(pattern) }.getOrNull()
 
     /** 等价于 `pattern.matcher(text).find()`，但回溯超出预算时按「没命中」返回 */
-    fun contains(pattern: Pattern, text: String, maxChecks: Int = MAX_CHECKS): Boolean = try {
-        pattern.matcher(BudgetedText(text, intArrayOf(maxChecks))).find()
+    fun contains(
+        pattern: Pattern,
+        text: String,
+        maxChecks: Int = MAX_CHECKS,
+        budget: Budget? = null,
+    ): Boolean = try {
+        pattern.matcher(BudgetedText(text, budget?.remaining ?: intArrayOf(maxChecks))).find()
     } catch (e: BudgetExceeded) {
         false
     }
 
     /** 取命名组的值；没匹配、组不存在或超出预算都返回 null */
-    fun group(pattern: Pattern, text: String, group: String, maxChecks: Int = MAX_CHECKS): String? = try {
-        val matcher = pattern.matcher(BudgetedText(text, intArrayOf(maxChecks)))
+    fun group(
+        pattern: Pattern,
+        text: String,
+        group: String,
+        maxChecks: Int = MAX_CHECKS,
+        budget: Budget? = null,
+    ): String? = try {
+        val matcher = pattern.matcher(BudgetedText(text, budget?.remaining ?: intArrayOf(maxChecks)))
         if (!matcher.find()) null else runCatching { matcher.group(group) }.getOrNull()
     } catch (e: BudgetExceeded) {
         null
@@ -64,8 +89,8 @@ object SafeRegex {
      * 线路名格式的语义是「匹配不上就丢掉这条元素，匹配上但取不出 ch 就用全文」，
      * 两种 null 不能混为一谈。
      *
-     * 预算耗尽也退回 [fallback]：如果这里返回 null，调用方的 `mapNotNull`
-     * 会把这条线路整个丢掉，后面 `lists.zip(channelNames)` 整体错位 ——
+     * 预算耗尽也退回 [fallback]：如果这里返回 null，调用方按线路下标对齐时
+     * 会以为这条线路不存在，后面整组剧集被挂到别的线路名下 ——
      * 正则没跑完就变成「A 线路的剧集挂到 B 线路名下」，比少一个线路名糟得多。
      */
     fun groupOrText(
@@ -74,8 +99,9 @@ object SafeRegex {
         group: String,
         fallback: String,
         maxChecks: Int = MAX_CHECKS,
+        budget: Budget? = null,
     ): String? = try {
-        val matcher = pattern.matcher(BudgetedText(text, intArrayOf(maxChecks)))
+        val matcher = pattern.matcher(BudgetedText(text, budget?.remaining ?: intArrayOf(maxChecks)))
         if (!matcher.find()) null
         else runCatching { matcher.group(group) }.getOrNull()?.trim()?.takeIf { it.isNotBlank() } ?: fallback
     } catch (e: BudgetExceeded) {

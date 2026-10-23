@@ -183,7 +183,10 @@ fun Application.configureApiRoutes(
                     // 限速期间连「猜对了没有」都不回答：不下发质询（那会勾起浏览器反复弹窗），
                     // 也不给 401（401 与 403 的区别就是一个 yes/no 预言机）
                     AuthResult.Throttled -> {
-                        call.response.header(HttpHeaders.RetryAfter, limiter.windowSeconds().toString())
+                        call.response.header(
+                            HttpHeaders.RetryAfter,
+                            limiter.retryAfterSeconds(call.rateLimitKey(cfg)).toString(),
+                        )
                         call.respond(
                             HttpStatusCode.TooManyRequests,
                             mapOf("error" to "凭据校验失败次数过多，请稍后再试"),
@@ -260,7 +263,10 @@ fun Application.configureApiRoutes(
                 )
                 !credentialsMatch(cfg, username, password) -> {
                     if (limiter.blocked(clientKey)) {
-                        call.response.header(HttpHeaders.RetryAfter, limiter.windowSeconds().toString())
+                        call.response.header(
+                            HttpHeaders.RetryAfter,
+                            limiter.retryAfterSeconds(clientKey).toString(),
+                        )
                         call.respond(
                             HttpStatusCode.TooManyRequests,
                             mapOf("error" to "失败次数过多，请稍后再试"),
@@ -591,21 +597,29 @@ fun Application.configureStaticFrontend(cfg: AppConfig) {
             val rel = path.removePrefix("/")
             val index = File(dir, "index.html")
             val file = if (rel.isEmpty()) index else dir.resolve(rel).normalize()
+            // 缓存策略必须按**归一化后的**路径判断：`/assets/../index.html` 的原始 rel
+            // 以 assets/ 开头，但实际文件是 index.html，不能给它 immutable。
+            val normalizedRel = if (file == index) {
+                "index.html"
+            } else {
+                file.relativeTo(dir).path.replace(File.separatorChar, '/')
+            }
             when {
                 file.isFile && file.startsWith(dir) -> {
                     when {
                         // 带内容哈希的产物可以长期强缓存
-                        rel.startsWith("assets/") ->
+                        normalizedRel.startsWith("assets/") ->
                             call.response.header(HttpHeaders.CacheControl, "public, max-age=31536000, immutable")
                         // 入口文档（含直接访问 /index.html）必须每次回源：
                         // 缓存住它就等于缓存住一批重新部署后已不存在的 chunk 文件名。
                         // sw.js 同理、且更要紧：浏览器发现 SW 文件有变化才会装新版本，
                         // 而它判断依据是响应本身 —— 缓存住就等于让更新永远装不上。
                         // manifest 一起带上，改图标/改名后要能立刻生效。
-                        file == index || rel == "sw.js" || rel == "manifest.webmanifest" ->
+                        normalizedRel == "index.html" || normalizedRel == "sw.js" ||
+                            normalizedRel == "manifest.webmanifest" ->
                             call.response.header(HttpHeaders.CacheControl, "no-cache")
                     }
-                    if (rel == "manifest.webmanifest") {
+                    if (normalizedRel == "manifest.webmanifest") {
                         // Ktor 的扩展名映射不认识 .webmanifest，会落到 octet-stream，
                         // 部分浏览器会因此直接忽略这份 manifest。显式给正确类型。
                         // 用 respondBytes 而不是 LocalFileContent：后者在这个 Ktor
@@ -635,8 +649,18 @@ fun Application.configureStaticFrontend(cfg: AppConfig) {
 
 private val assetExtensionRegex = Regex("""\.[A-Za-z0-9]{1,8}$""")
 
+/**
+ * 缺失的静态资源要 404，不能回退成 index.html（那会让浏览器把 HTML 当 JS/CSS）。
+ *
+ * 判据只认两种：`/assets/` 下的构建产物，以及**根目录**带扩展名的文件。
+ * 不能用「路径最后一段带扩展名」：数据源名本身可以带点（`Anime1.me`、`xx.720p`），
+ * `/source/Anime1.me` 是 SPA 路由，按扩展名判会把它 404 掉 —— 站内跳转正常、
+ * 一刷新或分享链接就变成 404。SPA 路由不会出现在根目录，这样既保住白屏防线，
+ * 也不误伤带点的路由参数。
+ */
 private fun looksLikeAsset(rel: String): Boolean =
-    assetExtensionRegex.containsMatchIn(rel.substringAfterLast('/', rel))
+    rel.startsWith("assets/") ||
+        (!rel.contains('/') && assetExtensionRegex.containsMatchIn(rel))
 
 // ---- 鉴权 ----
 
@@ -663,8 +687,18 @@ private fun ApplicationCall.rateLimitKey(cfg: AppConfig): String {
     return if (looksLikeIpLiteral(candidate)) candidate else remote
 }
 
-private fun looksLikeIpLiteral(value: String): Boolean =
-    value.contains(':') || value.matches(Regex("""\d{1,3}(\.\d{1,3}){3}"""))
+private fun looksLikeIpLiteral(value: String): Boolean {
+    // 旧实现只判断「含冒号」，`abc:def` 也会被当成 IP 进入限速键空间。
+    // 这里做字面校验、不解析 DNS：XFF 是自由文本，解析域名会变成出站请求。
+    if (value.contains(':')) {
+        return value.count { it == ':' } >= 2 &&
+            value.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' || it == ':' }
+    }
+    val parts = value.split('.')
+    return parts.size == 4 && parts.all { part ->
+        part.length in 1..3 && part.all { it.isDigit() } && part.toInt() in 0..255
+    }
+}
 
 /**
  * 浏览器总会带上 Origin（同源的 fetch/表单也是），所以拿它与「这个请求被送到哪个主机」
@@ -910,7 +944,9 @@ private fun ApplicationResponse.clearSessionCookie(cfg: AppConfig) {
             HttpHeaders.SetCookie,
             buildString {
                 append(name).append("=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
-                if (cfg.cookieSecure) append("; Secure")
+                // __Host- 前缀强制要求 Secure：降级到 cookieSecure=false 后，若清理头不带
+                // Secure，浏览器会拒绝这条 Set-Cookie，旧会话 Cookie 就永远删不掉。
+                if (cfg.cookieSecure || name == HOST_PREFIXED_COOKIE) append("; Secure")
             },
         )
     }
@@ -929,6 +965,10 @@ private suspend fun proxyVideo(
     cfg: AppConfig,
     sessions: ProxySessionStore,
 ) {
+    // 代理会把上游内容原样吐在同源下。CSP sandbox 只在「把代理地址当文档打开」时
+    // 生效（媒体/图片子资源不受影响），可以挡住上游 HTML/JS 在站点源下执行；
+    // 对 HTML/SVG/JS 再加 nosniff，避免浏览器按内容猜成脚本。
+    call.response.header("Content-Security-Policy", "sandbox")
     // Ktor 已经解码过查询参数，不能再 URLDecoder 一次：
     // 带签名/令牌的地址几乎都含 % 和 +，二次解码会把 ?sign=a%2Bb 变成 ?sign=a b，
     // 表现为「解析成功但播放/清单 404」，且日志里看不出原因。
@@ -999,6 +1039,14 @@ private suspend fun proxyVideo(
     }
 
     val contentType = result.contentType
+    if (contentType?.let {
+            it.contains("html", ignoreCase = true) ||
+                it.contains("svg", ignoreCase = true) ||
+                it.contains("javascript", ignoreCase = true)
+        } == true
+    ) {
+        call.response.header("X-Content-Type-Options", "nosniff")
+    }
     val isHls = url.contains(".m3u8", ignoreCase = true) ||
         contentType?.contains("mpegurl", ignoreCase = true) == true
 
@@ -1008,11 +1056,12 @@ private suspend fun proxyVideo(
         // 只有 2xx 才改写。以前无论上游回什么都 respondText(...)，而它默认 200：
         // 源站一个 403 防盗链页会被包装成「一份合法的 m3u8 清单」发回播放器，
         // hls.js 既不会报错也不会切下一条线路/下一个源，用户只看到「加载中」然后黑屏。
-        val body = if (upstreamOk) HlsRewriter.rewrite(text, url, sid = sid) else text
-        if (upstreamOk) {
-            // 分片与密钥常在另一个主机（清单域 vs CDN 域）：由服务端从清单内容里登记，
-            // 客户端无法自行扩大允许范围
-            sessions.allowPlaylistHosts(sid, body)
+        val rewritten = if (upstreamOk) HlsRewriter.rewriteDetailed(text, url, sid = sid) else null
+        val body = rewritten?.body ?: text
+        if (rewritten != null) {
+            // 分片与密钥常在另一个主机（清单域 vs CDN 域）：只登记**这次真正改写出的**
+            // URI 主机，不由客户端、也不由评论行里的任意字符串扩大范围。
+            sessions.allowHosts(sid, rewritten.hosts)
         }
         val outType = if (upstreamOk) {
             ContentType.parse("application/vnd.apple.mpegurl")
@@ -1026,8 +1075,14 @@ private suspend fun proxyVideo(
     }
 
     if (result.status in 301..399) {
-        // 重定向次数用尽仍是 3xx：把 Location 透传给播放器自己续跳，而不是回一个无法跟随的裸 3xx
-        result.header("location")?.let { call.response.header(HttpHeaders.Location, it) }
+        // 跳转次数用尽后如果还有有效 Location，不能再把它交给浏览器：
+        // 这一跳从未经过 UrlGuard 校验，等于让页面替服务器去访问一个未验证的地址
+        // （浏览器侧的内网探测、混合内容等）。没有 Location（或只有空白值）的 3xx
+        // 仍原样透传——不能把「上游没给跳转目标」误报成「重定向超过 5 跳」。
+        if (!result.header("location").isNullOrBlank()) {
+            runCatching { result.body.close() }
+            throw UpstreamException("上游重定向次数过多（超过 $MAX_REDIRECTS 跳）")
+        }
     }
     val status = runCatching { HttpStatusCode.fromValue(result.status) }.getOrDefault(HttpStatusCode.BadGateway)
     result.header("content-range")?.let { call.response.header("Content-Range", it) }

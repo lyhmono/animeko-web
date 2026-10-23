@@ -1,10 +1,13 @@
 package com.animeko.web.http
 
 import com.sun.net.httpserver.HttpServer
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 
 /**
  * 出站客户端的重定向策略。
@@ -39,6 +42,16 @@ class HttpRedirectPolicyTest {
                 val body = "internal-secret".toByteArray()
                 ex.sendResponseHeaders(200, body.size.toLong())
                 ex.responseBody.use { it.write(body) }
+            }
+            b.createContext("/big") { ex ->
+                val chunk = ByteArray(64 * 1024) { 'x'.code.toByte() }
+                try {
+                    ex.sendResponseHeaders(200, (chunk.size * 4).toLong())
+                    ex.responseBody.use { out -> repeat(4) { out.write(chunk) } }
+                } catch (_: IOException) {
+                    // 客户端在达到上限后主动断开，服务端写失败是预期行为
+                }
+                ex.close()
             }
             a.start(); b.start()
         }
@@ -78,6 +91,32 @@ class HttpRedirectPolicyTest {
      * 而代理那条调用点（ApiRoutes 的 fetchStream）现在由 ProxyRouteTest 的
      * `same host redirect keeps cookie...` 里那句「每一跳都必须自己发起」看着。
      */
+    @Test
+    fun `fetchStream defaults to not following redirects`() = kotlinx.coroutines.runBlocking {
+        Pair().use { p ->
+            val resp = JdkFetcher(timeoutMs = 3000).fetchStream(p.start)
+            try {
+                assertEquals(302, resp.status, "视频代理的流式请求必须把跳转交回调用方逐跳校验")
+                assertEquals(0, p.hits.get(), "fetchStream 自动跟随了重定向")
+            } finally {
+                resp.body.close()
+            }
+        }
+    }
+
+    @Test
+    fun `fetchBounded aborts as soon as the byte cap is exceeded`() = kotlinx.coroutines.runBlocking {
+        Pair().use { p ->
+            val e = assertFailsWith<UpstreamException> {
+                JdkFetcher(timeoutMs = 3000).fetchBounded(
+                    "http://127.0.0.1:${p.targetPort}/big",
+                    maxBytes = 1024,
+                )
+            }
+            assertTrue(e.message.orEmpty().contains("上限"), e.message.orEmpty())
+        }
+    }
+
     @Test
     fun `default fetch does follow, so call sites must opt out`() = kotlinx.coroutines.runBlocking {
         Pair().use { p ->

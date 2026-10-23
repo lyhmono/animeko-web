@@ -27,13 +27,41 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * API 请求的总超时。Bangumi 后端超时是 45 秒，前端留出余量；
+ * 没有它，一个半开连接会让数据层的 PUT 永远停在「保存中」，后续写入全部排队。
+ */
+const REQUEST_TIMEOUT_MS = 60_000
+
 /** 发请求并统一处理错误。拆成一层是因为 /api/data 还需要读响应头（ETag）。 */
 async function send(path: string, init?: RequestInit): Promise<Response> {
-  const resp = await fetch(path, {
-    ...init,
-    // init.headers 合进来而不是覆盖
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
-  })
+  const controller = new AbortController()
+  const outer = init?.signal ?? undefined
+  const onOuterAbort = () => controller.abort()
+  if (outer) {
+    if (outer.aborted) controller.abort()
+    else outer.addEventListener('abort', onOuterAbort, { once: true })
+  }
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, REQUEST_TIMEOUT_MS)
+  let resp: Response
+  try {
+    resp = await fetch(path, {
+      ...init,
+      signal: controller.signal,
+      // init.headers 合进来而不是覆盖
+      headers: { 'Content-Type': 'application/json', ...init?.headers },
+    })
+  } catch (e) {
+    if (timedOut) throw new Error(`请求超时（${REQUEST_TIMEOUT_MS / 1000} 秒），请检查网络或稍后重试`)
+    throw e
+  } finally {
+    clearTimeout(timer)
+    outer?.removeEventListener('abort', onOuterAbort)
+  }
   if (!resp.ok) {
     let message = `${resp.status} ${resp.statusText}`
     let code = ''

@@ -117,6 +117,9 @@ class SelectorRepository(private val dir: Path) {
     fun save(arguments: SelectorSourceArguments, enabled: Boolean = true): StoredSource = synchronized(this) {
         require(arguments.name.isNotBlank()) { "数据源名称不能为空" }
         require(arguments.name.length <= MAX_NAME_LENGTH) { "数据源名称过长（上限 $MAX_NAME_LENGTH 字符）" }
+        // 订阅导入对空 searchUrl 是拒绝的；单源导入也必须一致，否则会存下一条
+        // 永远搜不出东西的死源，用户只会看到「导入成功但搜索没结果」。
+        require(arguments.searchConfig.searchUrl.isNotBlank()) { "数据源缺少 searchUrl，无法搜索" }
         validateRegexes(arguments.searchConfig)
         val stored = StoredSource(enabled = enabled, arguments = arguments)
         val target = fileFor(arguments.name)

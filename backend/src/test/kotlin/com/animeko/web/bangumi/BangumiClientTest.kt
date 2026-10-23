@@ -201,6 +201,26 @@ class BangumiClientTest {
         assertTrue(fetcher.boundedGets.any { it.first.contains("/v0/episodes") })
     }
 
+    @Test
+    fun `episodes without a total field keep paging while the page is full`() = runTest {
+        // 镜像省略 total 时它会被默认成 0。旧逻辑 `collected.size >= 0` 在首页就 break，
+        // 长篇番剧第 200 集之后整段丢失。现在没有 total 就看这一页是否满 200。
+        val fullPage = (1..200).joinToString(",", "[", "]") { """{"id":$it,"name":"e$it","sort":$it}""" }
+        val page1 = """{"data":$fullPage}"""
+        val page2 = """{"data":[{"id":201,"name":"e201","sort":201}]}"""
+        val fetcher = BangumiStubFetcher(
+            getRoutes = mapOf(
+                "https://api.bgm.tv/v0/subjects/328609" to subjectResponse,
+                "https://api.bgm.tv/v0/episodes?subject_id=328609&limit=200&offset=0" to page1,
+                "https://api.bgm.tv/v0/episodes?subject_id=328609&limit=200&offset=200" to page2,
+            ),
+        )
+        val client = BangumiClient(fetcher, listOf("https://api.bgm.tv"))
+        val eps = client.subject(328609).eps as kotlinx.serialization.json.JsonArray
+        assertEquals(201, eps.size)
+        assertEquals(2, fetcher.requests.count { it.contains("/v0/episodes") })
+    }
+
     /**
      * 探测接口的 CUSTOM 目标由任何能打开设置页的人填写（默认部署无鉴权）。
      * 它以前走的是 `fetch`（ofByteArray）：对方回一个大文件就能把堆吃光。
@@ -307,6 +327,17 @@ class BangumiClientTest {
     }
 
     @Test
+    fun `a definitive 404 wins over another base returning 500`() = runTest {
+        val fetcher = BangumiStubFetcher(
+            notFoundPrefixes = setOf("https://api.bgm.tv/v0/subjects"),
+            failingGetPrefixes = setOf("https://bgmapi.anibt.net"),
+        )
+        val client = BangumiClient(fetcher, listOf("https://api.bgm.tv", "https://bgmapi.anibt.net"))
+        // 一个 base 404、另一个 500 时，最终错误必须是 404，不能被后到的 500 盖成 502
+        assertFailsWith<SubjectNotFoundException> { client.subject(999999) }
+    }
+
+    @Test
     fun `second search prefers working base`() = runTest {
         val fetcher = BangumiStubFetcher(
             postRoutes = mapOf("https://bgmapi.anibt.net/v0/search/subjects" to searchResponse),
@@ -383,6 +414,49 @@ class BangumiClientTest {
         val official = fetcher.requests.count { it.startsWith("https://api.bgm.tv") }
         assertEquals(1, official, "死域名被打了 $official 次：${fetcher.requests}")
         assertEquals(2, fetcher.requests.count { it.startsWith("https://bgmapi.anibt.net") })
+    }
+
+    @Test
+    fun `a slow remembered base is hedged with the other candidates`() = runTest {
+        var mirrorSlow = false
+        val fetcher = object : Fetcher {
+            val requests = mutableListOf<String>()
+            override suspend fun fetch(
+                url: String,
+                headers: Map<String, String>,
+                followRedirects: Boolean,
+            ): HttpResult = throw UnsupportedOperationException()
+
+            override suspend fun post(
+                url: String,
+                body: String,
+                headers: Map<String, String>,
+                contentType: String,
+            ): HttpResult {
+                requests.add(url)
+                if (url.startsWith("https://bgmapi.anibt.net")) {
+                    delay(if (mirrorSlow) 10_000L else 100L)
+                } else {
+                    delay(if (mirrorSlow) 1_000L else 10_000L)
+                }
+                return HttpResult(200, mapOf("content-type" to listOf("application/json")), searchResponse.toByteArray())
+            }
+
+            override suspend fun fetchStream(
+                url: String,
+                headers: Map<String, String>,
+                followRedirects: Boolean,
+            ): StreamResult = throw UnsupportedOperationException()
+        }
+        val client = BangumiClient(fetcher, listOf("https://api.bgm.tv", "https://bgmapi.anibt.net"))
+        client.search("第一次") // 镜像 100ms 获胜并被记住
+        mirrorSlow = true
+        client.search("第二次") // 镜像变慢：2.5s 对冲后官方 1s 应获胜
+        assertTrue(currentTime < 6_000L, "总耗时 $currentTime ms：慢首选没有被对冲")
+        assertTrue(
+            fetcher.requests.count { it.startsWith("https://api.bgm.tv") } >= 2,
+            "慢首选超时后应开始竞速：${fetcher.requests}",
+        )
     }
 
     @Test

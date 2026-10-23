@@ -74,7 +74,9 @@ class SubscriptionService(
      * 允许直接贴正文：订阅站挂了 / 需要登录时，用户手上往往是一份导出的文件。
      */
     private suspend fun loadBody(url: String?, text: String?): String {
-        val direct = text?.trim().orEmpty()
+        // U+FEFF 不是 isWhitespace：带 BOM 的导出文件会让 JSON 在 offset 0 直接失败，
+        // 用户只看到「不是合法 JSON」。粘贴正文与 HTTP 响应两条分支都要剥掉它。
+        val direct = text?.trim()?.removePrefix("\uFEFF").orEmpty()
         if (direct.isNotEmpty()) {
             require(direct.length <= MAX_SUBSCRIPTION_BYTES.toInt()) {
                 "订阅内容超过 ${MAX_SUBSCRIPTION_BYTES / 1024 / 1024}MB 上限"
@@ -117,7 +119,7 @@ class SubscriptionService(
             // 日志只该出现 scheme://host/path：订阅地址常把 token 放在查询串里
             throw UpstreamException("订阅返回 ${result.status}（${SelectorEngine.urlForLog(target)}）")
         }
-        return String(result.body, Charsets.UTF_8)
+        return String(result.body, Charsets.UTF_8).removePrefix("\uFEFF")
     }
 
     /**
@@ -170,7 +172,11 @@ class SubscriptionService(
         val (items, rejected) = parse(body)
         val known = repo.list().associateBy { it.arguments.name }
         return PreviewResponse(
-            subscription = label.ifBlank { url?.trim().orEmpty().take(200) },
+            // 订阅地址常把 token 放在查询串里；预览页会把它显示出来，截图/共享屏幕就是泄露。
+            // urlForLog 只保留 scheme://host/path，足够让人认出是哪个订阅。
+            subscription = label.ifBlank {
+                url?.trim()?.takeIf { it.isNotEmpty() }?.let { SelectorEngine.urlForLog(it) }.orEmpty()
+            },
             candidates = items.map { args ->
                 val existing = known[args.name]
                 Candidate(

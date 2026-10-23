@@ -48,22 +48,19 @@ object JsonPathEval {
                         i += 2
                         val (key, next) = readKey(p, i)
                         if (key.isEmpty()) return null
-                        current = current.flatMap { deepScan(it, key) }
-                        if (current.size > MAX_NODES) return null
+                        current = appendCapped(current) { deepScan(it, key) } ?: return null
                         i = next
                         continue
                     }
                     i++
                     if (i < p.length && p[i] == '*') {
-                        current = current.flatMap { children(it) }
-                        if (current.size > MAX_NODES) return null
+                        current = appendCapped(current) { children(it) } ?: return null
                         i++
                         continue
                     }
                     val (key, next) = readKey(p, i)
                     if (key.isEmpty()) return null
-                    current = current.flatMap { property(it, key) }
-                    if (current.size > MAX_NODES) return null
+                    current = appendCapped(current) { property(it, key) } ?: return null
                     i = next
                 }
 
@@ -71,7 +68,6 @@ object JsonPathEval {
                     val close = findClosingBracket(p, i) ?: return null
                     val inner = p.substring(i + 1, close).trim()
                     current = applyBracket(current, inner) ?: return null
-                    if (current.size > MAX_NODES) return null
                     i = close + 1
                 }
 
@@ -82,20 +78,55 @@ object JsonPathEval {
     }
 
     private fun applyBracket(current: List<JsonElement>, inner: String): List<JsonElement>? {
-        if (inner == "*") return current.flatMap { children(it) }
+        if (inner == "*") return appendCapped(current) { children(it) }
         // 多属性: 'a','b' 或 "a","b"。这里保持 Jayway 语义：一个元素命中几个键就贡献几项、
         // 一个都不命中贡献 0 项。需要「按位置配对」的调用方请用 evaluateAligned()，
         // 不要在通用求值器里偷偷改语义 —— 那会让所有其它路径的行为变得不可预期。
         if (inner.contains("'") || inner.contains("\"")) {
             val keys = multiKeyNames(inner) ?: return null
-            return current.flatMap { e -> keys.flatMap { property(e, it) } }
+            return appendMultiKeys(current, keys)
         }
         // 下标
         inner.toIntOrNull()?.let { idx ->
             return current.mapNotNull { e -> (e as? JsonArray)?.getOrNull(idx) }
         }
         // 单 key（无引号）
-        return current.flatMap { property(it, inner) }
+        return appendCapped(current) { property(it, inner) }
+    }
+
+    /**
+     * 有界 flatMap：先检查追加后的总数，再真正写入。
+     *
+     * 旧写法 `current.flatMap { … }` 会先把全部结果装进 ArrayList，之后才判 MAX_NODES；
+     * `$..a..a` 让 2 万个中间结果各自再产出 2 万项时，峰值是先分配约 4 亿个引用，
+     * 限额检查只是事后道歉。这里在每次 add 之前用 Long 判断，超限直接放弃整个选择器。
+     */
+    private inline fun appendCapped(
+        current: List<JsonElement>,
+        crossinline expand: (JsonElement) -> List<JsonElement>,
+    ): List<JsonElement>? {
+        val out = ArrayList<JsonElement>(minOf(current.size, MAX_NODES))
+        for (element in current) {
+            val items = expand(element)
+            if (items.isEmpty()) continue
+            if (out.size.toLong() + items.size > MAX_NODES) return null
+            out.addAll(items)
+        }
+        return out
+    }
+
+    /** 多属性选择器的逐键累加：同样在分配前检查上限，避免 keys × 数组扇出的峰值。 */
+    private fun appendMultiKeys(current: List<JsonElement>, keys: List<String>): List<JsonElement>? {
+        val out = ArrayList<JsonElement>(minOf(current.size, MAX_NODES))
+        for (element in current) {
+            for (key in keys) {
+                val items = property(element, key)
+                if (items.isEmpty()) continue
+                if (out.size.toLong() + items.size > MAX_NODES) return null
+                out.addAll(items)
+            }
+        }
+        return out
     }
 
     private fun multiKeyNames(inner: String): List<String>? {
@@ -128,7 +159,14 @@ object JsonPathEval {
         val keys = multiKeyNames(p.substring(open + 1, close))
         if (keys.isNullOrEmpty()) return evaluate(p, root)
         val elements = evaluate(prefix, root) ?: return null
-        return elements.flatMap { alignedFor(it, keys) }
+        val out = ArrayList<JsonElement>(minOf(elements.size, MAX_NODES))
+        for (element in elements) {
+            val items = alignedFor(element, keys)
+            if (items.isEmpty()) continue
+            if (out.size.toLong() + items.size > MAX_NODES) return null
+            out.addAll(items)
+        }
+        return out
     }
 
     /**

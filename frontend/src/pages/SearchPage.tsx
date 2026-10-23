@@ -46,6 +46,7 @@ export default function SearchPage() {
   const [sources, setSources] = useState<{ name: string }[]>([])
   const [sourceHits, setSourceHits] = useState<Record<string, SubjectHit[]>>({})
   const [sourceErrors, setSourceErrors] = useState<Record<string, string>>({})
+  const [sourcesError, setSourcesError] = useState('')
   const [sourcesLoading, setSourcesLoading] = useState(!!q)
   const [favIds, setFavIds] = useState<Set<number>>(() => favoriteIdSet())
   /** 手动刷新：先删掉这个关键词的缓存条目，再用 runId 触发 effect 重跑 ——
@@ -76,6 +77,7 @@ export default function SearchPage() {
       setSources([])
       setSourceHits({})
       setSourceErrors({})
+      setSourcesError('')
       setBgmLoading(false)
       setSourcesLoading(false)
       return
@@ -92,6 +94,7 @@ export default function SearchPage() {
       setSourceHits(cached.sourceHits)
       setSourceErrors(cached.sourceErrors)
       setSources(cached.sourceNames.filter((s) => s.enabled).map((s) => ({ name: s.name })))
+      setSourcesError('')
       setBgmLoading(false)
       setSourcesLoading(false)
       return
@@ -104,6 +107,7 @@ export default function SearchPage() {
     setSources([])
     setSourceHits({})
     setSourceErrors({})
+    setSourcesError('')
     setBgmLoading(true)
     setSourcesLoading(true)
     // effect 内的累加器：setState 的 functional update 拿不到最终值，
@@ -199,10 +203,11 @@ export default function SearchPage() {
         )
         if (!cancelled) setSourcesLoading(false)
       })
-      .catch(() => {
+      .catch((e) => {
         if (cancelled) return
         sourcesListFailed = true
         setSources([])
+        setSourcesError(errMsg(e))
       })
       .finally(() => {
         if (cancelled) return
@@ -338,11 +343,22 @@ export default function SearchPage() {
       </div>
 
       <h3 className="section-title" style={{ fontSize: 15 }}>
-        视频数据源 <span className="count">{sources.length} 个已启用</span>
+        视频数据源{' '}
+        <span className="count">
+          {sourcesError ? '列表加载失败' : `${sources.length} 个已启用`}
+        </span>
       </h3>
+      {!!q && sourcesError && (
+        <div className="error-box">
+          数据源列表加载失败：{sourcesError}{' '}
+          <button className="btn btn-sm" onClick={() => setRunId((n) => n + 1)}>
+            重试
+          </button>
+        </div>
+      )}
       {/* 不再放全局「数据源搜索中…」：每个源自己就有 搜索中…/N 个结果，
           多出来这一行只是在结果上方悬一条居中的孤句，把版面撑出一大段空白 */}
-      {!!q && !sourcesLoading && sources.length === 0 && (
+      {!!q && !sourcesLoading && !sourcesError && sources.length === 0 && (
         <div className="empty">
           还没有启用的数据源，去 <Link to="/sources" style={{ color: 'var(--accent)' }}>数据源管理</Link> 导入 animeko
           配置

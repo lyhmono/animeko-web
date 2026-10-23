@@ -34,6 +34,8 @@ class ProxySessionStore(
 
     private class Entry(
         val headers: Map<String, String>,
+        /** 初始媒体 URL 的主机：只有它能收到 Cookie，清单追加的 CDN 主机只收 UA/Referer */
+        val mediaHost: String?,
         /**
          * expiresAt 必须 volatile：它在**读取路径**上被写（滑动续期），而分片由多个
          * Netty worker 线程并发拉取。非 volatile 的 long 允许被拆成两次 32 位写入，
@@ -56,10 +58,25 @@ class ProxySessionStore(
             if (cookie.isNotBlank()) put("Cookie", cookie)
         }
         if (headers.isEmpty()) return ""
+        val headerBytes = headers.entries.sumOf {
+            it.key.toByteArray(Charsets.UTF_8).size + it.value.toByteArray(Charsets.UTF_8).size
+        }
+        // 配置里的 Cookie 理论上可以接近 200KB（单个数据源配置的上限），
+        // 而每个数据源解析都会 put 一条会话：不封顶的话几千条会话就是几百 MB 常驻内存。
+        // 超过上限的请求头几乎只可能是恶意/损坏的配置，拒绝保存比常驻内存更安全。
+        if (headerBytes > MAX_HEADER_BYTES_PER_SESSION) {
+            appLog.warn(
+                "播放会话的请求头合计 {} 字节，超过 {} 字节上限，已拒绝保存（避免超大 Cookie 常驻内存）",
+                headerBytes,
+                MAX_HEADER_BYTES_PER_SESSION,
+            )
+            return ""
+        }
         purgeIfNeeded()
         val sid = newId()
-        val entry = Entry(headers, now() + ttlMs)
-        hostOf(mediaUrl)?.let { entry.allowedHosts.add(it) }
+        val mediaHost = hostOf(mediaUrl)
+        val entry = Entry(headers, mediaHost, now() + ttlMs)
+        mediaHost?.let { entry.allowedHosts.add(it) }
         sessions[sid] = entry
         return sid
     }
@@ -83,38 +100,69 @@ class ProxySessionStore(
         // maxOf 保证续期只会往后推：线程在两次 now() 之间被挂起时，
         // 直接赋值会把过期点提前，把正在播放的会话踢掉
         entry.expiresAt = maxOf(entry.expiresAt, now() + ttlMs)
-        return Grant(Kind.GRANTED, entry.headers)
+        // 源站 Cookie 只发给解析出来的那条媒体 URL 的主机。清单里追加的 CDN 主机
+        // 仍需要 UA/Referer 过防盗链，但没有理由把源站 Cookie 也交给它们 ——
+        // 一份被篡改的清单就能借此把用户的源站凭据引到第三方。
+        val headers = if (host == entry.mediaHost) entry.headers else entry.headers - "Cookie"
+        return Grant(Kind.GRANTED, headers)
     }
 
-    /** 清单改写完成后，把里面出现的分片/密钥主机登记为该会话可用主机。 */
     /**
-     * 登记清单里出现的分片/密钥主机。
+     * 登记一批由 [com.animeko.web.proxy.HlsRewriter.rewriteDetailed] 真实改写出的主机。
      *
      * 必须设上界：清单体积上限是 4MB，理论上能塞进上万个**不同**主机，而这个集合
-     * 只会随会话滑动续期一直长大（真实清单只有 1~3 个主机）。不设限等于让一个
-     * 恶意数据源用一份清单把服务端内存吃掉几十 MB，并且每次重拉清单都要把 4MB
-     * 全量正则 + 逐条 URL 解码一遍。
-     * 超限后不再扩大：后面的分片会以 HOST_NOT_ALLOWED 失败，是可诊断的错，
-     * 比静默 OOM 好。
+     * 只会随会话滑动续期一直长大（真实清单只有 1~3 个主机）。超限后不再扩大：
+     * 后面的分片会以 HOST_NOT_ALLOWED 失败，是可诊断的错，比静默 OOM 好。
      */
-    fun allowPlaylistHosts(sid: String, rewrittenPlaylist: String) {
-        if (sid.isEmpty()) return
+    fun allowHosts(sid: String, hosts: Collection<String>) {
+        if (sid.isEmpty() || hosts.isEmpty()) return
         val entry = sessions[sid] ?: return
         var added = 0
-        for (encoded in PROXY_URL_PARAM.findAll(rewrittenPlaylist)) {
+        for (host in hosts) {
+            if (host.isBlank()) continue
             if (entry.allowedHosts.size >= MAX_HOSTS_PER_SESSION) {
                 appLog.warn(
                     "清单的主机数超过单会话上限 {}，后续分片会被拒（sid 已登记 {} 个主机）",
                     MAX_HOSTS_PER_SESSION,
                     entry.allowedHosts.size,
                 )
-                return
+                break
             }
-            val host = runCatching { hostOf(java.net.URLDecoder.decode(encoded.groupValues[1], "UTF-8")) }
-                .getOrNull()
-            if (host != null && entry.allowedHosts.add(host)) added++
+            if (entry.allowedHosts.add(host)) added++
         }
         if (added > 0) appLog.debug("会话登记了 {} 个清单主机", added)
+    }
+
+    /**
+     * 从改写后的清单文本里登记主机。生产路径已经直接使用
+     * [com.animeko.web.proxy.HlsRewriter.rewriteDetailed] 返回的主机集合；
+     * 这里保留给调用方/测试，但**只认真正的 URI 位置**：
+     * 分片行本身，或标签里的 `URI="..."` 属性。旧实现用正则扫描全文，
+     * 评论行里随便写一个代理地址就能把任意主机加进白名单。
+     */
+    fun allowPlaylistHosts(sid: String, rewrittenPlaylist: String) {
+        if (sid.isEmpty()) return
+        val hosts = LinkedHashSet<String>()
+        for (rawLine in rewrittenPlaylist.lineSequence()) {
+            val line = rawLine.trim()
+            if (line.startsWith(PROXY_URL_PREFIX)) {
+                proxyUrlHost(line)?.let(hosts::add)
+            } else if (line.startsWith("#")) {
+                URI_ATTR.findAll(line).forEach { m ->
+                    val value = m.groupValues[1]
+                    if (value.startsWith(PROXY_URL_PREFIX)) proxyUrlHost(value)?.let(hosts::add)
+                }
+            }
+        }
+        allowHosts(sid, hosts)
+    }
+
+    private fun proxyUrlHost(proxyUrl: String): String? {
+        val rest = proxyUrl.substringAfter(PROXY_URL_PREFIX, "")
+        if (rest.isEmpty()) return null
+        val encoded = rest.substringBefore('&').substringBefore('"').substringBefore(' ')
+        if (encoded.isEmpty()) return null
+        return runCatching { hostOf(java.net.URLDecoder.decode(encoded, "UTF-8")) }.getOrNull()
     }
 
     val size: Int get() = sessions.size
@@ -147,12 +195,19 @@ class ProxySessionStore(
     }
 
     private companion object {
-        val PROXY_URL_PARAM = Regex("""/api/proxy\?url=([^&"\s]+)""")
+        const val PROXY_URL_PREFIX = "/api/proxy?url="
+        val URI_ATTR = Regex("""URI="([^"]+)"""")
 
         /** 6 小时空闲即失效；正在播放的请求会不断续期 */
         private const val DEFAULT_TTL_MS = 6L * 60 * 60 * 1000
 
-        private const val DEFAULT_MAX_ENTRIES = 4096
+        private const val DEFAULT_MAX_ENTRIES = 1024
+
+        /**
+         * 单会话请求头总字节上限（含 UA/Referer/Cookie）。
+         * 正常源站 Cookie 在 4KB 以内；16KB 已足够宽松，又能把最坏内存压到 16MB 量级。
+         */
+        private const val MAX_HEADER_BYTES_PER_SESSION = 16 * 1024
 
         /** 单个会话最多登记多少个清单主机（真实清单是 1~3 个） */
         private const val MAX_HOSTS_PER_SESSION = 64

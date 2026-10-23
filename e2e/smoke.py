@@ -136,7 +136,8 @@ def main() -> int:
         page.wait_for_url("**/discover")
         check(
             "排行榜网格出现",
-            lambda: expect(page.get_by_test_id("rank-grid")).to_be_visible(timeout=25000),
+            # 后端 Bangumi 超时是 45 秒，镜像最坏情况下要等满；这里必须覆盖它
+            lambda: expect(page.get_by_test_id("rank-grid")).to_be_visible(timeout=55000),
             page,
         )
         def ranking_ok() -> None:
@@ -152,7 +153,7 @@ def main() -> int:
             """
             cards = page.get_by_test_id("rank-grid").locator("a")
             try:
-                expect(cards.first).to_be_visible(timeout=20000)
+                expect(cards.first).to_be_visible(timeout=50000)
                 return
             except Exception:  # noqa: BLE001 - 超时后去对账上游是否本来就没数据
                 pass
@@ -199,8 +200,18 @@ def main() -> int:
             顶栏留下了、导航项却跟着内容滚走了。
             断言方式：滚动 400px，再量导航的 rect.top，应该还在顶部附近。
             """
+            # 页面不够高时 window.scrollTo 不会产生滚动，下面的 rect 断言就会空跑。
+            can_scroll = page.evaluate(
+                "() => document.documentElement.scrollHeight > window.innerHeight + 400"
+            )
+            if not can_scroll:
+                print("    (当前页面不够高，跳过滚动断言)")
+                return
             page.evaluate("() => window.scrollTo(0, 400)")
             page.wait_for_timeout(300)
+            y = page.evaluate("() => window.scrollY")
+            if y <= 0:
+                raise AssertionError("scrollTo(0,400) 后 window.scrollY 仍是 0，滚动断言无效")
             r = page.get_by_test_id("nav-tabs").evaluate(
                 "(el) => el.getBoundingClientRect().top"
             )

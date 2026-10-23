@@ -9,9 +9,11 @@ import java.io.IOException
 import java.nio.channels.FileChannel
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
+import java.nio.file.NoSuchFileException
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 
 /**
@@ -39,6 +41,13 @@ class UserDataStore(
     class Stale : Exception("DATA_STALE")
 
     /**
+     * 文件存在但读不出来（权限、磁盘、路径被目录占用）。这不是「空文档」：
+     * 若把它当空文档返回，前端会认为服务器上什么都没有，下一次保存就把原数据覆盖掉。
+     * 让它走 5xx，前端保持「未同步」并等待重试。
+     */
+    class ReadFailed(message: String, cause: Throwable? = null) : Exception(message, cause)
+
+    /**
      * 一次读取。必须和写入共用同一把锁：坏文件在这里会被移走（*.bad），
      * 而并发的 write() 正在往同一个路径上 rename ——
      * 不加锁时读侧能把写侧刚提交好的文件当坏文件搬走，盘上直接没有文档了。
@@ -46,12 +55,7 @@ class UserDataStore(
     fun read(): Snapshot = synchronized(this) { readLocked() }
 
     private fun readLocked(): Snapshot {
-        val bytes = try {
-            if (!Files.isRegularFile(file)) null else Files.readAllBytes(file)
-        } catch (e: Exception) {
-            appLog.warn("读取个人数据失败: {}", e.message)
-            null
-        }
+        val bytes = readBytesStrict(file, "个人数据")
         if (bytes != null && bytes.isNotEmpty()) {
             val text = String(bytes, Charsets.UTF_8)
             val parsed = runCatching { json.parseToJsonElement(text) }.getOrNull()
@@ -68,10 +72,33 @@ class UserDataStore(
         return EMPTY
     }
 
+    /**
+     * 读取一个「应该存在」的数据文件。
+     *
+     * 文件不存在返回 null；存在但读不出来必须抛 [ReadFailed]，不能降级成空文档。
+     * 这里用 readAttributes 而不是 isRegularFile：后者在 I/O 错误时也只返回 false，
+     * 会把「读不了」伪装成「不存在」。
+     */
+    private fun readBytesStrict(path: Path, label: String): ByteArray? {
+        val attrs = try {
+            Files.readAttributes(path, BasicFileAttributes::class.java)
+        } catch (e: NoSuchFileException) {
+            return null
+        } catch (e: Exception) {
+            throw ReadFailed("$label 读取失败：${e.message ?: e::class.simpleName}", e)
+        }
+        if (!attrs.isRegularFile) throw ReadFailed("$label 路径不是普通文件：$path")
+        return try {
+            Files.readAllBytes(path)
+        } catch (e: Exception) {
+            throw ReadFailed("$label 读取失败：${e.message ?: e::class.simpleName}", e)
+        }
+    }
+
     /** 备份存在且能解析成 JSON 对象时恢复它，否则 null。 */
     private fun restoreFromBackup(): Snapshot? {
         val bak = sib("bak")
-        val bytes = runCatching { if (Files.isRegularFile(bak)) Files.readAllBytes(bak) else null }.getOrNull()
+        val bytes = readBytesStrict(bak, "个人数据备份")
         if (bytes == null || bytes.isEmpty()) return null
         val text = String(bytes, Charsets.UTF_8)
         val parsed = runCatching { json.parseToJsonElement(text) }.getOrNull()
@@ -173,7 +200,8 @@ class UserDataStore(
     }
 
     private fun currentEtagLocked(): String {
-        val bytes = if (Files.isRegularFile(file)) runCatching { Files.readAllBytes(file) }.getOrNull() else null
+        // 读取失败不能当成「空文档」：那会让一次条件写把读不出来的原文件覆盖掉。
+        val bytes = readBytesStrict(file, "个人数据")
         return if (bytes == null || bytes.isEmpty()) EMPTY.etag else sha256Hex(bytes)
     }
 

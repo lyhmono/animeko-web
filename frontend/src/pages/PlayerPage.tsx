@@ -19,6 +19,8 @@ interface NextEpisode {
   title: string
   anime: string
   ep: string
+  /** 条目侧 Bangumi 集号：条目进度只能写这个，不能写数据源集号 */
+  bep?: string
 }
 
 function parseNext(raw: string | null): NextEpisode | null {
@@ -40,6 +42,7 @@ function nextToParams(next: NextEpisode, subjectId = 0, subjectUrl = ''): URLSea
     anime: next.anime,
     ep: next.ep,
   })
+  if (next.bep) p.set('bep', next.bep)
   // 连播要把条目 id 一起带过去。原先 next 里只有五个字段（没有 subject），
   // 于是自动切到下一话后 subjectId=0，那一句 `if (subjectId > 0) setSubjectProgress(...)`
   // 再也不执行 —— 条目页的「看到第几话」永久停在上一话，而且没有任何报错。
@@ -75,6 +78,8 @@ export default function PlayerPage() {
   const title = params.get('title') ?? ''
   const animeName = params.get('anime') ?? ''
   const ep = params.get('ep') ?? ''
+  /** 条目侧 Bangumi 集号。与数据源集号 ep 分开：连播时源站可能用绝对集号/0 基编号 */
+  const bep = params.get('bep') ?? ''
   /** 从条目页进来时带的 Bangumi 条目 id：用来回写「看到第几话」 */
   const subjectId = Number(params.get('subject') || '') || 0
   /** 数据源详情页地址：连播链条重新取剧集列表时用（见 resolveChain） */
@@ -86,6 +91,8 @@ export default function PlayerPage() {
   const [fallbackSrc, setFallbackSrc] = useState('')
   const [startAt, setStartAt] = useState(0)
   const [resumeTime, setResumeTime] = useState<number | null>(null)
+  /** 用户已选择续播方式后自增，通知播放器可以开始播放 */
+  const [playRequest, setPlayRequest] = useState(0)
   const [resolving, setResolving] = useState(false)
   const [error, setError] = useState('')
   const [manualUrl, setManualUrl] = useState('')
@@ -117,6 +124,7 @@ export default function PlayerPage() {
   // 解析视频地址 + 写入最近观看
   useEffect(() => {
     if (!source || !playUrl) return
+    let alive = true
     setError('')
     lastWriteRef.current = null
     const playKey = `${source}|${playUrl}`
@@ -142,7 +150,7 @@ export default function PlayerPage() {
     api
       .resolveVideo(source, playUrl)
       .then((video) => {
-        if (seq !== resolveSeqRef.current) return
+        if (!alive || seq !== resolveSeqRef.current) return
         // 直连优先：视频流量不经过这台服务器；直连被防盗链/CORS 拒绝时播放器会自动回退
         setFallbackSrc(video.proxyPath)
         setSrc(getDirectPlayback() ? (directUrlFor(video.url) ?? video.proxyPath) : video.proxyPath)
@@ -156,12 +164,18 @@ export default function PlayerPage() {
         })
       })
       .catch((e) => {
-        if (seq !== resolveSeqRef.current) return
+        if (!alive || seq !== resolveSeqRef.current) return
         setError(`视频地址解析失败：${errMsg(e)}（可尝试下方手动地址播放）`)
       })
       .finally(() => {
-        if (seq === resolveSeqRef.current) setResolving(false)
+        if (alive && seq === resolveSeqRef.current) setResolving(false)
       })
+    // 离页后丢弃在飞的解析结果：光靠 setState 不会阻止 addRecent 往服务端
+    // 写一条「最近观看」，那会给用户留下一条从未看过的记录。
+    return () => {
+      alive = false
+      resolveSeqRef.current++
+    }
   }, [source, playUrl, title, animeName, ep, resolveNonce])
 
   // 断点续播：读取历史进度
@@ -204,18 +218,29 @@ export default function PlayerPage() {
         ?? (result.episodes.length > 0 ? result.episodes : result.groups.flatMap((g) => g.episodes))
       const i = list.findIndex((e) => e.playUrl === playUrl)
       if (i < 0) return
-      const mk = (e: (typeof list)[number]): NextEpisode => ({
+      const current = list[i]
+      const currentBep = Number(bep)
+      const mk = (e: (typeof list)[number], nextBep?: string): NextEpisode => ({
         source,
         play: e.playUrl,
         title: `${animeName || title} ${e.name}`,
         anime: animeName,
         ep: String(e.sortNum ?? e.sort),
+        bep: nextBep,
       })
       const nx = list[i + 1]
       if (!nx) return
-      setAutoNext(mk(nx))
+      // 源站集号连续时，Bangumi 集号也连续；否则宁可不写条目进度，也不写错一集。
+      const nxBep = Number.isInteger(currentBep) && currentBep > 0 &&
+          current.sortNum != null && nx.sortNum === current.sortNum + 1
+        ? String(currentBep + 1)
+        : undefined
+      setAutoNext(mk(nx, nxBep))
       const after = list[i + 2]
-      successorRef.current = after ? mk(after) : null
+      const afterBep = nxBep != null && nx.sortNum != null && after?.sortNum === nx.sortNum + 1
+        ? String(Number(nxBep) + 1)
+        : undefined
+      successorRef.current = after ? mk(after, afterBep) : null
       setNextCountdown(5)
     } catch {
       // 取列表失败就停在今天的行为上（停在当前，用户仍可手动选）。
@@ -241,8 +266,12 @@ export default function PlayerPage() {
       lastWriteRef.current = time
       setProgress({ source, playUrl, title, time, duration, ts: Date.now() })
       // 同步记一笔条目级进度：条目页据此显示「看到第 X 话」并标出已看过的集。
-      // 只在有 subject 参数（从条目页进入）时写，从数据源页直接进来没有条目 id。
-      if (subjectId > 0) setSubjectProgress(subjectId, Number(ep) || 0)
+      // 只写 bep（Bangumi 集号）：ep 是数据源集号，源站用绝对集号/0 基编号时会把
+      // 「看到第几话」写到错误的集上。没有 bep（SP/OP、从数据源页直接进入）就不写。
+      const bangumiEp = Number(bep)
+      if (subjectId > 0 && Number.isInteger(bangumiEp) && bangumiEp > 0) {
+        setSubjectProgress(subjectId, bangumiEp)
+      }
     }
   }
 
@@ -257,12 +286,15 @@ export default function PlayerPage() {
   const resumePlay = () => {
     if (resumeTime != null) setStartAt(Math.floor(resumeTime))
     setResumeTime(null)
+    // 自动播放被续播闸门挡住了，选择后必须显式开播
+    setPlayRequest((n) => n + 1)
   }
 
   const restartPlay = () => {
     if (source && playUrl) clearProgress(source, playUrl)
     setStartAt(0)
     setResumeTime(null)
+    setPlayRequest((n) => n + 1)
   }
 
   const gotoNext = navToNext
@@ -303,6 +335,8 @@ export default function PlayerPage() {
         next.set('source', 'manual')
         next.set('play', url)
         next.delete('next')
+        // 手动地址与条目无对应关系，别把「看到第几话」写成上一个视频的集号
+        next.delete('bep')
         return next
       },
       { replace: true },
@@ -326,6 +360,8 @@ export default function PlayerPage() {
             src={src}
             fallbackSrc={fallbackSrc}
             startAt={startAt}
+            resumeGate={resumeTime != null}
+            playRequest={playRequest}
             playKey={`${source}|${playUrl}`}
             fullscreenTarget={stageRef}
             theater

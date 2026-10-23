@@ -5,6 +5,7 @@ import com.animeko.web.http.HttpResult
 import com.animeko.web.http.StreamResult
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
+import org.jsoup.Jsoup
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -19,6 +20,9 @@ import kotlin.test.assertTrue
 class StubFetcher(
     private val routes: Map<String, String>,
     private val redirects: Map<String, String> = emptyMap(),
+    /** 让“源站用 GBK/GB2312 编码”这类场景可以被测到 */
+    private val charset: java.nio.charset.Charset = Charsets.UTF_8,
+    private val contentType: String = "text/html",
 ) : Fetcher {
     val requested = mutableListOf<String>()
     /** 每次请求实际带出去的头（副本）：凭据会不会跟着跳转跑到第三个主机，只能从这里看 */
@@ -38,7 +42,7 @@ class StubFetcher(
             return HttpResult(302, mapOf("location" to listOf(loc)), ByteArray(0))
         }
         val body = lookup(url) ?: throw IllegalStateException("no fixture for $url")
-        return HttpResult(200, mapOf("content-type" to listOf("text/html")), body.toByteArray())
+        return HttpResult(200, mapOf("content-type" to listOf(contentType)), body.toByteArray(charset))
     }
 
     /** 生产实现是「逐跳校验 + 边读边限」，桩要跟着走这条路径，否则新代码在测试里等于没被测到 */
@@ -227,6 +231,45 @@ class SelectorEngineTest {
     }
 
     @Test
+    fun `search decodes a gbk source page instead of showing mojibake`() = runTest {
+        // 不少国内源站仍是 GBK/GB2312；统一按 UTF-8 解会让标题与链接整片乱码，
+        // 搜索链路看起来“有结果”，但用户点进去全是错的。
+        val page = """<div class="video-info-header"><a href="/detail/1" title="孤独摇滚">孤独摇滚</a></div>"""
+        val fetcher = StubFetcher(
+            mapOf("$base/search" to page),
+            charset = java.nio.charset.Charset.forName("GBK"),
+            contentType = "text/html; charset=gbk",
+        )
+        val hits = SelectorEngine(fetcher).search(config(), "孤独摇滚")
+        assertEquals("孤独摇滚", hits.single().name)
+        assertEquals("$base/detail/1", hits.single().url)
+    }
+
+    @Test
+    fun `index-grouped keeps lists aligned when a channel name is blank`() = runTest {
+        // 某条线路的 tab 文本为空时，旧实现 mapNotNull 会把它丢掉，
+        // 后面的线路名整体左移，剧集挂到别人的线路名下（连播会串线）。
+        val page = """
+            <html><body>
+            <div class="anthology-tab"><div class="swiper-wrapper">
+              <a></a>
+              <a>备用线路</a>
+            </div></div>
+            <div class="anthology-list-box"><a href="/play/1-1.html">第1话</a></div>
+            <div class="anthology-list-box"><a href="/play/2-1.html">第1话</a></div>
+            </body></html>
+        """.trimIndent()
+        val fetcher = StubFetcher(mapOf("$base/anime/1.html" to page))
+        val result = SelectorEngine(fetcher).episodes(
+            config(channelFormatId = ChannelFormatIndexGrouped.ID),
+            "$base/anime/1.html",
+        )
+        assertEquals(listOf("线路 1", "备用线路"), result.channels)
+        assertEquals("$base/play/1-1.html", result.groups[0].episodes.single().playUrl)
+        assertEquals("$base/play/2-1.html", result.groups[1].episodes.single().playUrl)
+    }
+
+    @Test
     fun `search with subject format A`() = runTest {
         val fetcher = StubFetcher(mapOf("$base/search" to fixture("search_page.html")))
         val hits = SelectorEngine(fetcher).search(config(), "示例")
@@ -341,6 +384,14 @@ class SelectorEngineTest {
     }
 
     @Test
+    fun `xpath prefix is stripped before handing the expression to jsoup`() {
+        val doc = Jsoup.parse("""<html><body><div class="x"><a href="/a">A</a></div></body></html>""")
+        val elements = SelectorEngine.queryAll(doc, "xpath://div[@class='x']/a")
+        assertEquals(1, elements?.size)
+        assertEquals("/a", elements?.first()?.attr("href"))
+    }
+
+    @Test
     fun `episodes with no-channel format`() = runTest {
         val fetcher = StubFetcher(mapOf("$base/anime/1.html" to fixture("detail_nochannel.html")))
         val cfg = config().copy(
@@ -376,6 +427,29 @@ class SelectorEngineTest {
         assertNull(ep.sortNum, "超长文本不该再交给配置正则")
     }
 
+    /**
+     * 剧集名的正则必须和视频候选一样「整页一份预算」。旧实现 sortText/sortNum
+     * 每集各新建 2M 额度（且各调一次正则），几百集就能把一次 episodes 请求按在 CPU 上。
+     */
+    @Test
+    fun `episode regex budget is shared across the whole page`() = runTest {
+        val name = "第1话 " + "a".repeat(500) + "b"
+        val links = (1..600).joinToString("") { """<a href="/play/$it.html">$name</a>""" }
+        val page = """<html><body><div id="plist">$links</div></body></html>"""
+        val cfg = config().copy(
+            selectorChannelFormatNoChannel = ChannelFormatNoChannel.Config(
+                selectEpisodes = "#plist a",
+                matchEpisodeSortFromName = "(a+)+$",
+            ),
+        )
+        val fetcher = StubFetcher(mapOf("$base/anime/episodes.html" to page))
+        val started = System.nanoTime()
+        val result = SelectorEngine(fetcher).episodes(cfg, "$base/anime/episodes.html")
+        val ms = (System.nanoTime() - started) / 1_000_000
+        assertEquals(600, result.episodes.size)
+        assertTrue(ms < 2_000, "花了 ${ms}ms，剧集名正则的预算没有跨集共享")
+    }
+
     @Test
     fun `episodes with index-grouped format`() = runTest {        val fetcher = StubFetcher(mapOf("$base/anime/1.html" to fixture("detail_grouped.html")))
         val result = SelectorEngine(fetcher).episodes(
@@ -401,6 +475,16 @@ class SelectorEngineTest {
         assertEquals(base, video.referer)
         // 播放页 UA 默认来自 userAgent
         assertTrue(video.userAgent.contains("Mozilla"))
+    }
+
+    @Test
+    fun `video request inherits the source user agent when video UA is not set`() = runTest {
+        val fetcher = StubFetcher(mapOf("$base/play/1-1.html" to fixture("play_page.html")))
+        val cfg = config().copy(userAgent = "CustomUA/1.0")
+        val video = SelectorEngine(fetcher).resolveVideo(cfg, "$base/play/1-1.html")
+        // VideoHeaders.userAgent 的默认值必须是空串，否则这里永远拿到内置 Chrome UA，
+        // 配置里给数据源指定的 UA 对视频 CDN 不生效。
+        assertEquals("CustomUA/1.0", video.userAgent)
     }
 
     @Test

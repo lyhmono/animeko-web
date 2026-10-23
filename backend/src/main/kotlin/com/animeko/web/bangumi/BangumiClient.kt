@@ -138,6 +138,11 @@ class BangumiClient(
      * 所以必须和 proxy / 订阅走同一条内网拦截规则。
      */
     private val allowPrivateTargets: Boolean = false,
+    /**
+     * 有多个候选时，首选地址最多独占多久；超时后同时竞速其余地址。
+     * 社区镜像实测 13~25 秒才返回，若一直「先试首选」，稳态下每次搜索都要等它。
+     */
+    private val preferredHedgeMs: Long = PREFERRED_HEDGE_MS,
 ) {
 
     /** 来自 ANIMEKO_BANGUMI_BASE_URLS（或默认值）的候选地址，AUTO 通道用的就是这一份 */
@@ -481,7 +486,13 @@ class BangumiClient(
             )
             if (resp.data.isEmpty()) break
             collected.addAll(resp.data)
-            if (collected.size >= resp.total) break
+            // total 缺省为 0：镜像省略该字段时不能把首页 200 条当成「已经到结尾」。
+            // 有 total 按 total，没有就看这一页是否满页。
+            if (resp.total > 0) {
+                if (collected.size >= resp.total) break
+            } else if (resp.data.size < EPISODES_PAGE) {
+                break
+            }
             offset += resp.data.size
         }
         return collected
@@ -547,7 +558,18 @@ class BangumiClient(
         val preferred = preferredBase
         if (preferred != null && preferred in list) {
             try {
-                return block(preferred)
+                // 有多个候选时给首选一个很短的独占窗口：它慢但能成功时，
+                // 不能把每次请求都拖到 13~45 秒。超时不清除首选，交给竞速选新的赢家。
+                val hedged = if (list.size > 1 && preferredHedgeMs > 0) {
+                    withTimeoutOrNull(preferredHedgeMs) { block(preferred) }
+                } else {
+                    block(preferred)
+                }
+                if (hedged != null) return hedged
+            } catch (e: SubjectNotFoundException) {
+                // 404 是确定性的「条目不存在」，不是地址坏了：不要清 preferred，
+                // 也不要让所有 base 再打一遍（同一台镜像会被请求两次）。
+                throw e
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -584,16 +606,20 @@ class BangumiClient(
         }
         try {
             var lastError: Throwable? = null
+            var firstNotFound: SubjectNotFoundException? = null
             repeat(list.size) {
                 val (base, outcome) = results.receive()
                 if (outcome.isSuccess) {
                     if (rememberWinner) preferredBase = base
                     return@coroutineScope outcome.getOrThrow()
                 }
-                // 全失败时抛最后一个错：404 要能一路传到 API 层变成 404 而不是 502
-                lastError = outcome.exceptionOrNull()
+                val error = outcome.exceptionOrNull()
+                lastError = error
+                // 404 是确定性的结果：不能因为另一个 base 更晚回了一个 500
+                // 就把「条目不存在」变成 502。最终错误优先保留第一个 404。
+                if (error is SubjectNotFoundException && firstNotFound == null) firstNotFound = error
             }
-            throw lastError ?: IllegalStateException("没有可用的 Bangumi API 地址")
+            throw firstNotFound ?: lastError ?: IllegalStateException("没有可用的 Bangumi API 地址")
         } finally {
             // 赢家出现后必须掐掉其余的：否则 coroutineScope 要等最慢那条（可能是 30 秒超时）
             jobs.forEach { it.cancel() }
@@ -604,6 +630,9 @@ class BangumiClient(
         val DEFAULT_BASE_URLS = listOf("https://api.bgm.tv", "https://bgmapi.anibt.net")
         const val OFFICIAL_BASE = "https://api.bgm.tv"
         const val MIRROR_BASE = "https://bgmapi.anibt.net"
+
+        /** 首选地址的独占窗口；有多个候选时超时即开始竞速。 */
+        private const val PREFERRED_HEDGE_MS = 2_500L
         const val TYPE_ANIME = 2
 
         /** /v0/calendar 的顶层就是数组 */

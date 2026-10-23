@@ -2,6 +2,7 @@ package com.animeko.web.proxy
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.test.fail
 
@@ -39,6 +40,16 @@ class ProxySessionStoreTest {
         val grant = s.grant("", "https://anything.example/x.ts")
         assertEquals(ProxySessionStore.Kind.GRANTED, grant.kind)
         assertTrue(grant.headers.isEmpty())
+    }
+
+    @Test
+    fun `an oversized header set is refused instead of living in memory`() {
+        // 单源配置的 Cookie 理论上能到近 200KB，而每次解析都会 put 一条会话；
+        // 不封顶时几千条会话就是几百 MB 常驻内存。超大请求头只可能是坏配置/攻击。
+        val s = store()
+        val sid = s.put(MEDIA, "UA/1.0", "https://v.example/watch", "c=" + "x".repeat(100_000))
+        assertEquals("", sid)
+        assertEquals(0, s.size)
     }
 
     @Test
@@ -119,6 +130,35 @@ class ProxySessionStoreTest {
             "#EXTINF:10,\n/api/proxy?url=${java.net.URLEncoder.encode(cdn, "UTF-8")}&sid=$sid\n",
         )
         assertEquals(ProxySessionStore.Kind.GRANTED, s.grant(sid, cdn).kind)
+    }
+
+    @Test
+    fun `manifest hosts receive UA and Referer but not the source cookie`() {
+        val s = store()
+        val sid = mint(s) // media host: cdn.example.com, Cookie: q=1080
+        val other = "https://other.example/seg.ts"
+        s.allowHosts(sid, setOf("other.example"))
+        val grant = s.grant(sid, other)
+        assertEquals(ProxySessionStore.Kind.GRANTED, grant.kind)
+        assertEquals("UA/1.0", grant.headers["User-Agent"])
+        assertEquals("https://v.example/watch", grant.headers["Referer"])
+        assertNull(grant.headers["Cookie"], "清单追加的 CDN 主机不能收到源站 Cookie")
+        // 解析出来的媒体主机仍要带 Cookie（源站对视频请求本身可能要求它）
+        assertEquals("q=1080", s.grant(sid, MEDIA).headers["Cookie"])
+    }
+
+    @Test
+    fun `a proxy url mentioned in a playlist comment cannot register its host`() {
+        val s = store()
+        val sid = mint(s)
+        val evil = "https://evil.example/x"
+        val comment = "# 只是说明文字：/api/proxy?url=${java.net.URLEncoder.encode(evil, "UTF-8")}&sid=$sid\n"
+        s.allowPlaylistHosts(sid, comment)
+        assertEquals(
+            ProxySessionStore.Kind.HOST_NOT_ALLOWED,
+            s.grant(sid, evil).kind,
+            "评论行不是 URI 位置，不能扩大会话主机白名单",
+        )
     }
 
     @Test

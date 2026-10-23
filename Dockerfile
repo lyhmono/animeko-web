@@ -47,8 +47,9 @@ LABEL org.opencontainers.image.title="Animeko Web" \
       org.opencontainers.image.description="animeko 的服务端化实现：登录门控 + Bangumi + Selector 数据源 + 个人数据 + HLS 代理" \
       org.opencontainers.image.licenses="AGPL-3.0"
 
+# tzdata 会触发 debconf；不设 noninteractive 时某些构建环境会卡在交互提示
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl tzdata gosu \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl tzdata gosu \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --create-home app

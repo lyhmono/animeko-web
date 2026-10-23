@@ -56,6 +56,8 @@ class BgmChannelStore(private val file: Path) {
             .getOrDefault(BgmChannelConfig())
     }
 
+    /** 两个设置页并发保存时会共用同一个 `.tmp` 文件，串行化避免写出半份配置。 */
+    @Synchronized
     fun save(config: BgmChannelConfig) {
         val text = json.encodeToString(BgmChannelConfig.serializer(), config)
         // 首次保存时目录可能还不存在（AppConfig 的 selectorsDir 会自建，但通道文件就在 dataDir 根下）

@@ -54,6 +54,28 @@ class SafeRegexTest {
     }
 
     @Test
+    fun `a shared budget is consumed across calls`() {
+        // 页面里的候选 URL 有很多条，预算必须是一整次解析共享的；
+        // 每条候选各拿 2M 额度，恶意页面就能用几千条 4KB 候选把 CPU 按住几十秒。
+        val budget = SafeRegex.Budget(100)
+        val pattern = assertNotNull(SafeRegex.compile("^abc$"))
+        assertTrue(SafeRegex.contains(pattern, "abc", budget = budget))
+        assertTrue(budget.remaining[0] < 100, "第一次匹配没有从共享预算里扣次数")
+
+        // 把剩下的额度烧光后，后续候选必须立刻按「没命中」处理
+        assertFalse(
+            SafeRegex.contains(
+                assertNotNull(SafeRegex.compile("^((a+)+)+$")),
+                "a".repeat(40) + "!",
+                maxChecks = 10_000,
+                budget = budget,
+            ),
+        )
+        assertTrue(budget.exhausted)
+        assertFalse(SafeRegex.contains(pattern, "abc", budget = budget))
+    }
+
+    @Test
     fun `groupOrText falls back instead of dropping a channel when the budget runs out`() {
         // 线路名如果因为预算耗尽返回 null，mapNotNull 会丢项，lists.zip(channelNames)
         // 就会把后面的剧集挂错线路；这里必须退回到全文保住下标。

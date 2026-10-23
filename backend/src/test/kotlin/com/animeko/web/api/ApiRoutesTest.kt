@@ -271,6 +271,20 @@ class ApiRoutesTest {
     }
 
     @Test
+    fun `a spa route with a dot in its parameter is not mistaken for a missing asset`() = testApplication {
+        // 数据源名可以带点（Anime1.me、xx.720p）。旧判据看最后一段有没有扩展名，
+        // 于是 /source/Anime1.me 会 404：站内跳转正常，一刷新/分享链接就挂。
+        val dir = java.nio.file.Files.createTempDirectory("animeko-fe-dot-route")
+        java.io.File(dir.toFile(), "index.html").writeText("<html>spa-dot-route</html>")
+        application { module(testConfig().copy(frontendDir = dir.toString())) }
+        val resp = client.get("/source/Anime1.me")
+        assertEquals(HttpStatusCode.OK, resp.status, "/source/Anime1.me 应当回退到 SPA")
+        assertTrue(resp.bodyAsText().contains("spa-dot-route"))
+        // 缺失的构建产物仍然必须 404
+        assertEquals(HttpStatusCode.NotFound, client.get("/assets/missing-1.js").status)
+    }
+
+    @Test
     fun `ssrf denial does not echo the internal address`() = testApplication {
         application { module(testConfig()) }
         val resp = client.get("/api/proxy") { parameter("url", "http://192.168.1.7/x.m3u8") }

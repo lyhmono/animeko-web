@@ -87,7 +87,7 @@ self.addEventListener('fetch', (event) => {
     return
   }
   // 其余静态资源（图标、manifest、favicon）：先给缓存，后台顺手更新
-  event.respondWith(staleWhileRevalidate(req, ASSET_CACHE))
+  event.respondWith(staleWhileRevalidate(req, ASSET_CACHE, event))
 })
 
 /**
@@ -154,14 +154,21 @@ async function cacheFirst(req, cacheName) {
   return fresh
 }
 
-async function staleWhileRevalidate(req, cacheName) {
-  const cache = await caches.open(cacheName)
-  const hit = await cache.match(req)
+async function staleWhileRevalidate(req, cacheName, event) {
+  // 后台更新必须在事件还活着的时候登记给 waitUntil。原先这个 promise 是
+  // “悬空”的：命中缓存后 respondWith 立刻结束，SW 随时可能被回收，
+  // cache.put 不保证执行 —— 图标/manifest 会一直停在旧版本。
   const network = fetch(req)
     .then(async (fresh) => {
-      if (cacheable(fresh)) await cache.put(req, fresh.clone())
+      if (cacheable(fresh)) {
+        const cache = await caches.open(cacheName)
+        await cache.put(req, fresh.clone())
+      }
       return fresh
     })
     .catch(() => null)
+  event.waitUntil(network)
+  const cache = await caches.open(cacheName)
+  const hit = await cache.match(req)
   return hit || (await network) || new Response('', { status: 504 })
 }

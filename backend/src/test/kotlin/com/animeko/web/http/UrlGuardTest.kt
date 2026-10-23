@@ -54,6 +54,8 @@ class UrlGuardTest {
             "http://[100::1]/x",
             "http://[2001:db8::1]/x",
             "http://[2002:c000:204::]/x",
+            // NAT64 前缀：64:ff9b::7f00:1 在被 NAT64 的环境里就是 127.0.0.1
+            "http://[64:ff9b::7f00:1]/x",
         ).forEach { url ->
             assertTrue(blocked(url).isNotBlank(), "$url 属于保留地址段，应当被拒绝")
         }

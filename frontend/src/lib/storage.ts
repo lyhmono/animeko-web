@@ -91,15 +91,23 @@ function setDoc(next: UserData): void {
 export async function loadUserData(): Promise<void> {
   try {
     const remote = await api.loadDataWithEtag()
-    setDoc(remote.doc)
+    // 读取失败期间用户仍可点收藏/播放：这些改动记在 pending 里，但 doc 只有本地
+    // 这一小份。若直接 setDoc(remote) 再清 pending，它们就被静默丢掉了。
+    // 这里把 pending 改动合并到服务端文档上，随后立刻推一轮。
+    const hadPending = hasPendingWrites()
+    const nextDoc = hadPending ? applyPendingTo(remote.doc) : remote.doc
+    setDoc(nextDoc)
     baseEtag = remote.etag
     loaded = true
-    pendingKeys.clear()
-    pendingProgressKeys.clear()
-    pendingFavIds.clear()
-    pendingSourceFavKeys.clear()
-    pendingSubjectKeys.clear()
-    setSync({  status: 'ready', kind: null, error: ''  })
+    if (!hadPending) clearPending()
+    // 体积提醒属于上一份文档：换账号/重新读取后不能继续挂着旧结论
+    sizeNote = ''
+    if (hadPending) {
+      setSync({ status: 'pending', kind: null, error: '' })
+      void flushUserData()
+    } else {
+      setSync({ status: 'ready', kind: null, error: '' })
+    }
   } catch (e) {
     loaded = false
     setDoc({})
@@ -130,6 +138,19 @@ const pendingFavIds = new Set<number>()
 const pendingSourceFavKeys = new Set<string>()
 /** subjectProgress 也是 map：整键覆盖会让另一台设备刚记下的条目消失 */
 const pendingSubjectKeys = new Set<string>()
+
+function hasPendingWrites(): boolean {
+  return pendingKeys.size > 0 || pendingProgressKeys.size > 0 || pendingFavIds.size > 0 ||
+    pendingSourceFavKeys.size > 0 || pendingSubjectKeys.size > 0
+}
+
+function clearPending(): void {
+  pendingKeys.clear()
+  pendingProgressKeys.clear()
+  pendingFavIds.clear()
+  pendingSourceFavKeys.clear()
+  pendingSubjectKeys.clear()
+}
 
 let timer: ReturnType<typeof setTimeout> | undefined
 let running: Promise<void> | null = null
@@ -350,12 +371,25 @@ async function mergeWithServer(round: Round): Promise<boolean> {
   // 但不在 round 里。用快照合并会把它们从内存文档里抹掉（setDoc(merged)），
   // 下一轮再把这个「被抹掉」的文档发上去 —— 改动就这么静默丢了
   // （实测：删 A → PUT 在飞时删 B → 第一轮 409 → 合并只应用了 A → B 复活）。
-  const keys = [...new Set([...round.keys, ...pendingKeys])]
-  const progressKeys = [...new Set([...round.progressKeys, ...pendingProgressKeys])]
-  const favIds = [...new Set([...round.favIds, ...pendingFavIds])]
-  const sourceFavKeys = [...new Set([...round.sourceFavKeys, ...pendingSourceFavKeys])]
-  const subjectKeys = [...new Set([...round.subjectKeys, ...pendingSubjectKeys])]
-  const merged: UserData = { ...fresh.doc }
+  setDoc(applyPendingTo(fresh.doc, round))
+  baseEtag = fresh.etag
+  return true
+}
+
+/**
+ * 把本机待写改动贴到一份新鲜的服务端文档上。
+ *
+ * round 为 null 表示「读取失败后重新读取成功」：此时本地 doc 只是读取失败期间
+ * 攒下的一小份，recent / searchHistory 必须和服务器并集，不能整键覆盖掉
+ * 另一台设备刚写入的记录。正常 409 合并仍按原语义（本地整键为准）。
+ */
+function applyPendingTo(fresh: UserData, round?: Round): UserData {
+  const keys = [...new Set([...(round?.keys ?? []), ...pendingKeys])]
+  const progressKeys = [...new Set([...(round?.progressKeys ?? []), ...pendingProgressKeys])]
+  const favIds = [...new Set([...(round?.favIds ?? []), ...pendingFavIds])]
+  const sourceFavKeys = [...new Set([...(round?.sourceFavKeys ?? []), ...pendingSourceFavKeys])]
+  const subjectKeys = [...new Set([...(round?.subjectKeys ?? []), ...pendingSubjectKeys])]
+  const merged: UserData = { ...fresh }
   for (const key of keys) {
     if (key === 'progress') {
       const theirs = asMap(merged.progress)
@@ -385,15 +419,46 @@ async function mergeWithServer(round: Round): Promise<boolean> {
         else delete out[k]
       }
       merged.subjectProgress = out
+    } else if (key === 'recent' && round == null) {
+      merged.recent = mergeRecentLists(fresh.recent, doc.recent)
+    } else if (key === 'searchHistory' && round == null) {
+      merged.searchHistory = mergeSearchHistory(fresh.searchHistory, doc.searchHistory)
     } else if (Object.prototype.hasOwnProperty.call(doc, key)) {
       merged[key] = doc[key]
     } else {
       delete merged[key]
     }
   }
-  setDoc(merged)
-  baseEtag = fresh.etag
-  return true
+  return merged
+}
+
+/** 读取失败后的重新加载：recent 按 (source, playUrl) 并集，取 ts 更新的一份。 */
+function mergeRecentLists(server: unknown, local: unknown): unknown[] {
+  const byKey = new Map<string, Record<string, unknown>>()
+  for (const item of [...asItemList(local), ...asItemList(server)]) {
+    const playUrl = asMap(item).playUrl
+    if (typeof playUrl !== 'string' || !playUrl.startsWith('http')) continue
+    const key = `${String(asMap(item).source ?? '')}|${playUrl}`
+    const existing = byKey.get(key)
+    if (!existing || numOr(asMap(item).ts, 0) > numOr(existing.ts, 0)) byKey.set(key, item)
+  }
+  return [...byKey.values()]
+    .sort((a, b) => numOr(b.ts, 0) - numOr(a.ts, 0))
+    .slice(0, RECENT_LIMIT)
+}
+
+/** 读取失败后的重新加载：搜索历史并集，本地新增在前，仍受 10 条上限。 */
+function mergeSearchHistory(server: unknown, local: unknown): string[] {
+  const out: string[] = []
+  const values = [...(Array.isArray(local) ? local : []), ...(Array.isArray(server) ? server : [])]
+  for (const value of values) {
+    if (typeof value !== 'string') continue
+    const keyword = value.trim()
+    if (!keyword || out.includes(keyword)) continue
+    out.push(keyword)
+    if (out.length >= HISTORY_LIMIT) break
+  }
+  return out
 }
 
 // 关掉标签页 / 切后台时尽力把待写内容送出去（fetch 在页面卸载后可能被浏览器掐掉，
@@ -524,30 +589,36 @@ function mergeTouchedItems(
   return out
 }
 
+/**
+ * 按 ts 保留最新的一批条目，并返回被剪掉的键。
+ *
+ * 被剪掉的键必须一并记进 pending*：否则 409 合并时只把「本次新增的条目」
+ * 贴回服务端，被本地剪掉的旧条目会从服务端那份快照里复活，文档永远缩不回去。
+ */
+function pruneByTs(map: Record<string, unknown>): { next: Record<string, unknown>; removed: string[] } {
+  const entries = Object.entries(map)
+  if (entries.length <= MAX_PROGRESS_ENTRIES) return { next: map, removed: [] }
+  const tsOf = (v: unknown): number => {
+    const ts = asMap(v).ts
+    return typeof ts === 'number' && Number.isFinite(ts) ? ts : 0
+  }
+  // 所有条目一起按 ts 竞争（缺 ts 视为最旧，最先淘汰）：上限才是真上限，
+  // 淘汰的也是「最没信息的那几条」，而不是「格式旧的那一类」。
+  entries.sort((a, b) => tsOf(b[1]) - tsOf(a[1]))
+  const kept: Record<string, unknown> = Object.create(null)
+  entries.slice(0, MAX_PROGRESS_ENTRIES).forEach(([k, v]) => {
+    kept[k] = v
+  })
+  const keptKeys = new Set(Object.keys(kept))
+  return { next: kept, removed: Object.keys(map).filter((k) => !keptKeys.has(k)) }
+}
+
 function writeProgressMap(map: Record<string, unknown>, entryKey: string): void {
   // 剪掉最久没动的条目：一条都不删的话，看够了集数就会撞上服务端 512KB 上限，
   // 之后每一次收藏/进度写入都会 400，等于整个数据层从此写不进去
-  const entries = Object.entries(map)
-  if (entries.length > MAX_PROGRESS_ENTRIES) {
-    // 说清楚这次到底改变了什么，别写成「原先会无条件删掉没有 ts 的条目」那种大话：
-    // 原先是先把条目按「有没有 ts」分堆，**只有带 ts 的那堆参与上限判断** ——
-    // 于是一旦带 ts 的超过 400，所有不带 ts 的连排序资格都没有就被丢了（它们本来
-    // 可能是刚导入的那几条）；而反过来，不带 ts 的再多也不算数，文档可以无限超出
-    // 400 这一档 —— 而 400 存在的理由正是别让 512KB 上限把整个数据层写死。
-    // 现在所有条目一起按 ts 竞争（缺 ts 视为最旧，最先淘汰）：上限是真上限，
-    // 淘汰的也是「最没信息的那几条」，而不是「格式旧的那一类」。
-    const tsOf = (v: unknown): number => {
-      const ts = asMap(v).ts
-      return typeof ts === 'number' && Number.isFinite(ts) ? ts : 0
-    }
-    entries.sort((a, b) => tsOf(b[1]) - tsOf(a[1]))
-    const kept: Record<string, unknown> = {}
-    entries.slice(0, MAX_PROGRESS_ENTRIES).forEach(([k, v]) => {
-      kept[k] = v
-    })
-    map = kept
-  }
-  doc.progress = map
+  const { next, removed } = pruneByTs(map)
+  removed.forEach((key) => pendingProgressKeys.add(key))
+  doc.progress = next
   scheduleFlush('progress', entryKey)
 }
 
@@ -664,17 +735,9 @@ export function setSubjectProgress(subjectId: number, ep: number): void {
   const next = { ...map, [key]: { ep, ts: Date.now() } }
   // 和 progress 一样要剪枝：这个键按条目增长，不剪的话迟早撞上服务端 512KB 上限，
   // 之后每一次写入都会 400 —— 整个数据层从此写不进去，而不只是进度丢失。
-  const entries = Object.entries(next).filter(([, v]) => typeof asMap(v).ts === 'number')
-  if (entries.length > MAX_PROGRESS_ENTRIES) {
-    entries.sort((a, b) => (asMap(b[1]).ts as number) - (asMap(a[1]).ts as number))
-    const kept: Record<string, unknown> = {}
-    entries.slice(0, MAX_PROGRESS_ENTRIES).forEach(([k, v]) => {
-      kept[k] = v
-    })
-    writeSubjectProgress(kept, [key])
-    return
-  }
-  writeSubjectProgress(next, [key])
+  const { next: pruned, removed } = pruneByTs(next)
+  removed.forEach((k) => pendingSubjectKeys.add(k))
+  writeSubjectProgress(pruned, [key])
 }
 
 // ---------- 播放方式（设备偏好，不进服务端文档）----------
@@ -1097,8 +1160,12 @@ export function importUserData(text: string): ImportSummary {
     }
     // 与 progress 同理：导入必须把**真正改过的条目**记进待写集合，
     // 否则 409 合并时会按服务端版本整键覆盖，这次导入静默丢失。
-    // 之前这里用 writeJson 连条目级标记都没有，正是在这条路上丢的。
-    if (applied.length > 0) writeSubjectProgress(merged, applied)
+    // 同时走一次上限剪枝：备份可能有几千条，直接合并会撞上 512KB 上限。
+    if (applied.length > 0) {
+      const { next: pruned, removed } = pruneByTs(merged)
+      removed.forEach((k) => pendingSubjectKeys.add(k))
+      writeSubjectProgress(pruned, applied)
+    }
   }
 
   if (incoming.progress && typeof incoming.progress === 'object' && !Array.isArray(incoming.progress)) {
@@ -1115,7 +1182,11 @@ export function importUserData(text: string): ImportSummary {
       summary.progress += 1
     }
     if (applied.length > 0) {
-      doc.progress = merged
+      // 备份里可能有几千条进度；不剪枝的话一次导入就能超过服务端 512KB，
+      // 之后每一次保存都是 400，用户只能手动清理文档。
+      const { next: pruned, removed } = pruneByTs(merged)
+      removed.forEach((key) => pendingProgressKeys.add(key))
+      doc.progress = pruned
       // 只标记这次真正写进去的键。把**全部本地键**都记成「我改的」会在 409 合并时
       // 把另一台设备刚删掉的旧进度又贴回服务端（复活）。
       for (const key of applied) pendingProgressKeys.add(key)
@@ -1124,15 +1195,26 @@ export function importUserData(text: string): ImportSummary {
   }
 
   if (Array.isArray(incoming.searchHistory)) {
-    const merged = [...listSearchHistory()]
+    const local = listSearchHistory()
+    // 导入项放前面：本地历史通常已经占满 10 条，若追加到末尾再 slice，
+    // 导入项会被全部裁掉，而摘要仍然报告「已合并 N 条」。
+    const merged: string[] = []
     for (const raw of incoming.searchHistory) {
       if (typeof raw !== 'string') continue
       const keyword = raw.trim()
       if (!keyword || merged.includes(keyword)) continue
       merged.push(keyword)
-      summary.searchHistory += 1
     }
-    if (summary.searchHistory > 0) writeJson('searchHistory', merged.slice(0, HISTORY_LIMIT))
+    for (const keyword of local) {
+      if (!merged.includes(keyword)) merged.push(keyword)
+    }
+    const next = merged.slice(0, HISTORY_LIMIT)
+    const localSet = new Set(local)
+    const actuallyAdded = next.filter((keyword) => !localSet.has(keyword)).length
+    if (actuallyAdded > 0) {
+      summary.searchHistory += actuallyAdded
+      writeJson('searchHistory', next)
+    }
   }
 
   if (Array.isArray(incoming.recent)) {

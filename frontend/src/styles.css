@@ -1469,8 +1469,12 @@ textarea::placeholder {
 /* 播放中 3 秒无操作：控制条淡出，连光标一起藏 */
 .video-shell.hide-controls .player-controls {
   opacity: 0;
+  /* 只藏 opacity 不够：控制条里的按钮仍在 Tab 焦点序里，键盘可以触发不可见按钮。
+     visibility 在淡出结束后切到 hidden，既保留过渡又移出焦点/辅助技术树。 */
+  visibility: hidden;
   transform: translateY(8px);
   pointer-events: none;
+  transition: opacity 0.25s ease, transform 0.25s ease, visibility 0s linear 0.25s;
 }
 
 .video-shell.hide-controls {

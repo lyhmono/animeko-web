@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import AiringCalendar from '../components/AiringCalendar'
 import ContinueWatching from '../components/ContinueWatching'
-import { api } from '../api'
+import { api, errMsg } from '../api'
 import type { StoredSource } from '../types'
 import { addSearchHistory, clearSearchHistory, listSearchHistory, onDocChange } from '../lib/storage'
 import {
@@ -17,6 +17,8 @@ import {
 export default function HomePage() {
   const [keyword, setKeyword] = useState('')
   const [sources, setSources] = useState<StoredSource[]>([])
+  const [sourcesError, setSourcesError] = useState('')
+  const [sourcesRetry, setSourcesRetry] = useState(0)
   const [health, setHealth] = useState<{ version: string; authEnabled: boolean } | null>(null)
   // 区分「检测中」与「连接失败」：null=检测中，true/false=健康检查结果
   const [apiReachable, setApiReachable] = useState<boolean | null>(null)
@@ -34,9 +36,16 @@ export default function HomePage() {
         setHealth(null)
         setApiReachable(false)
       })
-    api.sources().then(setSources).catch(() => setSources([]))
+    setSourcesError('')
+    api
+      .sources()
+      .then((list) => setSources(list))
+      .catch((e) => {
+        setSources([])
+        setSourcesError(errMsg(e))
+      })
     setHistory(listSearchHistory())
-  }, [])
+  }, [sourcesRetry])
 
   // 启动读取失败后「重新读取」成功会整份换档，历史 chips 要跟着刷新
   useEffect(() => onDocChange(() => setHistory(listSearchHistory())), [])
@@ -78,7 +87,7 @@ export default function HomePage() {
         <div className="hero-actions">
           <Link className="btn btn-secondary" to="/sources">
             <IconLayers size={15} />
-            数据源管理（{enabledCount}/{sources.length} 已启用）
+            数据源管理（{sourcesError ? '列表加载失败' : `${enabledCount}/${sources.length} 已启用`}）
           </Link>
           <Link className="btn btn-secondary" to="/settings">
             <IconSettings size={15} />
@@ -86,6 +95,15 @@ export default function HomePage() {
           </Link>
         </div>
       </section>
+
+      {sourcesError && (
+        <div className="error-box">
+          数据源列表加载失败：{sourcesError}{' '}
+          <button className="btn btn-sm" onClick={() => setSourcesRetry((n) => n + 1)}>
+            重试
+          </button>
+        </div>
+      )}
 
       {/* 继续观看：比「每日放送」更贴近当下的动作 —— 上次没看完的那集就在眼前 */}
       <ContinueWatching />

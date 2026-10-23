@@ -55,12 +55,11 @@ open http://localhost:8080
 
 ### 别把 8080 直接裸露在公网
 
-服务默认监听 `0.0.0.0`，而「能不能读到你的收藏和内网拓扑」取决于网络边界，不取决于代码。
-三种安全姿势，按推荐顺序：
+服务进程在容器内默认监听 `0.0.0.0`，而 compose **默认只把端口发布到 `127.0.0.1`**；
+「能不能读到你的收藏和内网拓扑」最终仍取决于网络边界。三种安全姿势，按推荐顺序：
 
 ```bash
-# A. 只绑本机，用 SSH 隧道看（最省心，口令都不用设）
-#    compose 里改成 ports: - "127.0.0.1:8080:8080"，然后本地：
+# A. 只绑本机，用 SSH 隧道看（默认就是这个姿势，口令都不用设）
 ssh -N -L 8080:127.0.0.1:8080 user@your-vps      # 浏览器开 http://localhost:8080
 
 # B. 反向代理 + HTTPS：记得开 ANIMEKO_COOKIE_SECURE=true，
@@ -251,6 +250,9 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
   会话**绑定目标主机**：sid 只适用于解析出来的那台主机，以及清单内容里出现过的
   分片/密钥主机（由服务端改写清单时登记，客户端无法自行扩大）。缺了这层绑定，
   一个泄漏的 sid 就等于「用受害者的 Cookie 去请求攻击者指定的任意地址」。
+  源站 Cookie 只发给解析出来的**媒体主机**；清单里追加的 CDN/密钥主机只收到
+  UA/Referer，不再收到 Cookie —— 一份被篡改的清单因此无法把源站凭据引到第三方。
+  （若某个源的分片 CDN 确实依赖源站 Cookie，需要把视频/分片放在同一主机或调整源配置。）
   会话过期返回 `410 PROXY_SESSION_EXPIRED`、主机不匹配返回
   `403 PROXY_SESSION_TARGET_MISMATCH`（都与「源站拒绝」可区分）；播放器遇到
   这两种情况会**自动重新解析一次**，失败才报错。
@@ -274,7 +276,9 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
   超限返回 `400`，且请求体是边读边计数的，不会先把整个请求读进堆里。
 - 个人数据落盘是「写临时文件 → `fsync` → 备份当前文件 → rename」，而**读的一侧会认这份备份**：
   主文档缺失、为空或不是合法 JSON 时，先拿同目录的 `userdata.json.bak` 恢复（复制回主文件，
-  这样恢复动作本身再被打断也还能再来一次），只有备份也不可用时才退回空文档。
+  这样恢复动作本身再被打断也还能再来一次），只有备份也不存在/不是合法 JSON 时才退回空文档。
+  **读取本身失败**（权限、磁盘、路径被目录占用）时返回 5xx，而不是空文档：把「读不出来」
+  当成「服务器上没有数据」，前端下一次保存就会把原文件覆盖掉。
   这一条以前是缺的 —— `.bak` 一直在写却没人读，等于备了份没人看的档案：掉电让主文件只剩半个，
   读侧就返回 `{}`，前端把它当空文档，用户下一次点收藏把整份数据覆盖掉。
   坏掉的那份会留成 `*.bad` 作为证据。`read()` 与 `write()` 共用同一把锁：
@@ -349,7 +353,7 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 
 ## 使用流程
 
-1. **导入数据源**：全新安装的数据源列表是**空的**（不再预置示例源）；设了 `ANIMEKO_SUBSCRIPTION_AUTO_IMPORT` 时会在后台协程里拉取并导入（compose 里默认就是社区 css1.json），打开就能用；订阅站挂了或很慢都不影响启动。之后想增删，进入「数据源」页粘贴 animeko 的 Selector 数据源 JSON（与 animeko App 内「设置 → 数据源管理」添加的配置格式一致），或再用聚合订阅入口挑源。
+1. **导入数据源**：全新安装的数据源列表是**空的**（不再预置示例源）；设了 `ANIMEKO_SUBSCRIPTION_AUTO_IMPORT` 时会在后台协程里拉取并导入，打开就能用；订阅站挂了或很慢都不影响启动。**这一项默认关闭**（compose 里已注释），需要自行取消注释，避免首次启动就自动装载第三方配置。之后想增删，进入「数据源」页粘贴 animeko 的 Selector 数据源 JSON（与 animeko App 内「设置 → 数据源管理」添加的配置格式一致），或再用聚合订阅入口挑源。
 2. **搜索**：首页搜索 → Bangumi 条目 + 各数据源结果。
 3. **播放**：
    - Bangumi 条目页 → 剧集「播放」→ 选择数据源「自动匹配」（或「手动」）→ 自动在数据源中匹配番剧与集数；
@@ -357,7 +361,7 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
    - 解析失败时在播放页底部「手动地址播放」粘贴 m3u8/mp4 地址。
    - **解析失败的三种原因**，报错文案里都区分得出来：① 播放页里根本没有可提取的地址（`NO_VIDEO_URL_FOUND`，多是强依赖 JS 执行的源，服务端拿不到地址，只能手动播放）；② 地址提到了但上游拒绝本机（`403/401` 或连不上，常见于只对国内 IP 开放的 CDN，境外 VPS 无解，换国内线路的源即可）；③ 源站超时（`ANIMEKO_REQUEST_TIMEOUT_MS` 可调，但别指望调大能救死站）。
 4. **聚合订阅**：数据源页填一条社区订阅地址（如 `https://sub.creamycake.org/v1/css1.json`）→「拉取订阅」→ 列表里能看到每个源的名字、分级、站点主机名与是否已存在 → 勾选后导入。整包导入的坏处是每次搜索都要把打不开的站点各试一遍，所以默认只勾选「本机还没有」的那些。订阅站挂了可以展开「贴订阅正文」直接粘 JSON。预览时会记录内容指纹，导入时若订阅已被更新过会提示重新预览，避免按一份和刚看到的不一样的清单导入。
-   **不想每次都手动勾**：设 `ANIMEKO_SUBSCRIPTION_AUTO_IMPORT=https://sub.creamycake.org/v1/css1.json`（compose 里已默认写好），服务每次启动自动导入，再配 `ANIMEKO_SUBSCRIPTION_AUTO_TIERS=0,1` 只留高质量分级。自动导入只覆盖同名源、不删你手工加的源，也不会重启你关掉的源。
+   **不想每次都手动勾**：设 `ANIMEKO_SUBSCRIPTION_AUTO_IMPORT=https://sub.creamycake.org/v1/css1.json`（compose 里已注释好这一行，取消注释即可），服务每次启动自动导入，再配 `ANIMEKO_SUBSCRIPTION_AUTO_TIERS=0,1` 只留高质量分级。自动导入只覆盖同名源、不删你手工加的源，也不会重启你关掉的源。
 5. **登录**：首次打开是登录页，输入账号口令后由服务端签发会话 Cookie；退出登录会让会话在服务端立即作废。
 6. **追番与连播**：条目页点「收藏」加入追番列表（导航栏「收藏」查看）；从剧集列表进入播放时会自动带上下一集，当前集播放结束后倒计时自动连播。
 7. **播放快捷键**：`空格`/`K` 播放暂停、`←`/`→` ±5 秒、`J`/`L` ±10 秒、`↑`/`↓` 音量、`M` 静音、`F` 全屏。播放进度自动记忆（写在服务器），下次进入同一剧集时可「继续播放」。
@@ -454,6 +458,8 @@ LANG=C.UTF-8 LC_ALL=C.UTF-8 ANIMEKO_FRONTEND_DIR=../frontend/dist \
 
 # 前端（React 19 + Vite 7）
 cd frontend && NODE_ENV=development npm install && npm run dev   # http://localhost:5173，/api 代理到 8080
+# 代理必须保留浏览器原始 Host（vite.config.ts 的 changeOrigin: false）：
+# 后端用 Origin 与 Host 的 host+port 做同源写校验，改成 8080 会让登录/收藏等 POST 全部 403。
 ```
 
 两个坑都踩过，写下来省时间：
@@ -463,7 +469,7 @@ cd frontend && NODE_ENV=development npm install && npm run dev   # http://localh
   而 `npm install` 本身是成功退出 0 的。
 - **起服务要带 UTF-8 locale**（原因见上面「社区数据源哪里找」）。
 
-单元测试：`cd backend && ./gradlew test` —— 用例数以 `grep -rho '@Test' backend/src/test | wc -l` 为准（写死一个数字必然过期，这里就曾经写着 178 而实际早已 260+）。覆盖 JsonPath / Selector 引擎与数据源仓库 /
+单元测试：`cd backend && ./gradlew test` —— 用例数以 `grep -rho '@Test' backend/src/test | wc -l` 为准（写死一个数字必然过期，这里就曾经写着 178 而实际早已 260+）；前端纯函数用 Vitest：`cd frontend && npm run test`。覆盖 JsonPath / Selector 引擎与数据源仓库 /
 聚合订阅（含逐跳重定向、订阅内重名、坏条目单独失败、预览指纹防内容漂移、自动导入沿用已关闭的源、
 一个订阅挂了不连带其它订阅）/ HLS 重写 /
 代理会话绑定与过期（含主机名解析不出来时不得放行凭据）/ HLS 上游非 2xx 不得伪装成合法清单 / 个人数据从 .bak 恢复与读写同锁 / 登录会话与限速（含 XFF 伪造与可信代理层数）/ 凭据预言机 /
@@ -472,7 +478,10 @@ cd frontend && NODE_ENV=development npm install && npm run dev   # http://localh
 配置正则过期时的通用后缀兜底（且配置命中优先）/
 停用源服务端拒绝 / API 路由与静态托管缓存策略 / Bangumi 客户端。
 编译会有告警但**不会因此失败**（没开 `-Werror`/`allWarningsAsErrors`）——与其写一句没人执行的「要求 0 警告」，不如把它写成现状：一个不生效的承诺比没有承诺更坏。
-GitHub Actions（`.github/workflows/ci.yml`）在 push/PR 上自动跑后端测试与前端 `tsc + vite build`。
+GitHub Actions（`.github/workflows/ci.yml`）在 push/PR 上自动跑后端测试、前端 `tsc + vite build` +
+Vitest、容器健康/降权检查、HTTP 门禁（401、`If-Match`/409、注销后旧 Cookie 不可复用、缺失静态资源 404）
+和 Playwright 浏览器冒烟。完整的 `live-smoke.sh` 依赖真实社区订阅站，仍作为本地/手工检查，
+不作为 CI 门禁。
 
 端到端冒烟（对**真实二进制**跑，不是测试桩）：`bash scripts/live-smoke.sh` —— 13 节 78 项，
 含登录门控、服务端个人数据往返与 ETag/409、真实订阅站预览导入、静态缓存策略、

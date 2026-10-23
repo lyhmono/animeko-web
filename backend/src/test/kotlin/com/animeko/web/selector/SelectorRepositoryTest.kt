@@ -11,7 +11,10 @@ class SelectorRepositoryTest {
 
     private fun repo() = SelectorRepository(Files.createTempDirectory("animeko-repo"))
 
-    private fun args(name: String) = SelectorSourceArguments(name = name)
+    private fun args(name: String) = SelectorSourceArguments(
+        name = name,
+        searchConfig = SelectorSearchConfig(searchUrl = "https://a.test/s?kw={keyword}"),
+    )
 
     @Test
     fun `an unavailable data dir does not stop startup and writes fail loudly`() {
@@ -155,6 +158,7 @@ class SelectorRepositoryTest {
         val r = repo()
         val bad = args("坏源").copy(
             searchConfig = SelectorSearchConfig(
+                searchUrl = "https://a.test/s?kw={keyword}",
                 matchVideo = MatchVideoConfig(matchVideoUrl = "([unclosed"),
             ),
         )

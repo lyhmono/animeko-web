@@ -144,13 +144,17 @@ object UrlGuard {
         }
     }
 
-    /** IPv6 保留段：100::/64（discard-only）、2001:db8::/32（文档）、2002::/16（6to4） */
+    /** IPv6 保留段：100::/64（discard-only）、2001:db8::/32（文档）、2002::/16（6to4）、64:ff9b::/96（NAT64） */
     private fun isReservedIpv6(b: ByteArray): Boolean {
         // 参数是**字节偏移**，不是第 n 组：2001:db8:: 的第二组在 b[2..3]。
         // 写成 word(1) 会读到 b[1..2]（0x010d），于是 2001:db8::/32 永远匹配不上
         fun wordAt(byteAt: Int) = ((b[byteAt].toInt() and 0xff) shl 8) or (b[byteAt + 1].toInt() and 0xff)
         val head = wordAt(0)
-        return head == 0x0100 || head == 0x2002 || (head == 0x2001 && wordAt(2) == 0x0db8)
+        val second = wordAt(2)
+        return head == 0x0100 || head == 0x2002 || (head == 0x2001 && second == 0x0db8) ||
+            // NAT64 的 64:ff9b::/96 可以把内网 IPv4 映射成一个看起来「正常」的 v6 地址，
+            // 在不做这条拦截的环境里，http://[64:ff9b::7f00:1]/ 就是 127.0.0.1。
+            (head == 0x0064 && second == 0xff9b)
     }
 
     /** IPv6 唯一本地地址 fc00::/7，Java 不把它归入 siteLocal。 */
