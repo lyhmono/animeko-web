@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
 import Hls from 'hls.js'
 import { isDirectPlayable } from '../api'
 import { getPlayerPrefs, savePlayerPrefs } from '../lib/storage'
@@ -181,9 +181,17 @@ export default function VideoPlayer({
   const startAtAppliedRef = useRef(false)
   /** 换源（直连失败回退、410 重解析）时要续上的播放位置；由上一份源的清理逻辑写入 */
   const resumeAtRef = useRef(0)
+  /**
+   * 源生命周期对应的 playKey。清理回调只在「当前这一轮仍是同一个 playKey」时
+   * 才记录播放位置 —— 不能只靠 effect 先后顺序：参数先换、src 后换时，
+   * 清理拿到的是旧源的 currentTime，会把上一段进度错续到新视频上。
+   */
+  const loadedPlayKeyRef = useRef(playKey)
+  const currentPlayKeyRef = useRef(playKey)
   useEffect(() => {
     const video = videoRef.current
     if (!video || !activeSrc) return
+    loadedPlayKeyRef.current = playKey
     let hls: Hls | null = null
     setError(null)
     // 换源（切集）后要重新允许定位一次，否则第二集的断点续播永远不生效
@@ -228,10 +236,12 @@ export default function VideoPlayer({
     }
 
     return () => {
-      // 换源前记住当前位置：直接回退/410 重解析换的是同一集的另一条地址，
-      // 不能再用最初的续播点重新定位（那会把看到一半的视频倒回起点）
-      const at = video.currentTime
-      if (Number.isFinite(at) && at > 0) resumeAtRef.current = at
+      // 只有还在同一集时才记住当前位置：直接回退/410 重解析换的是同一集的
+      // 另一条地址，要续播；playKey 已经变了（手动换地址/换集）则不能沿用。
+      if (currentPlayKeyRef.current === loadedPlayKeyRef.current) {
+        const at = video.currentTime
+        if (Number.isFinite(at) && at > 0) resumeAtRef.current = at
+      }
       hls?.destroy()
       video.removeAttribute('src')
       video.load()
@@ -262,8 +272,10 @@ export default function VideoPlayer({
 
   // 同一集换源（直连→中转、410 重解析）要续上当前位置，靠 playKey 区分：
   // 它不变说明还是这一集，变了（手动换地址/换集）就不能沿用上一段的位置。
-  // 不能用 src 判断：410 重解析时 proxyPath 会换一个 sid，src 也会变。
-  useEffect(() => {
+  // 用 layout effect 是为了赶在 activeSrc 的被动清理之前更新：
+  // 清理回调要拿 currentPlayKeyRef 和“加载时的 playKey”比，晚一步就会把旧位置写回去。
+  useLayoutEffect(() => {
+    currentPlayKeyRef.current = playKey
     resumeAtRef.current = 0
   }, [playKey])
 
