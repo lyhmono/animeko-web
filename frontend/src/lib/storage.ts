@@ -20,6 +20,10 @@ import type { UserData } from '../types'
 let doc: UserData = {}
 let loaded = false
 let baseEtag = ''
+/** 同一时刻只允许一个 loadUserData 在飞；重试按钮连点/两处触发时不能并发整档读取 */
+let loadInFlight: Promise<void> | null = null
+/** 注销/会话失效时递增，用来丢弃换账号后才返回的旧读取结果 */
+let loadEpoch = 0
 
 // ---------- 同步状态（给界面一个「到底存上了没有」的说法）----------
 
@@ -89,8 +93,22 @@ function setDoc(next: UserData): void {
  * 所以它同时也是「现在不能写」的状态，界面要显示可重试的读取错误。
  */
 export async function loadUserData(): Promise<void> {
+  if (loadInFlight) return loadInFlight
+  const epoch = loadEpoch
+  const task = loadOnce(epoch)
+  loadInFlight = task
+  try {
+    await task
+  } finally {
+    if (loadInFlight === task) loadInFlight = null
+  }
+}
+
+async function loadOnce(epoch: number): Promise<void> {
   try {
     const remote = await api.loadDataWithEtag()
+    // 注销/换账号后返回的旧读取结果必须丢弃，不能把旧会话的 doc 贴回来
+    if (epoch !== loadEpoch) return
     // 读取失败期间用户仍可点收藏/播放：这些改动记在 pending 里，但 doc 只有本地
     // 这一小份。若直接 setDoc(remote) 再清 pending，它们就被静默丢掉了。
     // 这里把 pending 改动合并到服务端文档上，随后立刻推一轮。
@@ -109,9 +127,12 @@ export async function loadUserData(): Promise<void> {
       setSync({ status: 'ready', kind: null, error: '' })
     }
   } catch (e) {
+    if (epoch !== loadEpoch) return
     loaded = false
-    setDoc({})
     baseEtag = ''
+    // 不能 setDoc({})：读取失败期间攒下的本地操作仍要留给下一次成功时合并。
+    // 清掉本地 doc 会让 pendingFavIds/XxxKeys 指向一份空文档，下一次合并反而
+    // 会删掉服务端同 id 的收藏/进度（失败两次就丢数据）。
     setSync({
       status: 'error',
       kind: 'load',
@@ -1019,6 +1040,9 @@ export function addRecent(item: RecentItem): RecentItem[] {
  * 否则「用旧会话的残档去覆盖新会话的数据」这种事真的会发生。
  */
 export function markUserDataStale(): void {
+  // 让在飞的旧 load 结果失效；同时允许下一次 loadUserData 立即重新发起
+  loadEpoch++
+  loadInFlight = null
   if (timer) {
     clearTimeout(timer)
     timer = undefined

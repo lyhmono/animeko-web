@@ -182,6 +182,12 @@ data class MatchVideoConfig(
         """(^http(s)?:\/\/(?!.*http(s)?:\/\/).+((\.mp4)|(\.mkv)|(m3u8)).*(\?.+)?)|(akamaized)|(bilivideo.com)""",
     /** 访问播放页时携带的 Cookie（每行一条 k=v） */
     val cookies: String = "quality=1080",
+    /**
+     * 额外允许接收 [cookies] 的主机名（只写主机名，不带 scheme/path）。
+     * 默认空：Cookie 只发给解析出的媒体主机；同站子域或分离的 CDN 如果确实依赖
+     * 源站 Cookie，由数据源配置显式列在这里，不能由清单内容自行扩大。
+     */
+    val cookieHosts: List<String> = emptyList(),
     val addHeadersToVideo: VideoHeaders = VideoHeaders(),
 )
 

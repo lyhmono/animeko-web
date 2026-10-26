@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { api, errMsg, UNAUTHORIZED_EVENT } from '../api'
 import VideoPlayer from '../components/VideoPlayer'
+import { isSpecialEpisodeName } from '../lib/titleMatch'
 import {
   addRecent,
   clearProgress,
@@ -226,7 +227,7 @@ export default function PlayerPage() {
         title: `${animeName || title} ${e.name}`,
         anime: animeName,
         ep: String(e.sortNum ?? e.sort),
-        bep: nextBep,
+        bep: nextBep != null && !isSpecialEpisodeName(e.name) ? nextBep : undefined,
       })
       const nx = list[i + 1]
       if (!nx) return

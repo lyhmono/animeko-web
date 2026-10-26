@@ -478,6 +478,16 @@ class SelectorEngineTest {
     }
 
     @Test
+    fun `cookie hosts from the source config are normalized and returned`() = runTest {
+        val fetcher = StubFetcher(mapOf("$base/play/1-1.html" to fixture("play_page.html")))
+        val cfg = config().copy(
+            matchVideo = MatchVideoConfig(cookieHosts = listOf("CDN.Example.COM", "bad/host", " ")),
+        )
+        val video = SelectorEngine(fetcher).resolveVideo(cfg, "$base/play/1-1.html")
+        assertEquals(setOf("cdn.example.com"), video.cookieHosts)
+    }
+
+    @Test
     fun `video request inherits the source user agent when video UA is not set`() = runTest {
         val fetcher = StubFetcher(mapOf("$base/play/1-1.html" to fixture("play_page.html")))
         val cfg = config().copy(userAgent = "CustomUA/1.0")

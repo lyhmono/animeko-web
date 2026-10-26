@@ -194,10 +194,13 @@ fun Application.configureApiRoutes(
                         finish()
                     }
                     AuthResult.Failed -> {
-                        // 顺手把两个会话 Cookie 名都过期掉：若浏览器里还揣着一份服务端已不认的
-                        // 旧 Cookie（改过 ANIMEKO_COOKIE_SECURE 的部署就会这样），不清掉的话
-                        // 它会一直被送上来，而用户看到的是「登录成功、下一个请求又 401」。
-                        call.response.clearSessionCookie(cfg)
+                        // 只有请求确实带着（可能是陈旧的）会话时才清 Cookie：若浏览器里
+                        // 还揣着一份服务端已不认的旧 Cookie，不清掉会让「登录成功、下一
+                        // 个请求又 401」循环。反过来，跨站无 Cookie 的 401（例如恶意
+                        // <img>）不能下发删除头，否则等于一个登出 CSRF。
+                        if (call.sessionTokens().isNotEmpty()) {
+                            call.response.clearSessionCookie(cfg)
+                        }
                         // 只有「浏览器直接访问」这类请求才值得下发 Basic 质询（curl 与命令行也没有
                         // Sec-Fetch-Mode）。给 XHR/媒体请求下发质询会让浏览器弹原生口令框，
                         // 盖住前端自己的登录页 —— 而 hls.js 的分片请求全是 XHR。
@@ -560,6 +563,7 @@ fun Application.configureApiRoutes(
                         userAgent = target.userAgent,
                         referer = target.referer,
                         cookie = target.cookie,
+                        extraCookieHosts = target.cookieHosts,
                     )
                     call.respond(
                         VideoSourceResponse(
@@ -597,15 +601,17 @@ fun Application.configureStaticFrontend(cfg: AppConfig) {
             val rel = path.removePrefix("/")
             val index = File(dir, "index.html")
             val file = if (rel.isEmpty()) index else dir.resolve(rel).normalize()
-            // 缓存策略必须按**归一化后的**路径判断：`/assets/../index.html` 的原始 rel
-            // 以 assets/ 开头，但实际文件是 index.html，不能给它 immutable。
-            val normalizedRel = if (file == index) {
-                "index.html"
-            } else {
-                file.relativeTo(dir).path.replace(File.separatorChar, '/')
-            }
             when {
                 file.isFile && file.startsWith(dir) -> {
+                    // 只在确认文件在 dir 内之后才 relativeTo：Windows 上不同盘根会抛
+                    // IllegalArgumentException，不能把一次静态资源请求变成 400。
+                    // 缓存策略必须按**归一化后的**路径判断：`/assets/../index.html` 的原始
+                    // rel 以 assets/ 开头，但实际文件是 index.html，不能给它 immutable。
+                    val normalizedRel = if (file == index) {
+                        "index.html"
+                    } else {
+                        file.relativeTo(dir).path.replace(File.separatorChar, '/')
+                    }
                     when {
                         // 带内容哈希的产物可以长期强缓存
                         normalizedRel.startsWith("assets/") ->
@@ -691,8 +697,10 @@ private fun looksLikeIpLiteral(value: String): Boolean {
     // 旧实现只判断「含冒号」，`abc:def` 也会被当成 IP 进入限速键空间。
     // 这里做字面校验、不解析 DNS：XFF 是自由文本，解析域名会变成出站请求。
     if (value.contains(':')) {
+        // 允许 IPv4-mapped 地址（::ffff:192.0.2.1）：双栈反代会把它作为 IPv4 客户端的
+        // XFF，若这里拒绝，所有 IPv4 客户端会退化成共用一个代理 IP 限速桶。
         return value.count { it == ':' } >= 2 &&
-            value.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' || it == ':' }
+            value.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' || it == ':' || it == '.' }
     }
     val parts = value.split('.')
     return parts.size == 4 && parts.all { part ->
@@ -740,8 +748,8 @@ private fun ApplicationCall.isCrossSiteWrite(cfg: AppConfig): Boolean {
     // 任意写这个账号。实测：服务在 127.0.0.1:8240 时，Origin: http://127.0.0.1:9999
     // 的 PUT 曾返回 200。
     //
-    // 端口从哪来，按可信度分三档；**取不到就放行** —— 宁可漏一格，也不要把每一次
-    // 收藏都误杀成 403，那会逼用户去开 ANIMEKO_ALLOW_CROSS_ORIGIN 把整道防线拆掉。
+    // 端口从哪来，按可信度分三档；取不到时用 Sec-Fetch-Site 兜底（见下），没有该头的
+    // 客户端（curl/脚本）仍放行 —— 宁可漏一格，也不要把每一次收藏都误杀成 403。
     //  1) Host / X-Forwarded-Host 里明写的端口：直接用。
     //  2) hops>=1 时用 X-Forwarded-Proto 推：既然已经信任这层代理转发的 Host，
     //     它转发的协议同样可信（https->443、http->80）。这一档以前是缺的：原写法是
@@ -764,7 +772,13 @@ private fun ApplicationCall.isCrossSiteWrite(cfg: AppConfig): Boolean {
         } else {
             cfg.port.takeIf { it == 80 || it == 443 }
         }
-        ?: return false
+    if (hostPort == null) {
+        // 端口不可知（反代抹掉了端口且没给 X-Forwarded-Proto）。此时如果浏览器
+        // 明确说这不是 same-origin，就不能放行；没有 Sec-Fetch-Site 的 curl/脚本
+        // 仍按原来的方式放行。
+        val site = request.headers["Sec-Fetch-Site"]?.trim()?.lowercase()
+        return site != null && site != "same-origin"
+    }
     val originPort = runCatching { URI(origin).port }.getOrNull()?.takeIf { it > 0 }
         ?: defaultPortFor(runCatching { URI(origin).scheme?.lowercase() }.getOrNull())
     // Origin 侧可以猜：它是浏览器给的可信值，scheme 一定在里面
@@ -1028,14 +1042,24 @@ private suspend fun proxyVideo(
             runCatching { result.body.close() }
             throw e
         }
-        if (UrlGuard.hostOf(next) != UrlGuard.hostOf(url)) {
-            // 跨主机重定向不再带 Cookie，避免源站凭据被送给第三个域名
+        if (UrlGuard.hostOf(next) != UrlGuard.hostOf(url) ||
+            UrlGuard.isInsecureDowngrade(url, next)
+        ) {
+            // 跨主机或 https→http 降级都不再带 Cookie：前者避免把源站凭据送给第三个
+            // 域名，后者避免 Cookie 明文经过链路中间人。
             headers.remove("Cookie")
         }
         url = next
         result.body.close()
         result = fetchStream(fetcher, url, headers)
         redirects++
+    }
+
+    // 跳转次数用尽后仍有有效 Location：这一跳从未经过 UrlGuard 校验，不能交给浏览器；
+    // 也必须放在 isHls 分支之前，否则 m3u8 的重定向环会被包装成一个无 Location 的 3xx。
+    if (result.status in 301..399 && !result.header("location").isNullOrBlank()) {
+        runCatching { result.body.close() }
+        throw UpstreamException("上游重定向次数过多（超过 $MAX_REDIRECTS 跳）")
     }
 
     val contentType = result.contentType
@@ -1074,16 +1098,6 @@ private suspend fun proxyVideo(
         return
     }
 
-    if (result.status in 301..399) {
-        // 跳转次数用尽后如果还有有效 Location，不能再把它交给浏览器：
-        // 这一跳从未经过 UrlGuard 校验，等于让页面替服务器去访问一个未验证的地址
-        // （浏览器侧的内网探测、混合内容等）。没有 Location（或只有空白值）的 3xx
-        // 仍原样透传——不能把「上游没给跳转目标」误报成「重定向超过 5 跳」。
-        if (!result.header("location").isNullOrBlank()) {
-            runCatching { result.body.close() }
-            throw UpstreamException("上游重定向次数过多（超过 $MAX_REDIRECTS 跳）")
-        }
-    }
     val status = runCatching { HttpStatusCode.fromValue(result.status) }.getOrDefault(HttpStatusCode.BadGateway)
     result.header("content-range")?.let { call.response.header("Content-Range", it) }
     result.header("accept-ranges")?.let { call.response.header("Accept-Ranges", it) }

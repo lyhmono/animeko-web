@@ -98,7 +98,11 @@ class UserDataStore(
     /** 备份存在且能解析成 JSON 对象时恢复它，否则 null。 */
     private fun restoreFromBackup(): Snapshot? {
         val bak = sib("bak")
-        val bytes = readBytesStrict(bak, "个人数据备份")
+        // .bak 是辅助资源：它自己读不出来（目录/锁定/权限）时降级为 warn，
+        // 不能把「主文件缺失 + 备份不可读」变成 API 永久 500。
+        val bytes = runCatching { readBytesStrict(bak, "个人数据备份") }
+            .onFailure { appLog.warn("个人数据备份读取失败，已忽略：{}", it.message ?: it::class.simpleName) }
+            .getOrNull()
         if (bytes == null || bytes.isEmpty()) return null
         val text = String(bytes, Charsets.UTF_8)
         val parsed = runCatching { json.parseToJsonElement(text) }.getOrNull()
@@ -138,7 +142,13 @@ class UserDataStore(
         synchronized(this) {
             // 条件写必须和写入在同一个临界区里，否则「检查通过」和「覆盖落盘」
             // 之间还能挤进另一个写者，检查就只是装饰
-            val current = currentEtagLocked()
+            val current = try {
+                currentEtagLocked()
+            } catch (e: ReadFailed) {
+                // 读取失败属于「这次写入无法建立版本基准」，映射为可诊断的 400 停止重试；
+                // 不能让它落到 500，否则前端会把它当瞬时故障每 5 秒重试下去。
+                throw IllegalArgumentException("个人数据无法读取，已停止写入：${e.message}", e)
+            }
             if (!ifMatchAllows(ifMatch, current)) throw Stale()
             val tmp = sib("tmp")
             try {

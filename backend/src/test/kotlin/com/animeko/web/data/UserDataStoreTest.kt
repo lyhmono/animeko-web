@@ -105,7 +105,9 @@ class UserDataStoreTest {
         Files.createDirectory(file)
         val store = UserDataStore(file)
         assertFailsWith<UserDataStore.ReadFailed> { store.read() }
-        assertFailsWith<UserDataStore.ReadFailed> { store.write("""{"a":1}""", null) }
+        // 写路径要把「读不出当前版本」映射成 400 级错误，停止前端无限重试
+        val writeError = assertFailsWith<IllegalArgumentException> { store.write("""{"a":1}""", null) }
+        assertTrue(writeError.message.orEmpty().contains("无法读取"), writeError.message.orEmpty())
     }
 
     @Test

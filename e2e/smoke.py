@@ -26,6 +26,10 @@ BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18080"
 failures: list[str] = []
 
 
+class SkipCheck(Exception):
+    """环境不满足断言前提（如页面不够高无法滚动）：显式 skip，不算通过。"""
+
+
 def check(name: str, fn, page: Page) -> None:
     """跑一条断言。失败记下来继续跑下一条 —— 一次看到所有问题，
     比修一条跑一次快得多（CI 一轮好几分钟，来回几轮就废掉半小时）。
@@ -34,6 +38,8 @@ def check(name: str, fn, page: Page) -> None:
     try:
         fn()
         print(f"  [ok] {name}")
+    except SkipCheck as e:
+        print(f"  [skip] {name}: {e}")
     except Exception as e:  # noqa: BLE001 - 断言失败类型很多，统一收集
         print(f"  [FAIL] {name}: {str(e).splitlines()[0][:300]}")
         failures.append(name)
@@ -205,8 +211,7 @@ def main() -> int:
                 "() => document.documentElement.scrollHeight > window.innerHeight + 400"
             )
             if not can_scroll:
-                print("    (当前页面不够高，跳过滚动断言)")
-                return
+                raise SkipCheck("当前页面不够高，无法验证滚动后的导航")
             page.evaluate("() => window.scrollTo(0, 400)")
             page.wait_for_timeout(300)
             y = page.evaluate("() => window.scrollY")

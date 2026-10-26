@@ -92,6 +92,23 @@ object UrlGuard {
             host.endsWith(".internal") || host.endsWith(".local")
 
     /**
+     * 同主机的 https → http 重定向必须按「跨域」处理：继续带 Cookie 等于把源站凭据
+     * 明文交给链路上的中间人。http → https 是升级，可以继续带；换主机由调用方另行处理。
+     */
+    fun isInsecureDowngrade(fromUrl: String, toUrl: String): Boolean {
+        val from = runCatching { URI(fromUrl) }.getOrNull() ?: return false
+        val to = runCatching { URI(toUrl) }.getOrNull() ?: return false
+        if (!"https".equals(from.scheme, ignoreCase = true) ||
+            !"http".equals(to.scheme, ignoreCase = true)
+        ) {
+            return false
+        }
+        val fromHost = hostOf(fromUrl) ?: return true
+        val toHost = hostOf(toUrl) ?: return true
+        return fromHost == toHost
+    }
+
+    /**
      * 只在「确定是 IP 写法」时才交给 InetAddress 求值。
      * 判据必须严格：把普通域名误判成 IP 字面量会触发真实 DNS 查询，
      * 让本不该解析的轻量校验路径变得又慢又不确定。

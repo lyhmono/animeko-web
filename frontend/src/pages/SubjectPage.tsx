@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import Poster from '../components/Poster'
 import { api, errMsg } from '../api'
-import { pickBestHit, pickEpisode } from '../lib/titleMatch'
+import { isSpecialEpisodeName, pickBestHit, pickEpisode } from '../lib/titleMatch'
 import type { BgmEpisode, BgmSubject, EpisodesResult, StoredSource } from '../types'
 import { getSubjectProgress, isFavorite, onDocChange, toggleFavorite } from '../lib/storage'
 import { IconHeart, IconHeartFilled } from '../lib/icons'
@@ -197,7 +197,8 @@ export default function SubjectPage() {
         title: `${animeName} ${ep.name}`,
         anime: animeName,
         ep: String(ep.sortNum ?? ep.sort),
-        bep: nextBep != null ? String(nextBep) : undefined,
+        // 下一集是番外/特典时不能把「Bangumi 下一话」写成它的条目进度
+        bep: nextBep != null && !isSpecialEpisodeName(ep.name) ? String(nextBep) : undefined,
       }
     },
     [],

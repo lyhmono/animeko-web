@@ -148,6 +148,22 @@ class ProxySessionStoreTest {
     }
 
     @Test
+    fun `explicit cookie hosts receive the cookie while other manifest hosts do not`() {
+        val s = store()
+        val sid = s.put(MEDIA, "UA/1.0", "https://v.example/watch", "q=1080", setOf("other.example"))
+        s.allowHosts(sid, setOf("other.example", "third.example"))
+        assertEquals(
+            "q=1080",
+            s.grant(sid, "https://other.example/seg.ts").headers["Cookie"],
+            "数据源显式声明的 Cookie 主机应收到 Cookie",
+        )
+        assertNull(
+            s.grant(sid, "https://third.example/seg.ts").headers["Cookie"],
+            "未声明的清单主机不能收到 Cookie",
+        )
+    }
+
+    @Test
     fun `a proxy url mentioned in a playlist comment cannot register its host`() {
         val s = store()
         val sid = mint(s)

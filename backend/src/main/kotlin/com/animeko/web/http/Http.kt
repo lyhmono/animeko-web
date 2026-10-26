@@ -1,8 +1,12 @@
 package com.animeko.web.http
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.IOException
 import java.io.InputStream
 import java.net.URI
 import java.net.URLEncoder
@@ -155,7 +159,7 @@ class JdkFetcher(
         }
         // 见接口上的注释：POST 永不自动跳转；响应体边读边限，不能先 ofByteArray 再检查。
         val resp = noRedirectClient.sendCancellable(builder.build(), HttpResponse.BodyHandlers.ofInputStream())
-        val bytes = resp.body().use { readCapped(it, MAX_POST_BYTES) }
+        val bytes = readCappedTimed(resp.body(), MAX_POST_BYTES)
         HttpResult(
             status = resp.statusCode(),
             headers = resp.headers().map().mapValues { it.value.toList() },
@@ -187,7 +191,7 @@ class JdkFetcher(
         // ofInputStream + 逐块读：上限要能在「读到的那一刻」生效。
         // ofByteArray 的话，上限只能在整份响应进堆之后检查，等于没有上限。
         val resp = noRedirectClient.sendCancellable(request, HttpResponse.BodyHandlers.ofInputStream())
-        val bytes = resp.body().use { readCapped(it, maxBytes) }
+        val bytes = readCappedTimed(resp.body(), maxBytes)
         HttpResult(
             status = resp.statusCode(),
             headers = resp.headers().map().mapValues { it.value.toList() },
@@ -219,6 +223,30 @@ class JdkFetcher(
                 error != null -> cont.resumeWithException(error)
                 response != null -> cont.resume(response)
             }
+        }
+    }
+
+    /**
+     * 响应头到手后，请求超时就不再约束 body 读取了；这里给阻塞读加一个期限，
+     * 超时主动关闭流，避免慢速镜像长期占住 IO 线程。
+     */
+    private suspend fun readCappedTimed(input: InputStream, maxBytes: Long): ByteArray = supervisorScope {
+        val read = async(Dispatchers.IO) { readCapped(input, maxBytes) }
+        try {
+            // withTimeoutOrNull 只吃掉**本层**的超时；父协程的取消/超时要原样上抛，
+            // 否则 Bangumi calendar 的外层 withTimeoutOrNull 会被误转成 502。
+            val bytes = withTimeoutOrNull(streamTimeoutMs) { read.await() }
+            if (bytes == null) {
+                read.cancel()
+                throw UpstreamException("响应体读取超时（${streamTimeoutMs}ms）")
+            }
+            bytes
+        } catch (e: IOException) {
+            // 超时后主协程关闭流，阻塞中的 read 会抛 "closed"；统一映射成上游错误，
+            // 不能让子协程的 IOException 盖掉上面的超时异常。
+            throw UpstreamException("读取响应体失败：${e.message ?: e::class.simpleName}")
+        } finally {
+            runCatching { input.close() }
         }
     }
 

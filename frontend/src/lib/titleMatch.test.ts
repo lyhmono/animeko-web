@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ChannelGroupHit, EpisodeHit, EpisodesResult } from '../types'
-import { pickEpisode } from './titleMatch'
+import { isSpecialEpisodeName, pickEpisode } from './titleMatch'
 
 function ep(name: string, sortNum: number, channel: string | null): EpisodeHit {
   return {
@@ -36,5 +36,12 @@ describe('pickEpisode', () => {
     const hit = pickEpisode(r, 5, '第5话', ['Show'])
     expect(hit?.sortNum).toBe(5)
     expect(hit?.name).toBe('第5话')
+  })
+
+  it('recognizes special episode names for the progress guard', () => {
+    expect(isSpecialEpisodeName('第1话')).toBe(false)
+    expect(isSpecialEpisodeName('SP1')).toBe(true)
+    expect(isSpecialEpisodeName('特别篇')).toBe(true)
+    expect(isSpecialEpisodeName('OVA')).toBe(true)
   })
 })

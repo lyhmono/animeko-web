@@ -6,6 +6,7 @@ import java.net.InetSocketAddress
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
@@ -53,6 +54,16 @@ class HttpRedirectPolicyTest {
                 }
                 ex.close()
             }
+            b.createContext("/slow") { ex ->
+                try {
+                    ex.sendResponseHeaders(200, 10)
+                    Thread.sleep(1_000)
+                    ex.responseBody.use { it.write("0123456789".toByteArray()) }
+                } catch (_: Exception) {
+                    // 客户端在 body 超时后关闭了连接
+                }
+                ex.close()
+            }
             a.start(); b.start()
         }
 
@@ -92,6 +103,15 @@ class HttpRedirectPolicyTest {
      * `same host redirect keeps cookie...` 里那句「每一跳都必须自己发起」看着。
      */
     @Test
+    fun `https to http downgrade is treated as a credential scope change`() {
+        assertTrue(UrlGuard.isInsecureDowngrade("https://a.example/x", "http://a.example/y"))
+        assertTrue(UrlGuard.isInsecureDowngrade("https://a.example/x", "http://a.example:8080/y"))
+        assertFalse(UrlGuard.isInsecureDowngrade("http://a.example/x", "https://a.example/y"))
+        assertFalse(UrlGuard.isInsecureDowngrade("https://a.example/x", "https://b.example/y"))
+        assertFalse(UrlGuard.isInsecureDowngrade("https://a.example/x", "https://a.example/y"))
+    }
+
+    @Test
     fun `fetchStream defaults to not following redirects`() = kotlinx.coroutines.runBlocking {
         Pair().use { p ->
             val resp = JdkFetcher(timeoutMs = 3000).fetchStream(p.start)
@@ -101,6 +121,17 @@ class HttpRedirectPolicyTest {
             } finally {
                 resp.body.close()
             }
+        }
+    }
+
+    @Test
+    fun `post body read has a timeout after headers arrive`() = kotlinx.coroutines.runBlocking {
+        Pair().use { p ->
+            val e = assertFailsWith<UpstreamException> {
+                JdkFetcher(timeoutMs = 3000, streamTimeoutMs = 200)
+                    .post("http://127.0.0.1:${p.targetPort}/slow", "{}")
+            }
+            assertTrue(e.message.orEmpty().contains("超时"), e.message.orEmpty())
         }
     }
 

@@ -165,6 +165,8 @@ export interface SelectorSearchConfig {
     matchNestedUrl?: string
     enableNestedUrl?: boolean
     cookies?: string
+    /** 额外允许携带 cookies 的主机名；默认只有媒体主机 */
+    cookieHosts?: string[]
     addHeadersToVideo?: { referer?: string; userAgent?: string }
   }
   autoMatch?: {

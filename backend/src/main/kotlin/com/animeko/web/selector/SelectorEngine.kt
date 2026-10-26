@@ -67,6 +67,8 @@ data class ResolvedTarget(
     val referer: String,
     val userAgent: String,
     val cookie: String,
+    /** 数据源显式声明的、允许接收 Cookie 的额外主机（不含媒体主机本身） */
+    val cookieHosts: Set<String> = emptySet(),
 )
 
 class SelectorException(message: String) : Exception(message)
@@ -133,6 +135,14 @@ class SelectorEngine(
             .map { it.trim() }
             .filter { it.contains("=") }
             .joinToString("; ")
+        val cookieHosts = mv.cookieHosts.mapNotNull { raw ->
+            val text = raw.trim()
+            if (text.isEmpty() || text.contains('/') || text.contains(' ') || text.contains('@')) {
+                null
+            } else {
+                UrlGuard.hostOf("https://$text")
+            }
+        }.toSet()
         val headers = buildMap {
             put("User-Agent", ua)
             put("Referer", referer)
@@ -153,7 +163,7 @@ class SelectorEngine(
         // 8MB 页面等于白做两遍解析与两遍正则。
         val pageCandidates = videoCandidates(html, target)
         findVideoUrl(pageCandidates, videoRegex, budget)?.let {
-            return ResolvedTarget(it, referer, ua, cookies)
+            return ResolvedTarget(it, referer, ua, cookies, cookieHosts)
         }
         genericVideoUrl(pageCandidates)?.let { fallback = it }
         if (mv.enableNestedUrl && nestedRegex != null) {
@@ -195,7 +205,7 @@ class SelectorEngine(
                 }.getOrNull() ?: continue
                 val subCandidates = videoCandidates(sub, n)
                 findVideoUrl(subCandidates, videoRegex, budget)?.let {
-                    return ResolvedTarget(it, referer, ua, cookies)
+                    return ResolvedTarget(it, referer, ua, cookies, cookieHosts)
                 }
                 if (fallback == null) fallback = genericVideoUrl(subCandidates)
             }
@@ -207,7 +217,7 @@ class SelectorEngine(
             // 原样进容器日志等于把可用凭据抄进一份谁都能读的文件
             // （同一个理由已经用在 /api/proxy 的日志上）。
             appLog.info("matchVideoUrl 没有命中，改用通用扩展名兜底：{}", urlForLog(it))
-            return ResolvedTarget(it, referer, ua, cookies)
+            return ResolvedTarget(it, referer, ua, cookies, cookieHosts)
         }
         throw SelectorException("未能从播放页提取视频地址（NO_VIDEO_URL_FOUND）")
     }
@@ -627,7 +637,9 @@ class SelectorEngine(
             // 302 把它送给第三个域名既不是用户的授权，也让源站凭据跟着页面里
             // 随便一个跳转目标走（代理链路早就这么做，见 ApiRoutes 的重定向循环）。
             // 只剥 Cookie：Referer 常是防盗链的必要信息且不含凭据，UA 同理。
-            if (UrlGuard.hostOf(next) != UrlGuard.hostOf(target)) {
+            if (UrlGuard.hostOf(next) != UrlGuard.hostOf(target) ||
+                UrlGuard.isInsecureDowngrade(target, next)
+            ) {
                 sent = sent - "Cookie"
             }
             target = next

@@ -34,8 +34,8 @@ class ProxySessionStore(
 
     private class Entry(
         val headers: Map<String, String>,
-        /** 初始媒体 URL 的主机：只有它能收到 Cookie，清单追加的 CDN 主机只收 UA/Referer */
-        val mediaHost: String?,
+        /** 允许接收 Cookie 的主机：初始媒体主机 + 数据源显式声明的额外主机 */
+        val cookieHosts: Set<String>,
         /**
          * expiresAt 必须 volatile：它在**读取路径**上被写（滑动续期），而分片由多个
          * Netty worker 线程并发拉取。非 volatile 的 long 允许被拆成两次 32 位写入，
@@ -51,7 +51,14 @@ class ProxySessionStore(
     private val random = SecureRandom()
 
     /** 登记会话并返回 sid；没有额外头需要携带时返回空串（调用方据此不拼 sid 参数）。 */
-    fun put(mediaUrl: String, userAgent: String, referer: String, cookie: String): String {
+    fun put(
+        mediaUrl: String,
+        userAgent: String,
+        referer: String,
+        cookie: String,
+        /** 数据源显式声明的额外 Cookie 主机；默认只信媒体主机本身 */
+        extraCookieHosts: Set<String> = emptySet(),
+    ): String {
         val headers = buildMap {
             if (userAgent.isNotBlank()) put("User-Agent", userAgent)
             if (referer.isNotBlank()) put("Referer", referer)
@@ -75,7 +82,13 @@ class ProxySessionStore(
         purgeIfNeeded()
         val sid = newId()
         val mediaHost = hostOf(mediaUrl)
-        val entry = Entry(headers, mediaHost, now() + ttlMs)
+        val cookieHosts = buildSet {
+            mediaHost?.let { add(it) }
+            extraCookieHosts.mapNotNullTo(this) {
+                it.trim().lowercase().takeIf(String::isNotBlank)
+            }
+        }
+        val entry = Entry(headers, cookieHosts, now() + ttlMs)
         mediaHost?.let { entry.allowedHosts.add(it) }
         sessions[sid] = entry
         return sid
@@ -100,10 +113,10 @@ class ProxySessionStore(
         // maxOf 保证续期只会往后推：线程在两次 now() 之间被挂起时，
         // 直接赋值会把过期点提前，把正在播放的会话踢掉
         entry.expiresAt = maxOf(entry.expiresAt, now() + ttlMs)
-        // 源站 Cookie 只发给解析出来的那条媒体 URL 的主机。清单里追加的 CDN 主机
-        // 仍需要 UA/Referer 过防盗链，但没有理由把源站 Cookie 也交给它们 ——
-        // 一份被篡改的清单就能借此把用户的源站凭据引到第三方。
-        val headers = if (host == entry.mediaHost) entry.headers else entry.headers - "Cookie"
+        // 源站 Cookie 只发给媒体主机，以及数据源显式声明的额外主机。清单里自动
+        // 追加的 CDN 主机仍需要 UA/Referer 过防盗链，但没有理由把源站 Cookie
+        // 也交给它们 —— 一份被篡改的清单就能借此把用户的源站凭据引到第三方。
+        val headers = if (host in entry.cookieHosts) entry.headers else entry.headers - "Cookie"
         return Grant(Kind.GRANTED, headers)
     }
 
@@ -140,7 +153,7 @@ class ProxySessionStore(
      * 分片行本身，或标签里的 `URI="..."` 属性。旧实现用正则扫描全文，
      * 评论行里随便写一个代理地址就能把任意主机加进白名单。
      */
-    fun allowPlaylistHosts(sid: String, rewrittenPlaylist: String) {
+    internal fun allowPlaylistHosts(sid: String, rewrittenPlaylist: String) {
         if (sid.isEmpty()) return
         val hosts = LinkedHashSet<String>()
         for (rawLine in rewrittenPlaylist.lineSequence()) {

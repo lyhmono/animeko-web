@@ -21,6 +21,7 @@ import {
   listRecent,
   listSearchHistory,
   loadUserData,
+  markUserDataStale,
   toggleFavorite,
 } from './storage'
 
@@ -63,5 +64,51 @@ describe('loadUserData after a failed read', () => {
     }
     expect(sent.favorites?.map((f) => f.id).sort()).toEqual([1, 2])
     expect(sent.searchHistory).toEqual(expect.arrayContaining(['local', 'remote']))
+  })
+
+  it('keeps pending local writes when a retry fails again', async () => {
+    markUserDataStale()
+    const load = vi.mocked(api.loadDataWithEtag)
+    const save = vi.mocked(api.saveData)
+    load.mockReset()
+    save.mockReset()
+    load
+      .mockRejectedValueOnce(new Error('down-1'))
+      .mockRejectedValueOnce(new Error('down-2'))
+      .mockResolvedValueOnce({
+        doc: { favorites: [{ id: 2, name: 'Remote', status: 'wish', ts: 10 }] },
+        etag: 'e1',
+      })
+    save.mockResolvedValue({ etag: 'e2', bytes: 100 })
+
+    await loadUserData()
+    toggleFavorite({ id: 1, name: 'Local', name_cn: '', cover: '', date: '', score: null, ts: 20 })
+    expect(listFavorites().map((f) => f.id)).toEqual([1])
+
+    // 第二次读取失败曾把本地 doc 清空，pending 仍在，下一次合并会把服务端 id 删掉
+    await loadUserData()
+    expect(listFavorites().map((f) => f.id)).toEqual([1])
+
+    await loadUserData()
+    await flushUserData()
+    expect(listFavorites().map((f) => f.id).sort()).toEqual([1, 2])
+  })
+
+  it('coalesces concurrent loads and ignores results after logout', async () => {
+    markUserDataStale()
+    const load = vi.mocked(api.loadDataWithEtag)
+    load.mockReset()
+    let finish!: (value: Awaited<ReturnType<typeof api.loadDataWithEtag>>) => void
+    load.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+
+    const first = loadUserData()
+    const second = loadUserData()
+    expect(load).toHaveBeenCalledTimes(1)
+
+    // 读取在飞时注销：旧结果不能再贴回新会话的 doc
+    markUserDataStale()
+    finish({ doc: { favorites: [{ id: 9, name: 'Old', status: 'wish', ts: 1 }] }, etag: 'e0' })
+    await Promise.all([first, second])
+    expect(listFavorites()).toEqual([])
   })
 })

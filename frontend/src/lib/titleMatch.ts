@@ -154,6 +154,11 @@ export function pickBestHit<T extends { name: string }>(hits: T[], subjectNames:
 
 const SPECIAL_EPISODE = /番外|ova|oad|特别篇|特典|预告|花絮|\bpv\d*\b|\bsp\d*\b|外传|剧场版|电影版|映画/i
 
+/** 源站剧集名是否像番外/特典等非正片：只用于「是否允许写条目进度」，不参与选集。 */
+export function isSpecialEpisodeName(name: string): boolean {
+  return SPECIAL_EPISODE.test(name)
+}
+
 /** 条目本身是剧场版/番外时，来源里叫「剧场版」「特别篇」的剧集就是正主，不能再当噪音 */
 function subjectKindOf(subjectNames: string[]): TitleKind {
   const kinds = subjectNames.filter((n) => n.trim()).map((n) => parseTitleInfo(n).kind)
