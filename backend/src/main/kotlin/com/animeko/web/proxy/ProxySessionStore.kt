@@ -2,6 +2,7 @@ package com.animeko.web.proxy
 
 import com.animeko.web.appLog
 import com.animeko.web.http.UrlGuard
+import java.net.URI
 import java.security.SecureRandom
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
@@ -36,6 +37,8 @@ class ProxySessionStore(
         val headers: Map<String, String>,
         /** 允许接收 Cookie 的主机：初始媒体主机 + 数据源显式声明的额外主机 */
         val cookieHosts: Set<String>,
+        /** Cookie 来源的协议范围；HTTPS 凭据不能在新子请求中降级到 HTTP。 */
+        val cookieScheme: String,
         /**
          * expiresAt 必须 volatile：它在**读取路径**上被写（滑动续期），而分片由多个
          * Netty worker 线程并发拉取。非 volatile 的 long 允许被拆成两次 32 位写入，
@@ -88,7 +91,8 @@ class ProxySessionStore(
                 it.trim().lowercase().takeIf(String::isNotBlank)
             }
         }
-        val entry = Entry(headers, cookieHosts, now() + ttlMs)
+        val cookieScheme = runCatching { URI(mediaUrl).scheme?.lowercase() }.getOrNull() ?: "https"
+        val entry = Entry(headers, cookieHosts, cookieScheme, now() + ttlMs)
         mediaHost?.let { entry.allowedHosts.add(it) }
         sessions[sid] = entry
         return sid
@@ -104,19 +108,23 @@ class ProxySessionStore(
             return Grant(Kind.EXPIRED, emptyMap())
         }
         val host = hostOf(targetUrl)
+        val targetScheme = runCatching { URI(targetUrl).scheme?.lowercase() }.getOrNull()
         // 主机名认不出来 = 无法判断它是不是当初授权的那台，必须**拒绝带凭据**：
         // 之前写的是 `host != null && host !in allowedHosts`，等于 URI 解析失败时
         // 直接放行并把源站 Cookie 发出去 —— 和下面这行注释正好相反。
         // sid 是能力令牌，必须绑定目标主机：否则拿到一个 sid 就能用受害者的
         // Cookie 去请求攻击者指定的任意地址。
-        if (host == null || host !in entry.allowedHosts) return Grant(Kind.HOST_NOT_ALLOWED, emptyMap())
+        if (host == null || host !in entry.allowedHosts || targetScheme !in setOf("http", "https")) {
+            return Grant(Kind.HOST_NOT_ALLOWED, emptyMap())
+        }
         // maxOf 保证续期只会往后推：线程在两次 now() 之间被挂起时，
         // 直接赋值会把过期点提前，把正在播放的会话踢掉
         entry.expiresAt = maxOf(entry.expiresAt, now() + ttlMs)
         // 源站 Cookie 只发给媒体主机，以及数据源显式声明的额外主机。清单里自动
         // 追加的 CDN 主机仍需要 UA/Referer 过防盗链，但没有理由把源站 Cookie
         // 也交给它们 —— 一份被篡改的清单就能借此把用户的源站凭据引到第三方。
-        val headers = if (host in entry.cookieHosts) entry.headers else entry.headers - "Cookie"
+        val cookieAllowed = host in entry.cookieHosts && !(entry.cookieScheme == "https" && targetScheme == "http")
+        val headers = if (cookieAllowed) entry.headers else entry.headers - "Cookie"
         return Grant(Kind.GRANTED, headers)
     }
 

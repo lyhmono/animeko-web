@@ -22,8 +22,9 @@ let loaded = false
 let baseEtag = ''
 /** 同一时刻只允许一个 loadUserData 在飞；重试按钮连点/两处触发时不能并发整档读取 */
 let loadInFlight: Promise<void> | null = null
-/** 注销/会话失效时递增，用来丢弃换账号后才返回的旧读取结果 */
-let loadEpoch = 0
+/** 普通读取、PUT 与 409 重读共用的会话代次；取消只是节省资源，代次才保证隔离。 */
+let sessionEpoch = 0
+let sessionController = new AbortController()
 
 // ---------- 同步状态（给界面一个「到底存上了没有」的说法）----------
 
@@ -94,7 +95,7 @@ function setDoc(next: UserData): void {
  */
 export async function loadUserData(): Promise<void> {
   if (loadInFlight) return loadInFlight
-  const epoch = loadEpoch
+  const epoch = sessionEpoch
   const task = loadOnce(epoch)
   loadInFlight = task
   try {
@@ -106,9 +107,9 @@ export async function loadUserData(): Promise<void> {
 
 async function loadOnce(epoch: number): Promise<void> {
   try {
-    const remote = await api.loadDataWithEtag()
+    const remote = await api.loadDataWithEtag(sessionController.signal)
     // 注销/换账号后返回的旧读取结果必须丢弃，不能把旧会话的 doc 贴回来
-    if (epoch !== loadEpoch) return
+    if (epoch !== sessionEpoch) return
     // 读取失败期间用户仍可点收藏/播放：这些改动记在 pending 里，但 doc 只有本地
     // 这一小份。若直接 setDoc(remote) 再清 pending，它们就被静默丢掉了。
     // 这里把 pending 改动合并到服务端文档上，随后立刻推一轮。
@@ -127,7 +128,7 @@ async function loadOnce(epoch: number): Promise<void> {
       setSync({ status: 'ready', kind: null, error: '' })
     }
   } catch (e) {
-    if (epoch !== loadEpoch) return
+    if (epoch !== sessionEpoch) return
     loaded = false
     baseEtag = ''
     // 不能 setDoc({})：读取失败期间攒下的本地操作仍要留给下一次成功时合并。
@@ -159,6 +160,8 @@ const pendingFavIds = new Set<number>()
 const pendingSourceFavKeys = new Set<string>()
 /** subjectProgress 也是 map：整键覆盖会让另一台设备刚记下的条目消失 */
 const pendingSubjectKeys = new Set<string>()
+/** 明确清空与「读取失败所以本地为空」不同；对象身份也保留在飞期间再次清空的意图。 */
+let historyClear: object | null = null
 
 function hasPendingWrites(): boolean {
   return pendingKeys.size > 0 || pendingProgressKeys.size > 0 || pendingFavIds.size > 0 ||
@@ -166,6 +169,7 @@ function hasPendingWrites(): boolean {
 }
 
 function clearPending(): void {
+  historyClear = null
   pendingKeys.clear()
   pendingProgressKeys.clear()
   pendingFavIds.clear()
@@ -185,8 +189,26 @@ function scheduleFlush(key?: string, progressEntry?: string): void {
   timer = setTimeout(() => void flushUserData(), DEBOUNCE_MS)
 }
 
-/** 立即把内存里的改动推给服务端（去抖合并、版本比对、失败保留待写状态）。 */
-export async function flushUserData(): Promise<void> {
+/** 调用方不能把 Promise resolve 当成保存成功；会话变化同样不是成功确认。 */
+export type FlushResult =
+  | { ok: true; pending: false }
+  | { ok: false; pending: boolean; reason: 'load' | 'save' | 'session-changed'; error: string }
+
+function flushResult(epoch: number): FlushResult {
+  if (epoch !== sessionEpoch) {
+    return { ok: false, pending: true, reason: 'session-changed', error: '会话已变化，未确认旧会话的保存结果' }
+  }
+  const pending = hasPendingWrites()
+  if (loaded && !pending) return { ok: true, pending: false }
+  return {
+    ok: false, pending, reason: !loaded || sync.kind === 'load' ? 'load' : 'save',
+    error: sync.error || '仍有个人数据待保存，请原地重试或导出备份',
+  }
+}
+
+/** 立即推送；失败明确返回并保留待写数据，不向事件监听器抛出网络错误。 */
+export async function flushUserData(): Promise<FlushResult> {
+  const epoch = sessionEpoch
   if (timer) {
     clearTimeout(timer)
     timer = undefined
@@ -195,19 +217,21 @@ export async function flushUserData(): Promise<void> {
     if (sync.status !== 'error') {
       setSync({  status: 'error', kind: 'load', error: '还没读到服务器数据，写入已暂停'  })
     }
-    return
+    return flushResult(epoch)
   }
   // 正在写的那一轮会看到 pendingKeys，不用并发发第二个 PUT（并发 PUT 的到达顺序没有保证）
   if (running) {
     await running
-    if (pendingKeys.size > 0) await flushUserData()
-    return
+    if (epoch !== sessionEpoch || sync.status === 'error') return flushResult(epoch)
+    if (hasPendingWrites()) return flushUserData()
+    return flushResult(epoch)
   }
-  const round = pushOnce().finally(() => {
+  const round = pushOnce(epoch, sessionController.signal).finally(() => {
     if (running === round) running = null
   })
   running = round
   await round
+  return flushResult(epoch)
 }
 
 /**
@@ -220,6 +244,7 @@ export async function flushUserData(): Promise<void> {
  * （所有写入路径都是整体替换 `doc[key] = next`，所以引用比较足以判断「变过」。）
  */
 interface Round {
+  historyClear: object | null
   keys: string[]
   progressKeys: string[]
   favIds: number[]
@@ -247,6 +272,7 @@ function snapshotValues(round: Round): void {
 /** 发出去之后又被改过的顶层键 */
 function changedKeys(round: Round): string[] {
   return round.keys.filter((key) => {
+    if (key === 'searchHistory' && historyClear !== round.historyClear) return true
     if (key === 'progress') {
       const progress = asMap(doc.progress)
       // 本轮没带走、但飞行期间新加进来的条目同样要再发一轮。
@@ -275,16 +301,20 @@ function changedKeys(round: Round): string[] {
 }
 
 /** 还欠着服务端一次写入：排一轮延迟推送（有在途请求时由 flushUserData 排队） */
-function scheduleFollowUp(delay = DEBOUNCE_MS): void {
+function scheduleFollowUp(delay = DEBOUNCE_MS, epoch = sessionEpoch): void {
+  if (epoch !== sessionEpoch || !loaded) return
   if (timer) clearTimeout(timer)
-  timer = setTimeout(() => void flushUserData(), delay)
+  timer = setTimeout(() => {
+    if (epoch === sessionEpoch) void flushUserData()
+  }, delay)
 }
 
-async function pushOnce(): Promise<void> {
+async function pushOnce(epoch: number, signal: AbortSignal): Promise<void> {
   let attempt = 0
-  while (pendingKeys.size > 0 && attempt < 3) {
+  while (epoch === sessionEpoch && pendingKeys.size > 0 && attempt < 3) {
     attempt++
     const round: Round = {
+      historyClear,
       keys: [...pendingKeys],
       progressKeys: [...pendingProgressKeys],
       favIds: [...pendingFavIds],
@@ -299,7 +329,8 @@ async function pushOnce(): Promise<void> {
     snapshotValues(round)
     setSync({  status: 'saving', kind: null, error: ''  })
     try {
-      const saved = await api.saveData(doc, baseEtag)
+      const saved = await api.saveData(doc, baseEtag, signal)
+      if (epoch !== sessionEpoch) return
       baseEtag = saved.etag
       // 服务端上限 512KB，撞到之后每次保存都是 400，而症状只是「收藏点不动」。
       // 提前到八成就说，用户还有机会自己清一清，而不是等写失败去猜原因
@@ -309,6 +340,7 @@ async function pushOnce(): Promise<void> {
       // 只清「发出去之后没再被动过」的键：await 期间新产生的改动必须留给下一轮
       const changed = changedKeys(round)
       round.keys.forEach((k) => { if (!changed.includes(k)) pendingKeys.delete(k) })
+      if (round.keys.includes('searchHistory') && !changed.includes('searchHistory')) historyClear = null
       round.progressKeys.forEach((k) => {
         if (asMap(doc.progress)[k] === round.sentProgress.get(k)) pendingProgressKeys.delete(k)
       })
@@ -334,22 +366,24 @@ async function pushOnce(): Promise<void> {
       // 结论：这是**状态标注的正确性**修复（顺带让文件头第 3 条说得通），
       // 不是一个可以稳定复现给用户看的缺陷 —— 别在注释里把它写成后者。
       if (changed.length > 0) {
-        scheduleFollowUp()
+        scheduleFollowUp(DEBOUNCE_MS, epoch)
         setSync({ status: 'pending', kind: null, error: '' })
       } else {
         setSync({ status: 'ready', kind: null, error: '' })
       }
     } catch (e) {
+      if (epoch !== sessionEpoch) return
       if (isApiError(e, 409, ERR_DATA_STALE)) {
-        const merged = await mergeWithServer(round)
+        const merged = await mergeWithServer(round, epoch, signal)
+        if (epoch !== sessionEpoch) return
         if (merged) continue // 换好基准，重试这一次写
-        setSync({  status: 'error', kind: 'save', error: '本机改动与服务端冲突且无法合并，请刷新页面重试'  })
+        // mergeWithServer 已保留原始读取原因并按可恢复性安排重试，不能覆盖它。
         return
       }
       // 超上限、格式错这类不会自己变好，别把浏览器变成打服务端的循环
       const fatal = isApiError(e, 400) || isApiError(e, 413)
       setSync({ status: 'error', kind: 'save', error: `保存失败：${errMsg(e)}` })
-      if (!fatal) scheduleFollowUp(RETRY_MS)
+      if (!fatal) scheduleFollowUp(RETRY_MS, epoch)
       return
     }
   }
@@ -359,13 +393,13 @@ async function pushOnce(): Promise<void> {
   // 界面停在最后一轮那句「保存中」—— 状态点从此永远挂着「保存中…」，
   // 再没有任何东西会把这份改动推上去，用户以为存好了，刷新一下就没了。
   // 这里既不骗他（如实报错）也不放弃（定时重试，直到推上去或他刷新为止）。
-  if (pendingKeys.size > 0) {
+  if (epoch === sessionEpoch && pendingKeys.size > 0) {
     setSync({
       status: 'error',
       kind: 'save',
       error: '本机改动与服务端版本连续冲突三次，已暂停；将在 5 秒后自动重试',
     })
-    scheduleFollowUp(RETRY_MS)
+    scheduleFollowUp(RETRY_MS, epoch)
   }
 }
 
@@ -379,14 +413,21 @@ async function pushOnce(): Promise<void> {
  *  - 其余键（recent、searchHistory 等）仍按整键：它们只是最近记录，上限小、可自愈，
  *    两个标签页同时各加一条时可能只留下一条，这是已知取舍。
  */
-async function mergeWithServer(round: Round): Promise<boolean> {
+async function mergeWithServer(round: Round, epoch: number, signal: AbortSignal): Promise<boolean> {
   let fresh
   try {
-    fresh = await api.loadDataWithEtag()
+    fresh = await api.loadDataWithEtag(signal)
   } catch (e) {
-    setSync({ status: 'error', kind: 'load', error: `冲突后重读失败：${errMsg(e)}` })
+    if (epoch !== sessionEpoch) return false
+    const fatal = isApiError(e, 400) || isApiError(e, 413)
+    setSync({
+      status: 'error', kind: 'load',
+      error: `冲突后重读失败，本机改动仍保留：${errMsg(e)}。${fatal ? '请原地重试或导出备份' : '将在 5 秒后自动重试，也可原地重试或导出备份'}`,
+    })
+    if (!fatal) scheduleFollowUp(RETRY_MS, epoch)
     return false
   }
+  if (epoch !== sessionEpoch) return false
   // 合并要按**当前**的待写集合，而不是本轮开始时的快照：
   // PUT 在飞的这段时间里用户还能继续点（收藏、进度），那些改动记在 pending* 里，
   // 但不在 round 里。用快照合并会把它们从内存文档里抹掉（setDoc(merged)），
@@ -404,17 +445,18 @@ async function mergeWithServer(round: Round): Promise<boolean> {
  * 攒下的一小份，recent / searchHistory 必须和服务器并集，不能整键覆盖掉
  * 另一台设备刚写入的记录。正常 409 合并仍按原语义（本地整键为准）。
  */
-function applyPendingTo(fresh: UserData, round?: Round): UserData {
-  const keys = [...new Set([...(round?.keys ?? []), ...pendingKeys])]
-  const progressKeys = [...new Set([...(round?.progressKeys ?? []), ...pendingProgressKeys])]
-  const favIds = [...new Set([...(round?.favIds ?? []), ...pendingFavIds])]
-  const sourceFavKeys = [...new Set([...(round?.sourceFavKeys ?? []), ...pendingSourceFavKeys])]
-  const subjectKeys = [...new Set([...(round?.subjectKeys ?? []), ...pendingSubjectKeys])]
+function applyPendingTo(fresh: UserData, round?: Round, pending = pendingSnapshot()): UserData {
+  const keys = [...new Set([...(round?.keys ?? []), ...pending.keys])]
+  const progressKeys = [...new Set([...(round?.progressKeys ?? []), ...pending.progressKeys])]
+  const favIds = [...new Set([...(round?.favIds ?? []), ...pending.favIds])]
+  const sourceFavKeys = [...new Set([...(round?.sourceFavKeys ?? []), ...pending.sourceFavKeys])]
+  const subjectKeys = [...new Set([...(round?.subjectKeys ?? []), ...pending.subjectKeys])]
+  const local = pending.doc
   const merged: UserData = { ...fresh }
   for (const key of keys) {
     if (key === 'progress') {
       const theirs = asMap(merged.progress)
-      const mine = asMap(doc.progress)
+      const mine = asMap(local.progress)
       const out: Record<string, unknown> = { ...theirs }
       for (const entry of progressKeys) {
         if (entry in mine) out[entry] = mine[entry]
@@ -424,28 +466,37 @@ function applyPendingTo(fresh: UserData, round?: Round): UserData {
     } else if (key === 'favorites') {
       // 按条目合并：只应用本标签页动过的收藏，别人的新增/删除原样保留
       merged.favorites = mergeTouchedItems(
-        merged.favorites, favoritesById(doc.favorites), favIds, idOfFavorite,
+        merged.favorites, favoritesById(local.favorites), favIds, idOfFavorite,
       )
     } else if (key === SOURCE_FAV_KEY) {
       merged[SOURCE_FAV_KEY] = mergeTouchedItems(
-        merged[SOURCE_FAV_KEY], sourceFavoritesById(doc[SOURCE_FAV_KEY]), sourceFavKeys, idOfSourceFavorite,
+        merged[SOURCE_FAV_KEY], sourceFavoritesById(local[SOURCE_FAV_KEY]), sourceFavKeys, idOfSourceFavorite,
       )
     } else if (key === 'subjectProgress') {
       // 与 progress 同构：只把本标签页动过的条目贴上去
       const theirs = asMap(merged.subjectProgress)
-      const mine = asMap(doc.subjectProgress)
+      const mine = asMap(local.subjectProgress)
       const out: Record<string, unknown> = { ...theirs }
       for (const k of subjectKeys) {
-        if (k in mine) out[k] = mine[k]
-        else delete out[k]
+        if (k in mine) {
+          const localEp = numOr(asMap(mine[k]).ep, 0)
+          const remoteEp = numOr(asMap(theirs[k]).ep, 0)
+          // 只前进不后退；时间戳跟获胜集号走，同集号才取更新的记录。
+          out[k] = remoteEp > 0 && (remoteEp > localEp ||
+            (remoteEp === localEp && numOr(asMap(theirs[k]).ts, 0) > numOr(asMap(mine[k]).ts, 0)))
+            ? theirs[k] : mine[k]
+        } else {
+          // 明确删除/剪枝仍是 tombstone，不能因为 max 规则复活它。
+          delete out[k]
+        }
       }
       merged.subjectProgress = out
     } else if (key === 'recent' && round == null) {
-      merged.recent = mergeRecentLists(fresh.recent, doc.recent)
-    } else if (key === 'searchHistory' && round == null) {
-      merged.searchHistory = mergeSearchHistory(fresh.searchHistory, doc.searchHistory)
-    } else if (Object.prototype.hasOwnProperty.call(doc, key)) {
-      merged[key] = doc[key]
+      merged.recent = mergeRecentLists(fresh.recent, local.recent)
+    } else if (key === 'searchHistory' && round == null && pending.historyClear === null) {
+      merged.searchHistory = mergeSearchHistory(fresh.searchHistory, local.searchHistory)
+    } else if (Object.prototype.hasOwnProperty.call(local, key)) {
+      merged[key] = local[key]
     } else {
       delete merged[key]
     }
@@ -522,11 +573,6 @@ function writeSubjectProgress(next: Record<string, unknown>, touched: readonly s
   scheduleFlush('subjectProgress')
 }
 
-function removeKey(key: string): void {
-  if (!(key in doc)) return
-  delete doc[key]
-  scheduleFlush(key)
-}
 
 /** 服务端文档里没有 progress 时给一个空容器（返回的是活引用，调用方只读） */
 function progressMap(): Record<string, unknown> {
@@ -993,7 +1039,10 @@ export function addSearchHistory(q: string): string[] {
 }
 
 export function clearSearchHistory(): void {
-  removeKey('searchHistory')
+  historyClear = {}
+  delete doc.searchHistory
+  // 未加载/本地缺键时仍须记录删除，否则恢复读取会把远端旧历史复活。
+  scheduleFlush('searchHistory')
 }
 
 // ---------- 最近观看 ----------
@@ -1039,25 +1088,95 @@ export function addRecent(item: RecentItem): RecentItem[] {
  * 之后任何写入都只会改内存，直到 loadUserData 重新拉到属于新会话的文档为止 ——
  * 否则「用旧会话的残档去覆盖新会话的数据」这种事真的会发生。
  */
-export function markUserDataStale(): void {
-  // 让在飞的旧 load 结果失效；同时允许下一次 loadUserData 立即重新发起
-  loadEpoch++
+export function markUserDataStale(options: { preservePending?: boolean; owner?: string } = {}): void {
+  if (options.preservePending && hasPendingWrites()) {
+    retainedUserData.push({
+      info: { id: ++retainedId, owner: options.owner ?? '', origin: deploymentOrigin(), complete: loaded },
+      pending: pendingSnapshot(structuredClone(doc)),
+    })
+  }
+  // 新会话不等旧请求；旧 finally 只允许清理自己，不能占住或确认新队列。
+  sessionEpoch++
+  sessionController.abort()
+  sessionController = new AbortController()
   loadInFlight = null
+  running = null
   if (timer) {
     clearTimeout(timer)
     timer = undefined
   }
-  pendingKeys.clear()
-  pendingProgressKeys.clear()
-  pendingFavIds.clear()
-  pendingSourceFavKeys.clear()
-  pendingSubjectKeys.clear()
+  clearPending()
   loaded = false
   setDoc({})
   baseEtag = ''
   // 体积提醒属于上一份文档：不清掉的话，换账号后页脚还会说「接近上限」
   sizeNote = ''
   setSync({  status: 'ready', kind: null, error: ''  })
+}
+
+/** 会话失效的待写副本只留内存，与可读文档隔离；不自动混入下一次登录的数据。 */
+export interface RetainedUserDataInfo {
+  id: number
+  owner: string
+  origin: string
+  /** 初次读取失败期间的改动只能导出局部副本，不能声称是完整备份。 */
+  complete: boolean
+}
+
+type PendingSnapshot = Pick<Round, 'keys' | 'progressKeys' | 'favIds' | 'sourceFavKeys' | 'subjectKeys' | 'historyClear'> & { doc: UserData }
+function pendingSnapshot(local = doc): PendingSnapshot {
+  return {
+    doc: local, keys: [...pendingKeys], progressKeys: [...pendingProgressKeys], favIds: [...pendingFavIds],
+    sourceFavKeys: [...pendingSourceFavKeys], subjectKeys: [...pendingSubjectKeys], historyClear,
+  }
+}
+
+interface RetainedEntry { info: RetainedUserDataInfo; pending: PendingSnapshot }
+const retainedUserData: RetainedEntry[] = []
+let retainedId = 0
+
+function deploymentOrigin(): string {
+  return typeof location === 'undefined' ? '' : location.origin
+}
+
+export function listRetainedUserData(): RetainedUserDataInfo[] {
+  return retainedUserData.map(({ info }) => ({ ...info }))
+}
+
+export function exportRetainedUserData(id: number): string {
+  const retained = retainedUserData.find((entry) => entry.info.id === id)
+  if (!retained) throw new Error('未找到保留的未同步副本')
+  return JSON.stringify(retained.pending.doc, null, 2)
+}
+
+/** owner 必须由调用方提供本次成功登录响应的身份，不能用可编辑的显示名自动恢复。 */
+export function restoreRetainedUserData(id: number, owner: string): void {
+  const index = retainedUserData.findIndex((entry) => entry.info.id === id)
+  const retained = retainedUserData[index]
+  if (!retained) throw new Error('未找到保留的未同步副本')
+  if (!owner || !retained.info.owner || retained.info.owner !== owner || retained.info.origin !== deploymentOrigin()) {
+    throw new Error('未同步副本属于其他账号或部署，请登录原账号恢复，或先导出备份')
+  }
+  if (!loaded) throw new Error('请先重新读取当前会话的个人数据，再恢复未同步改动')
+  if (hasPendingWrites()) throw new Error('请先保存当前会话的改动，再恢复保留的副本')
+  const pending = retained.pending
+  const merged = applyPendingTo(doc, undefined, pending)
+  pending.keys.forEach((key) => pendingKeys.add(key))
+  pending.progressKeys.forEach((key) => pendingProgressKeys.add(key))
+  pending.favIds.forEach((id) => pendingFavIds.add(id))
+  pending.sourceFavKeys.forEach((key) => pendingSourceFavKeys.add(key))
+  pending.subjectKeys.forEach((key) => pendingSubjectKeys.add(key))
+  historyClear = pending.historyClear
+  setDoc(merged)
+  // 所有权移回当前待写队列；保存失败时仍可导出，或再次失效时重新隔离。
+  retainedUserData.splice(index, 1)
+  scheduleFlush()
+}
+
+/** 仅供用户明确选择放弃，不能在认证失败/普通加载路径自动调用。 */
+export function discardRetainedUserData(id: number): void {
+  const index = retainedUserData.findIndex((entry) => entry.info.id === id)
+  if (index >= 0) retainedUserData.splice(index, 1)
 }
 
 // ---------- 备份导出 / 导入 ----------
@@ -1074,6 +1193,16 @@ export interface ImportSummary {
 /** 个人数据是否已经从服务器读到。导出/导入都要看它，理由见下面两个函数的守卫。 */
 export function isUserDataLoaded(): boolean {
   return loaded
+}
+
+/** 离线救援用操作快照；不清待写队列，也不冒充可整档导入的完整备份。 */
+export function exportPendingUserData(): string {
+  return JSON.stringify({
+    format: 'animeko-unsynced-partial',
+    complete: false,
+    warning: '局部改动副本，不是完整备份；包含未同步操作记录，不能直接作为完整备份导入。',
+    pending: pendingSnapshot(),
+  }, null, 2)
 }
 
 /** 导出整份个人数据。格式化输出，便于人工查看与 diff。 */

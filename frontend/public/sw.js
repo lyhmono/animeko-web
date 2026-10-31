@@ -36,7 +36,7 @@
  * 二次打开直接命中本地，而清理需要解析 index.html 才知道哪些还在用，
  * 复杂度和出错面都不划算。真需要腾空间时把这里 +1 即可全清。
  */
-const VERSION = 'v2'
+const VERSION = 'v3'
 const SHELL_CACHE = `animeko-shell-${VERSION}`
 const ASSET_CACHE = `animeko-assets-${VERSION}`
 
@@ -44,11 +44,7 @@ self.addEventListener('install', (event) => {
   // 预缓存一份首页当离线兜底。cache: 'reload' 绕开 HTTP 缓存，
   // 保证装进 SW 缓存的是当下这份而不是浏览器里可能更旧的副本。
   event.waitUntil(
-    caches
-      .open(SHELL_CACHE)
-      .then((cache) => cache.add(new Request('/', { cache: 'reload' })))
-      // 离线/服务未起时安装失败不该让整个 SW 装不上：没有壳缓存也能正常工作
-      .catch(() => {}),
+    networkFirstNavigation(new Request('/', { cache: 'reload' })).catch(() => {}),
   )
 })
 
@@ -122,53 +118,73 @@ function isApiPath(pathname) {
  * 离线壳就没得兜底了。真正不能落盘的是 no-store / private。
  */
 function cacheable(resp) {
-  if (!resp || !resp.ok) return false
+  if (!resp || resp.status !== 200) return false
   const cc = (resp.headers.get('cache-control') || '').toLowerCase()
   if (cc.includes('no-store') || cc.includes('private')) return false
   return true
 }
 
-async function networkFirstNavigation(req) {
-  const cache = await caches.open(SHELL_CACHE)
+/** 只让应用路由的 HTML 更新离线壳，不接受静态文件和反代登录重定向。 */
+function shellResponse(req, resp) {
+  if (!cacheable(resp) || resp.redirected) return false
+  if ((resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase() !== 'text/html') return false
+  const path = new URL(req.url).pathname
+  if (!/^\/(?:search|play|sources|discover|favorites|settings)?\/?$/.test(path) &&
+      !/^\/(?:subject|source)\/[^/]+\/?$/.test(path)) return false
+  return !resp.url || new URL(resp.url).origin === self.location.origin
+}
+
+async function cachedResponse(cacheName, key) {
   try {
-    const fresh = await fetch(req)
-    // 只存成功的 HTML：把 5xx 或登录页存成壳，下次离线打开就是错的
-    if (cacheable(fresh)) await cache.put('/', fresh.clone())
-    return fresh
+    const cache = await caches.open(cacheName)
+    return await cache.match(key)
   } catch {
-    const cached = await cache.match('/')
+    return undefined
+  }
+}
+
+async function rememberResponse(cacheName, key, response) {
+  try {
+    const cache = await caches.open(cacheName)
+    await cache.put(key, response.clone())
+  } catch {
+    // 缓存关闭、配额或磁盘失败不能破坏已成功取得的网络响应。
+  }
+}
+
+async function networkFirstNavigation(req) {
+  let fresh
+  try {
+    fresh = await fetch(req)
+  } catch {
+    const cached = await cachedResponse(SHELL_CACHE, '/')
     if (cached) return cached
     return new Response('离线，且没有可用的页面缓存。连上网络后刷新即可。', {
       status: 503,
       headers: { 'Content-Type': 'text/plain; charset=utf-8' },
     })
   }
+  if (shellResponse(req, fresh)) await rememberResponse(SHELL_CACHE, '/', fresh)
+  return fresh
 }
 
 async function cacheFirst(req, cacheName) {
-  const cache = await caches.open(cacheName)
-  const hit = await cache.match(req)
+  const hit = await cachedResponse(cacheName, req)
   if (hit) return hit
   const fresh = await fetch(req)
-  if (cacheable(fresh)) await cache.put(req, fresh.clone())
+  if (cacheable(fresh)) await rememberResponse(cacheName, req, fresh)
   return fresh
 }
 
 async function staleWhileRevalidate(req, cacheName, event) {
-  // 后台更新必须在事件还活着的时候登记给 waitUntil。原先这个 promise 是
-  // “悬空”的：命中缓存后 respondWith 立刻结束，SW 随时可能被回收，
-  // cache.put 不保证执行 —— 图标/manifest 会一直停在旧版本。
+  // 在首次 await 前登记，缓存命中后后台更新仍由事件托管。
   const network = fetch(req)
     .then(async (fresh) => {
-      if (cacheable(fresh)) {
-        const cache = await caches.open(cacheName)
-        await cache.put(req, fresh.clone())
-      }
+      if (cacheable(fresh)) await rememberResponse(cacheName, req, fresh)
       return fresh
     })
     .catch(() => null)
   event.waitUntil(network)
-  const cache = await caches.open(cacheName)
-  const hit = await cache.match(req)
+  const hit = await cachedResponse(cacheName, req)
   return hit || (await network) || new Response('', { status: 504 })
 }

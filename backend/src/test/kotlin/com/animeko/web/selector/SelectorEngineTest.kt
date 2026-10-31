@@ -75,6 +75,7 @@ private fun fixture(name: String): String =
         "fixture $name not found"
     }.bufferedReader().use { it.readText() }
 
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class SelectorEngineTest {
 
     /**
@@ -97,7 +98,7 @@ class SelectorEngineTest {
         )
         val started = System.nanoTime()
         val e = assertFailsWith<com.animeko.web.selector.SelectorException> {
-            SelectorEngine(fetcher).resolveVideo(cfg, "$base/play/x.html")
+            selectorTestEngine(fetcher).resolveVideo(cfg, "$base/play/x.html")
         }
         val ms = (System.nanoTime() - started) / 1_000_000
         assertTrue(ms < 2_000, "跑了 ${ms}ms，长候选仍然被当成正则输入")
@@ -127,7 +128,7 @@ class SelectorEngineTest {
         )
         assertEquals(
             "https://cdn.test/hls/m.m3u8?sig=1",
-            SelectorEngine(fetcher).resolveVideo(cfg, "$base/play/cross.html").url,
+            selectorTestEngine(fetcher).resolveVideo(cfg, "$base/play/cross.html").url,
         )
         assertEquals(2, fetcher.headersSeen.size, "应当确实发生了两跳：${fetcher.headersSeen.map { it.first }}")
         assertEquals("vip=SECRET-VALUE", fetcher.headersSeen[0].second["Cookie"], "第一跳应当带上源站 Cookie")
@@ -138,7 +139,7 @@ class SelectorEngineTest {
 
         // 同主机跳转必须照旧带着 Cookie，否则真实源会整批播不动
         fetcher.headersSeen.clear()
-        SelectorEngine(fetcher).resolveVideo(cfg, "$base/play/same.html")
+        selectorTestEngine(fetcher).resolveVideo(cfg, "$base/play/same.html")
         assertEquals("vip=SECRET-VALUE", fetcher.headersSeen.last().second["Cookie"], "同主机跳转不应丢 Cookie")
     }
 
@@ -163,7 +164,7 @@ class SelectorEngineTest {
      */
     @Test
     fun `an absurd request interval is clamped`() = runTest {
-        val engine = SelectorEngine(StubFetcher(mapOf("$base/search" to fixture("search_page.html"))))
+        val engine = selectorTestEngine(StubFetcher(mapOf("$base/search" to fixture("search_page.html"))), monotonicMillis = { currentTime })
         val oneDay = 86_400_000L
         assertEquals(SelectorEngine.MAX_REQUEST_INTERVAL_MS, engine.effectiveInterval(oneDay))
         assertEquals(0L, engine.effectiveInterval(-5L))
@@ -221,7 +222,7 @@ class SelectorEngineTest {
         )
         val fetcher = StubFetcher(mapOf("$base/search" to html))
         val started = System.nanoTime()
-        val hits = SelectorEngine(fetcher).search(cfg, "番")
+        val hits = selectorTestEngine(fetcher).search(cfg, "番")
         val ms = (System.nanoTime() - started) / 1_000_000
         assertEquals(4000, hits.size)
         // 每条的封面必须是它自己的：邻居的海报发错比没图更糟
@@ -240,7 +241,7 @@ class SelectorEngineTest {
             charset = java.nio.charset.Charset.forName("GBK"),
             contentType = "text/html; charset=gbk",
         )
-        val hits = SelectorEngine(fetcher).search(config(), "孤独摇滚")
+        val hits = selectorTestEngine(fetcher).search(config(), "孤独摇滚")
         assertEquals("孤独摇滚", hits.single().name)
         assertEquals("$base/detail/1", hits.single().url)
     }
@@ -260,7 +261,7 @@ class SelectorEngineTest {
             </body></html>
         """.trimIndent()
         val fetcher = StubFetcher(mapOf("$base/anime/1.html" to page))
-        val result = SelectorEngine(fetcher).episodes(
+        val result = selectorTestEngine(fetcher).episodes(
             config(channelFormatId = ChannelFormatIndexGrouped.ID),
             "$base/anime/1.html",
         )
@@ -272,7 +273,7 @@ class SelectorEngineTest {
     @Test
     fun `search with subject format A`() = runTest {
         val fetcher = StubFetcher(mapOf("$base/search" to fixture("search_page.html")))
-        val hits = SelectorEngine(fetcher).search(config(), "示例")
+        val hits = selectorTestEngine(fetcher).search(config(), "示例")
         assertEquals(3, hits.size)
         // preferShorterName 默认开启，按名称长度升序：另一个番剧(5) < 示例番剧 第一季 < 较长的番剧名称测试
         assertEquals("另一个番剧", hits.first().name)
@@ -284,7 +285,7 @@ class SelectorEngineTest {
     @Test
     fun `search with indexed format`() = runTest {
         val fetcher = StubFetcher(mapOf("$base/search" to fixture("search_indexed.html")))
-        val hits = SelectorEngine(fetcher).search(config(subjectFormatId = SubjectFormatIndexed.ID), "番剧")
+        val hits = selectorTestEngine(fetcher).search(config(subjectFormatId = SubjectFormatIndexed.ID), "番剧")
         assertEquals(
             listOf("番剧A" to "$base/a/1.html", "番剧B" to "$base/a/2.html"),
             hits.map { it.name to it.url },
@@ -294,7 +295,7 @@ class SelectorEngineTest {
     @Test
     fun `search with json-path indexed format`() = runTest {
         val fetcher = StubFetcher(mapOf("$base/search" to fixture("search.json")))
-        val hits = SelectorEngine(fetcher).search(config(subjectFormatId = SubjectFormatJsonPathIndexed.ID), "JSON")
+        val hits = selectorTestEngine(fetcher).search(config(subjectFormatId = SubjectFormatJsonPathIndexed.ID), "JSON")
         assertEquals(
             listOf("JSON番剧一" to "$base/j/1.html", "JSON番剧二" to "$base/j/2.html"),
             hits.map { it.name to it.url },
@@ -321,7 +322,7 @@ class SelectorEngineTest {
             </div></body></html>
         """.trimIndent()
         val fetcher = StubFetcher(mapOf("$base/search" to html))
-        val hits = SelectorEngine(fetcher).search(
+        val hits = selectorTestEngine(fetcher).search(
             config(subjectFormatId = SubjectFormatIndexed.ID), "番剧",
         )
         assertEquals(
@@ -340,7 +341,7 @@ class SelectorEngineTest {
             [{"title":"JSON甲","url":"/j/1.html"},{"url":"/ad.html"},{"title":"JSON乙","url":"/j/2.html"}]
         """.trimIndent()
         val fetcher = StubFetcher(mapOf("$base/search" to body))
-        val hits = SelectorEngine(fetcher).search(
+        val hits = selectorTestEngine(fetcher).search(
             config(subjectFormatId = SubjectFormatJsonPathIndexed.ID), "JSON",
         )
         assertEquals(
@@ -358,7 +359,7 @@ class SelectorEngineTest {
             [{"title":"甲","name":"甲的别名","url":"/j/1.html"},{"title":"乙","url":"/j/2.html"}]
         """.trimIndent()
         val fetcher = StubFetcher(mapOf("$base/search" to body))
-        val hits = SelectorEngine(fetcher).search(
+        val hits = selectorTestEngine(fetcher).search(
             config(subjectFormatId = SubjectFormatJsonPathIndexed.ID), "JSON",
         )
         assertEquals(
@@ -373,7 +374,7 @@ class SelectorEngineTest {
             [{"title":"JSON甲","url":"/j/1.html"},{"title":null,"url":"/ad.html"},{"title":"JSON乙","url":"/j/2.html"}]
         """.trimIndent()
         val fetcher = StubFetcher(mapOf("$base/search" to body))
-        val hits = SelectorEngine(fetcher).search(
+        val hits = selectorTestEngine(fetcher).search(
             config(subjectFormatId = SubjectFormatJsonPathIndexed.ID), "JSON",
         )
         // title 为 JSON null 时不能变成字面串 "null"，也不能让后面的地址前移一位
@@ -397,7 +398,7 @@ class SelectorEngineTest {
         val cfg = config().copy(
             selectorChannelFormatNoChannel = ChannelFormatNoChannel.Config(selectEpisodes = "#glist-1 a"),
         )
-        val result = SelectorEngine(fetcher).episodes(cfg, "$base/anime/1.html")
+        val result = selectorTestEngine(fetcher).episodes(cfg, "$base/anime/1.html")
         assertEquals(3, result.episodes.size)
         assertTrue(result.channels.isEmpty())
         val first = result.episodes.first()
@@ -420,7 +421,7 @@ class SelectorEngineTest {
             selectorChannelFormatNoChannel = ChannelFormatNoChannel.Config(selectEpisodes = "#plist a"),
         )
         val fetcher = StubFetcher(mapOf("$base/anime/long.html" to page))
-        val result = SelectorEngine(fetcher).episodes(cfg, "$base/anime/long.html")
+        val result = selectorTestEngine(fetcher).episodes(cfg, "$base/anime/long.html")
         val ep = result.episodes.single()
         // 名称原样保留（界面还能显示），但不解析集号
         assertEquals(longName, ep.name)
@@ -444,7 +445,7 @@ class SelectorEngineTest {
         )
         val fetcher = StubFetcher(mapOf("$base/anime/episodes.html" to page))
         val started = System.nanoTime()
-        val result = SelectorEngine(fetcher).episodes(cfg, "$base/anime/episodes.html")
+        val result = selectorTestEngine(fetcher).episodes(cfg, "$base/anime/episodes.html")
         val ms = (System.nanoTime() - started) / 1_000_000
         assertEquals(600, result.episodes.size)
         assertTrue(ms < 2_000, "花了 ${ms}ms，剧集名正则的预算没有跨集共享")
@@ -452,7 +453,7 @@ class SelectorEngineTest {
 
     @Test
     fun `episodes with index-grouped format`() = runTest {        val fetcher = StubFetcher(mapOf("$base/anime/1.html" to fixture("detail_grouped.html")))
-        val result = SelectorEngine(fetcher).episodes(
+        val result = selectorTestEngine(fetcher).episodes(
             config(channelFormatId = ChannelFormatIndexGrouped.ID),
             "$base/anime/1.html",
         )
@@ -470,7 +471,7 @@ class SelectorEngineTest {
     @Test
     fun `resolve video url from play page`() = runTest {
         val fetcher = StubFetcher(mapOf("$base/play/1-1.html" to fixture("play_page.html")))
-        val video = SelectorEngine(fetcher).resolveVideo(config(), "$base/play/1-1.html")
+        val video = selectorTestEngine(fetcher).resolveVideo(config(), "$base/play/1-1.html")
         assertEquals("https://cdn.example.com/video/12345/index.m3u8?token=abcdef", video.url)
         assertEquals(base, video.referer)
         // 播放页 UA 默认来自 userAgent
@@ -483,7 +484,7 @@ class SelectorEngineTest {
         val cfg = config().copy(
             matchVideo = MatchVideoConfig(cookieHosts = listOf("CDN.Example.COM", "bad/host", " ")),
         )
-        val video = SelectorEngine(fetcher).resolveVideo(cfg, "$base/play/1-1.html")
+        val video = selectorTestEngine(fetcher).resolveVideo(cfg, "$base/play/1-1.html")
         assertEquals(setOf("cdn.example.com"), video.cookieHosts)
     }
 
@@ -491,7 +492,7 @@ class SelectorEngineTest {
     fun `video request inherits the source user agent when video UA is not set`() = runTest {
         val fetcher = StubFetcher(mapOf("$base/play/1-1.html" to fixture("play_page.html")))
         val cfg = config().copy(userAgent = "CustomUA/1.0")
-        val video = SelectorEngine(fetcher).resolveVideo(cfg, "$base/play/1-1.html")
+        val video = selectorTestEngine(fetcher).resolveVideo(cfg, "$base/play/1-1.html")
         // VideoHeaders.userAgent 的默认值必须是空串，否则这里永远拿到内置 Chrome UA，
         // 配置里给数据源指定的 UA 对视频 CDN 不生效。
         assertEquals("CustomUA/1.0", video.userAgent)
@@ -518,7 +519,7 @@ class SelectorEngineTest {
                 matchNestedUrl = """frame\.php""",
             ),
         )
-        val video = SelectorEngine(fetcher).resolveVideo(cfg, "$base/play/outer.html")
+        val video = selectorTestEngine(fetcher).resolveVideo(cfg, "$base/play/outer.html")
         assertEquals("https://cdn.example.net/hls/movie.m3u8?sig=1", video.url)
         assertTrue(fetcher.requested.contains("$base/player/frame.php?id=9"))
     }
@@ -539,7 +540,7 @@ class SelectorEngineTest {
             </script></body></html>
         """.trimIndent()
         val fetcher = StubFetcher(mapOf("$base/play/542-1-1.html" to page))
-        val video = SelectorEngine(fetcher).resolveVideo(config(), "$base/play/542-1-1.html")
+        val video = selectorTestEngine(fetcher).resolveVideo(config(), "$base/play/542-1-1.html")
         assertEquals("https://v6.tlkqc.com/wjv6/202309/09/abc/video/index.m3u8", video.url)
     }
 
@@ -553,7 +554,7 @@ class SelectorEngineTest {
             </body></html>
         """.trimIndent()
         val fetcher = StubFetcher(mapOf("$base/play/plain.html" to page))
-        val video = SelectorEngine(fetcher).resolveVideo(config(), "$base/play/plain.html")
+        val video = selectorTestEngine(fetcher).resolveVideo(config(), "$base/play/plain.html")
         assertTrue(video.url.startsWith("https://cdn."), video.url)
     }
 
@@ -570,7 +571,7 @@ class SelectorEngineTest {
             selectorSubjectFormatA = SubjectFormatA.Config(selectLists = "div.list > a"),
         )
         val fetcher = StubFetcher(mapOf("$base/search?keyword=%E6%97%A5" to page))
-        val hits = SelectorEngine(fetcher).search(cfg, "日")
+        val hits = selectorTestEngine(fetcher).search(cfg, "日")
         assertEquals(2, hits.size)
         assertEquals("https://img.cdn.test/a.jpg", hits[0].cover)
         kotlin.test.assertNull(hits[1].cover, "取不到封面要留空，不能编一个")
@@ -592,7 +593,7 @@ class SelectorEngineTest {
             selectorSubjectFormatA = SubjectFormatA.Config(selectLists = ".myui-vodlist h4 > a"),
         )
         val fetcher = StubFetcher(mapOf("$base/search?keyword=%E6%97%A5" to page))
-        val hits = SelectorEngine(fetcher).search(cfg, "日")
+        val hits = selectorTestEngine(fetcher).search(cfg, "日")
         assertEquals(2, hits.size)
         // 各自回到自己的 <li> 里取图：错位一格就是「看着 A 的海报点进去播 B」
         assertEquals(
@@ -618,7 +619,7 @@ class SelectorEngineTest {
             selectorSubjectFormatA = SubjectFormatA.Config(selectLists = ".title > a"),
         )
         val fetcher = StubFetcher(mapOf("$base/search?keyword=%E6%97%A5" to page))
-        val hits = SelectorEngine(fetcher).search(cfg, "日")
+        val hits = selectorTestEngine(fetcher).search(cfg, "日")
         assertEquals(
             mapOf("葬送的芙莉莲" to "$base/upload/1.jpg", "灵能百分百" to "https://pic.test/2.webp"),
             hits.associate { it.name to it.cover },
@@ -641,7 +642,7 @@ class SelectorEngineTest {
             ),
         )
         val fetcher = StubFetcher(mapOf("$base/search?keyword=%E6%97%A5" to page))
-        val hits = SelectorEngine(fetcher).search(cfg, "日")
+        val hits = selectorTestEngine(fetcher).search(cfg, "日")
         assertEquals(listOf("甲", "丙"), hits.map { it.name })
         // 名字为空的那条被丢掉时，封面必须跟着自己的链接走，不能整体错位
         assertEquals(listOf("https://img.cdn.test/1.jpg", "https://img.cdn.test/3.jpg"), hits.map { it.cover })
@@ -659,7 +660,7 @@ class SelectorEngineTest {
             ),
         )
         val fetcher = StubFetcher(mapOf("$base/search?keyword=%E6%97%A5" to body))
-        val hits = SelectorEngine(fetcher).search(cfg, "日")
+        val hits = selectorTestEngine(fetcher).search(cfg, "日")
         assertEquals("https://img.cdn.test/j.jpg", hits[0].cover)
         assertTrue(hits[1].cover.isNullOrBlank(), "空字符串封面要当成没有")
     }
@@ -668,7 +669,7 @@ class SelectorEngineTest {
     fun `resolve video throws when not found`() = runTest {
         val fetcher = StubFetcher(mapOf("$base/play/x.html" to "<html><body>no video</body></html>"))
         assertFailsWith<SelectorException> {
-            SelectorEngine(fetcher).resolveVideo(config(), "$base/play/x.html")
+            selectorTestEngine(fetcher).resolveVideo(config(), "$base/play/x.html")
         }
     }
 
@@ -682,7 +683,7 @@ class SelectorEngineTest {
         )
         val page = """<html><body><script>var u="https://v9.newcdn.test/x/index.m3u8?sign=abc"</script></body></html>"""
         val fetcher = StubFetcher(mapOf("$base/play/x.html" to page))
-        val video = SelectorEngine(fetcher).resolveVideo(cfg, "$base/play/x.html")
+        val video = selectorTestEngine(fetcher).resolveVideo(cfg, "$base/play/x.html")
         assertEquals("https://v9.newcdn.test/x/index.m3u8?sign=abc", video.url)
     }
 
@@ -697,7 +698,7 @@ class SelectorEngineTest {
             <script>var a="https://other.test/x/preview.mp4"</script>
             <script>var b="https://preferred.test/y/index.m3u8"</script></body></html>"""
         val fetcher = StubFetcher(mapOf("$base/play/x.html" to page))
-        val video = SelectorEngine(fetcher).resolveVideo(cfg, "$base/play/x.html")
+        val video = selectorTestEngine(fetcher).resolveVideo(cfg, "$base/play/x.html")
         assertEquals("https://preferred.test/y/index.m3u8", video.url)
     }
 
@@ -709,7 +710,7 @@ class SelectorEngineTest {
             routes = emptyMap(),
             redirects = mapOf("$base/search?keyword=%E5%AD%A4%E7%8B%AC" to "http://127.0.0.1:8080/admin"),
         )
-        val engine = SelectorEngine(fetcher, allowPrivateTargets = false)
+        val engine = selectorTestEngine(fetcher, allowPrivateTargets = false)
         // 必须是 403（UrlGuard.Blocked），而不是被包成 502 且带上「主机名 -> 内网 IP」的拒绝原因
         val e = assertFailsWith<com.animeko.web.http.UrlGuard.Blocked> { engine.search(config(), "孤独") }
         assertTrue(e.message!!.contains("127.0.0.1"), e.message!!)
@@ -725,7 +726,7 @@ class SelectorEngineTest {
             routes = mapOf("https://mirror-site.test/search?keyword=%E5%AD%A4%E7%8B%AC" to fixture("search_page.html")),
             redirects = mapOf("$base/search?keyword=%E5%AD%A4%E7%8B%AC" to "https://mirror-site.test/search?keyword=%E5%AD%A4%E7%8B%AC"),
         )
-        val engine = SelectorEngine(fetcher, allowPrivateTargets = false)
+        val engine = selectorTestEngine(fetcher, allowPrivateTargets = false)
         val hits = engine.search(config(), "孤独")
         assertTrue(hits.isNotEmpty(), "公网内的续跳应当照常工作")
     }
@@ -735,7 +736,7 @@ class SelectorEngineTest {
         // 上限要在读取过程中生效：正则跑在几百 MB 文本上不是「慢」，是挂死线程
         val huge = "<html><body>" + "x".repeat(9 * 1024 * 1024) + "</body></html>"
         val fetcher = StubFetcher(routes = mapOf("$base/search?keyword=%E5%AD%A4%E7%8B%AC" to huge))
-        val engine = SelectorEngine(fetcher, allowPrivateTargets = false)
+        val engine = selectorTestEngine(fetcher, allowPrivateTargets = false)
         val e = assertFailsWith<com.animeko.web.http.UpstreamException> { engine.search(config(), "孤独") }
         assertTrue(e.message!!.contains("上限"), e.message!!)
     }
@@ -765,7 +766,7 @@ class SelectorEngineTest {
             </script></body></html>
         """.trimIndent()
         val fetcher = StubFetcher(mapOf("$base/play/backtick.html" to page))
-        val video = SelectorEngine(fetcher).resolveVideo(config(), "$base/play/backtick.html")
+        val video = selectorTestEngine(fetcher).resolveVideo(config(), "$base/play/backtick.html")
         assertEquals("https://cdn.example.net/hls/movie.m3u8?sig=1", video.url)
     }
 }

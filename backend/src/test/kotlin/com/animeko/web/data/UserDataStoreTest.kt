@@ -15,8 +15,13 @@ import kotlin.test.assertTrue
 
 class UserDataStoreTest {
 
+    private fun testDirectory(prefix: String): Path = Files.createTempDirectory(
+        Path.of(System.getenv("TMPDIR") ?: System.getProperty("java.io.tmpdir")),
+        prefix,
+    )
+
     private fun store(maxBytes: Long = 512L * 1024): Pair<UserDataStore, Path> {
-        val dir = Files.createTempDirectory("animeko-data")
+        val dir = testDirectory("animeko-data")
         val file = dir.resolve("userdata.json")
         return UserDataStore(file, maxBytes) to file
     }
@@ -88,7 +93,7 @@ class UserDataStoreTest {
         // 只读挂载/磁盘满/父路径被普通文件占住时，IOException 原来会穿到兜底变成 500，
         // 前端把它当瞬时故障每 5 秒重试一次，永远重试下去，文案里也没有线索。
         // 现在换成 IllegalArgumentException（→ 400）+ 说得清的原因。
-        val dir = Files.createTempDirectory("animeko-data-ro")
+        val dir = testDirectory("animeko-data-ro")
         val blocker = dir.resolve("not-a-dir")
         Files.writeString(blocker, "x")
         val store = UserDataStore(blocker.resolve("userdata.json"))
@@ -100,7 +105,7 @@ class UserDataStoreTest {
     fun `a path that exists but is not a readable regular file fails instead of reading empty`() {
         // 这条是数据安全的分界：读不出来 ≠ 服务器上没有数据。
         // 若返回空文档，前端下一次保存就会覆盖掉原文件。
-        val dir = Files.createTempDirectory("animeko-data-baddir")
+        val dir = testDirectory("animeko-data-baddir")
         val file = dir.resolve("userdata.json")
         Files.createDirectory(file)
         val store = UserDataStore(file)

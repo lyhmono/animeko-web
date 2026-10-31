@@ -32,18 +32,20 @@ export default function SourceDetailPage() {
     }
     // 注意：react-router v6/v7 的 useParams 已自动解码，直接使用；
     // 不能再 decodeURIComponent（含 % 的源名会双重解码而错乱/抛错）
+    const controller = new AbortController()
     api
-      .sourceEpisodes(name, subjectUrl)
+      .sourceEpisodes(name, subjectUrl, controller.signal)
       .then((r) => {
         if (cancelled) return
         setResult(r)
         setChannel(r.channels[0] ?? null)
       })
       .catch((e) => {
-        if (!cancelled) setError(errMsg(e))
+        if (!cancelled && !controller.signal.aborted) setError(errMsg(e))
       })
     return () => {
       cancelled = true
+      controller.abort()
     }
   }, [name, subjectUrl])
 

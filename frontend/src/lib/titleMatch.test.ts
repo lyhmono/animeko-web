@@ -21,6 +21,26 @@ function result(groups: ChannelGroupHit[], episodes = groups.flatMap((g) => g.ep
 }
 
 describe('pickEpisode', () => {
+  it('rejects an exact-number hit explicitly labelled as a different season', () => {
+    const r = result([
+      group('第一季', [ep('第1话', 1, '第一季')]),
+      group('第二季', [ep('第5话', 5, '第二季')]),
+    ])
+    expect(pickEpisode(r, 5, '第5话', ['Show 第一季'])).toBeNull()
+  })
+
+  it('does not silently substitute a later episode in the correct season', () => {
+    const r = result([group('第一季', [ep('第6话', 6, '第一季')])])
+    expect(pickEpisode(r, 5, '第5话', ['Show 第一季'])).toBeNull()
+  })
+
+  it('preserves a same-season exact match and intentional special selection', () => {
+    const exact = ep('第5话', 5, '第二季')
+    expect(pickEpisode(result([group('第二季', [exact])]), 5, '第5话', ['Show 第二季'])).toBe(exact)
+    const special = ep('SP1', 1, '番外')
+    expect(pickEpisode(result([group('番外', [special])]), 1, 'SP1', ['Show'], true)).toBe(special)
+  })
+
   it('does not fall forward into another season', () => {
     // 本季只有第 1 集，另一季有第 6 集；点第 5 集时找不到精确匹配，
     // 旧实现会从扁平并集里取「第一个 >= 5」→ 跨季播第 6 集。

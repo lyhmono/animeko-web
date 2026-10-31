@@ -218,45 +218,20 @@ export function pickEpisode(
   }
 
   const pools: EpisodeHit[][] = []
-  /** 只含「同季/未标季」的池：找不到精确集时的下一集兜底不能跳到别的季 */
-  const fallbackPools: EpisodeHit[][] = []
   const candidates = allowSpecialNames ? result.groups : result.groups.filter((g) => !channelIsSpecial(g))
   if (candidates.length > 0) {
-    // 频道名写明了季号的按条目季号分组：同季 > 未写季号（通常是正片）> 其它季。
-    // 不能只按集数挑：同页挂全季的站点上，集数最多的往往是别的季。
+    // 只自动匹配同季或未标季的线路；已知别季不能用同号剧集顶替。
     const marked = candidates.map((g) => ({ g, season: parseTitleInfo(g.name).season }))
     const same = marked.filter((x) => x.season === subjectSeason).sort((a, b) => byCount(a.g, b.g))
     const none = marked.filter((x) => x.season == null).sort((a, b) => byCount(a.g, b.g))
-    const other = marked.filter((x) => x.season != null && x.season !== subjectSeason).sort((a, b) => byCount(a.g, b.g))
-    for (const x of same) {
-      pools.push(x.g.episodes)
-      fallbackPools.push(x.g.episodes)
-    }
-    for (const x of none) {
-      pools.push(x.g.episodes)
-      fallbackPools.push(x.g.episodes)
-    }
-    // 其它季只参与精确集数匹配，不参与「往后找一集」的兜底
-    for (const x of other) pools.push(x.g.episodes)
+    for (const x of [...same, ...none]) pools.push(x.g.episodes)
   } else if (result.groups.length > 0) {
     // 来源只有番外/OVA 线路：正片点第 N 集时不能拿番外顶替，交给手动选集
     return null
   }
   // 没有线路分组时才用扁平列表；有分组时它是所有季的并集，
   // 把它塞进 pools 会让「本季缺这一集」退化成另一季的同号剧集。
-  if (result.groups.length === 0) {
-    pools.push(result.episodes)
-    fallbackPools.push(result.episodes)
-  }
-
-  const hit = pickFromPools(pools, want, wantedName, allow)
-  if (hit) return hit
-  // 兜底也只在同季/未标季的 pool 内找，绝不回到跨季的扁平并集或「其它季」。
-  for (const pool of fallbackPools) {
-    const later = pool
-      .filter((e) => e.sortNum != null && e.sortNum >= want && allow(e))
-      .sort((a, b) => (a.sortNum as number) - (b.sortNum as number))
-    if (later.length > 0) return later[0]
-  }
-  return null
+  if (result.groups.length === 0) pools.push(result.episodes)
+  // 缺集时交给现有手动选集流程，不静默改播更晚的一集。
+  return pickFromPools(pools, want, wantedName, allow)
 }

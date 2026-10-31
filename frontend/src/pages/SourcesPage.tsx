@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, errMsg } from '../api'
 import type { StoredSource, SubscriptionCandidate, SubscriptionPreview } from '../types'
 import { IconLink } from '../lib/icons'
+import { notifySourcesChanged } from '../lib/sourceEvents'
+import { useModalFocus } from '../lib/useModalFocus'
 
 /** 订阅来源：填地址（服务端去取）或贴正文（站点挂了/需要登录时自己导出） */
 function subSource(url: string, text: string): { url?: string; text?: string } | null {
@@ -31,34 +33,63 @@ export default function SourcesPage() {
   const [checking, setChecking] = useState(false)
   const [testResult, setTestResult] = useState<Record<string, string>>({})
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  const deletingRef = useRef(false)
+  const deleteModalRef = useRef<HTMLDivElement>(null)
+  const closeDelete = () => {
+    if (!deletingRef.current) setPendingDelete(null)
+  }
+  useModalFocus(deleteModalRef, pendingDelete !== null, closeDelete)
   const [pendingToggles, setPendingToggles] = useState<Record<string, boolean>>({})
   const [loading, setLoading] = useState(true)
   const [loaded, setLoaded] = useState(false)
-
-  const reload = useCallback(() => {
-    api
-      .sources()
-      .then((list) => {
-        setSources(list)
-        setLoaded(true)
-      })
-      .catch((e) => {
-        setError(errMsg(e))
-        setLoaded(false)
-      })
-      .finally(() => setLoading(false))
-  }, [])
-
-  useEffect(reload, [reload])
+  const mountedRef = useRef(true)
+  const checkRef = useRef<AbortController | null>(null)
+  const singleChecksRef = useRef(new Map<string, AbortController>())
+  const [pendingTests, setPendingTests] = useState<Record<string, boolean>>({})
+  const reloadRef = useRef<AbortController | null>(null)
+  const reloadSeqRef = useRef(0)
 
   useEffect(() => {
-    if (!pendingDelete) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setPendingDelete(null)
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      checkRef.current?.abort()
+      checkRef.current = null
+      for (const ctrl of singleChecksRef.current.values()) ctrl.abort()
+      singleChecksRef.current.clear()
+      reloadSeqRef.current++
+      reloadRef.current?.abort()
     }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [pendingDelete])
+  }, [])
+
+  const reload = useCallback(async () => {
+    if (!mountedRef.current) return
+    reloadRef.current?.abort()
+    const ctrl = new AbortController()
+    reloadRef.current = ctrl
+    const seq = ++reloadSeqRef.current
+    const current = () => mountedRef.current && seq === reloadSeqRef.current && !ctrl.signal.aborted
+    setLoading(true)
+    try {
+      const list = await api.sources(ctrl.signal)
+      if (!current()) return
+      setSources(list)
+      setLoaded(true)
+    } catch (e) {
+      if (!current()) return
+      setError(errMsg(e))
+      setLoaded(false)
+    } finally {
+      if (current()) {
+        reloadRef.current = null
+        setLoading(false)
+      }
+    }
+  }, [])
+
+  useEffect(() => { void reload() }, [reload])
+
 
   const doImport = async () => {
     if (!importText.trim()) return
@@ -67,9 +98,10 @@ export default function SourcesPage() {
     setNotice('')
     try {
       const args = await api.importSource(importText.trim())
+      notifySourcesChanged()
       setNotice(`已导入数据源「${args.name}」`)
       setImportText('')
-      reload()
+      await reload()
     } catch (e) {
       setError(errMsg(e))
     } finally {
@@ -138,6 +170,7 @@ export default function SourcesPage() {
       // 带上预览时的内容指纹：订阅若在「拉取预览」和「导入」之间被更新过，
       // 服务端会拒绝并提示重新预览，而不是按一份和用户看到的不一样的清单导入
       const result = await api.importSubscription({ ...source, names, fingerprint: preview?.fingerprint })
+      if (result.added.length || result.updated.length) notifySourcesChanged()
       const parts = [
         result.added.length ? `新增 ${result.added.length} 个` : '',
         result.updated.length ? `覆盖 ${result.updated.length} 个` : '',
@@ -149,7 +182,7 @@ export default function SourcesPage() {
       }
       setPreview(null)
       setSubText('')
-      reload()
+      await reload()
     } catch (e) {
       setError(errMsg(e))
     } finally {
@@ -162,16 +195,42 @@ export default function SourcesPage() {
     setPicked(Object.fromEntries(preview.candidates.map((c) => [c.name, value])))
   }
 
+  const cancelSingle = (name: string) => {
+    singleChecksRef.current.get(name)?.abort()
+    singleChecksRef.current.delete(name)
+    setPendingTests((pending) => ({ ...pending, [name]: false }))
+    setTestResult((results) => ({ ...results, [name]: '已取消' }))
+  }
+
   const testSearch = async (name: string) => {
+    if (checkRef.current || singleChecksRef.current.has(name)) return
     const keyword = (testKeyword[name] ?? '').trim()
     if (!keyword) return
+    const ctrl = new AbortController()
+    singleChecksRef.current.set(name, ctrl)
+    const current = () => mountedRef.current && singleChecksRef.current.get(name) === ctrl && !ctrl.signal.aborted
+    setPendingTests((pending) => ({ ...pending, [name]: true }))
     setTestResult((r) => ({ ...r, [name]: '搜索中…' }))
     try {
-      const hits = await api.sourceSearch(name, keyword)
-      setTestResult((r) => ({ ...r, [name]: `找到 ${hits.length} 个结果` }))
+      const hits = await api.sourceSearch(name, keyword, ctrl.signal)
+      if (current()) setTestResult((r) => ({ ...r, [name]: `找到 ${hits.length} 个结果` }))
     } catch (e) {
-      setTestResult((r) => ({ ...r, [name]: `失败：${errMsg(e)}` }))
+      if (current()) setTestResult((r) => ({ ...r, [name]: `失败：${errMsg(e)}` }))
+    } finally {
+      if (current()) {
+        singleChecksRef.current.delete(name)
+        setPendingTests((pending) => ({ ...pending, [name]: false }))
+      }
     }
+  }
+
+  const cancelChecks = () => {
+    checkRef.current?.abort()
+    checkRef.current = null
+    setChecking(false)
+    setTestResult((results) => Object.fromEntries(Object.entries(results).map(([name, result]) =>
+      [name, result === '检查中…' ? '已取消' : result],
+    )))
   }
 
   /**
@@ -184,8 +243,12 @@ export default function SourcesPage() {
    * 全占满会让页面自己的其它请求排队。
    */
   const checkAll = async () => {
+    if (checkRef.current || singleChecksRef.current.size > 0) return
     const targets = sources.filter((s) => s.enabled).map((s) => s.arguments.name)
     if (targets.length === 0) return
+    const ctrl = new AbortController()
+    checkRef.current = ctrl
+    const current = () => mountedRef.current && checkRef.current === ctrl && !ctrl.signal.aborted
     setChecking(true)
     setTestResult((r) => {
       const next = { ...r }
@@ -194,20 +257,21 @@ export default function SourcesPage() {
     })
     let cursor = 0
     const worker = async () => {
-      while (cursor < targets.length) {
+      while (current() && cursor < targets.length) {
         const name = targets[cursor++]
         try {
-          // 用一个几乎必定有结果的宽泛词：目的是「这个源还能不能用」，
-          // 空结果会被误判成死源，所以不用「测试」这种精确词
-          const hits = await api.sourceSearch(name, '动画')
-          setTestResult((r) => ({ ...r, [name]: `✓ 可用（${hits.length} 个结果）` }))
+          const hits = await api.sourceSearch(name, '动画', ctrl.signal)
+          if (current()) setTestResult((r) => ({ ...r, [name]: `✓ 可用（${hits.length} 个结果）` }))
         } catch (e) {
-          setTestResult((r) => ({ ...r, [name]: `✗ 失败：${errMsg(e)}` }))
+          if (current()) setTestResult((r) => ({ ...r, [name]: `✗ 失败：${errMsg(e)}` }))
         }
       }
     }
     await Promise.all(Array.from({ length: Math.min(3, targets.length) }, worker))
-    setChecking(false)
+    if (current()) {
+      checkRef.current = null
+      setChecking(false)
+    }
   }
 
   const toggle = async (name: string, enabled: boolean) => {
@@ -215,7 +279,8 @@ export default function SourcesPage() {
     setPendingToggles((p) => ({ ...p, [name]: true }))
     try {
       await api.setSourceEnabled(name, enabled)
-      reload()
+      notifySourcesChanged()
+      await reload()
     } catch (e) {
       setError(errMsg(e))
     } finally {
@@ -230,29 +295,38 @@ export default function SourcesPage() {
 
   const confirmDelete = async () => {
     const name = pendingDelete
-    if (!name) return
-    setPendingDelete(null)
+    if (!name || deletingRef.current) return
+    deletingRef.current = true
+    setDeleting(true)
     setError('')
     try {
       await api.deleteSource(name)
-      reload()
+      notifySourcesChanged()
+      await reload()
     } catch (e) {
-      setError(errMsg(e))
+      if (mountedRef.current) setError(errMsg(e))
+    } finally {
+      deletingRef.current = false
+      if (mountedRef.current) {
+        setDeleting(false)
+        setPendingDelete(null)
+      }
     }
   }
 
   return (
     <div>
-      <h2 className="section-title">
+      <h2 className="section-title" tabIndex={-1} data-modal-return-focus>
         数据源管理 <span className="count">{sources.length} 个</span>
         <button
           className="airing-filter"
           onClick={() => void checkAll()}
-          disabled={checking || sources.filter((s) => s.enabled).length === 0}
+          disabled={checking || Object.values(pendingTests).some(Boolean) || sources.filter((s) => s.enabled).length === 0}
           title="对每个已启用的源跑一次搜索，标出不能用的"
         >
           {checking ? '检查中…' : '检查可用性'}
         </button>
+        {checking && <button className="airing-filter" onClick={cancelChecks}>取消检查</button>}
       </h2>
       <p style={{ color: 'var(--text-secondary)', fontSize: 13, marginBottom: 16 }}>
         直接导入 <b>animeko</b> 的 Selector 数据源配置 JSON（factoryId: web-selector，version: 2）。
@@ -298,8 +372,12 @@ export default function SourcesPage() {
               onKeyDown={(e) => e.key === 'Enter' && void testSearch(s.arguments.name)}
               style={{ width: 130 }}
             />
-            <button className="btn btn-secondary btn-sm" onClick={() => void testSearch(s.arguments.name)}>
-              测试
+            <button
+              className="btn btn-secondary btn-sm"
+              disabled={checking}
+              onClick={() => pendingTests[s.arguments.name] ? cancelSingle(s.arguments.name) : void testSearch(s.arguments.name)}
+            >
+              {pendingTests[s.arguments.name] ? '取消测试' : '测试'}
             </button>
             <button
               className={`switch ${s.enabled ? 'on' : ''}`}
@@ -319,8 +397,9 @@ export default function SourcesPage() {
       ))}
 
       {pendingDelete && (
-        <div className="modal-mask" onClick={() => setPendingDelete(null)}>
+        <div className="modal-mask" onClick={closeDelete}>
           <div
+            ref={deleteModalRef}
             className="modal"
             role="dialog"
             aria-modal="true"
@@ -333,11 +412,11 @@ export default function SourcesPage() {
               确认删除数据源「{pendingDelete}」？删除后不可恢复，需要重新导入。
             </p>
             <div className="modal-actions">
-              <button className="btn btn-secondary" autoFocus onClick={() => setPendingDelete(null)}>
+              <button className="btn btn-secondary" data-modal-autofocus disabled={deleting} onClick={closeDelete}>
                 取消
               </button>
-              <button className="btn btn-danger" onClick={() => void confirmDelete()}>
-                确认删除
+              <button className="btn btn-danger" disabled={deleting} onClick={() => void confirmDelete()}>
+                {deleting ? '删除中…' : '确认删除'}
               </button>
             </div>
           </div>

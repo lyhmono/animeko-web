@@ -2,7 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import Poster from '../components/Poster'
 import { api, errMsg } from '../api'
-import { isSpecialEpisodeName, pickBestHit, pickEpisode } from '../lib/titleMatch'
+import { pickBestHit, pickEpisode } from '../lib/titleMatch'
+import { confirmedBangumiEpisode, nextBangumiEpisode } from '../lib/episodeProgress'
+import { useModalFocus } from '../lib/useModalFocus'
 import type { BgmEpisode, BgmSubject, EpisodesResult, StoredSource } from '../types'
 import { getSubjectProgress, isFavorite, onDocChange, toggleFavorite } from '../lib/storage'
 import { IconHeart, IconHeartFilled } from '../lib/icons'
@@ -56,30 +58,22 @@ export default function SubjectPage() {
    * 关闭弹窗 / 换条目 / 卸载时世代+1，回不来的一律作废。
    */
   const matchGenRef = useRef(0)
+  const matchAbortRef = useRef<AbortController | null>(null)
   const closeFlow = useCallback(() => {
     matchGenRef.current++
+    matchAbortRef.current?.abort()
+    matchAbortRef.current = null
     setFlow(null)
   }, [])
 
-  // 弹窗打开时把焦点移进来，并支持 Esc 关闭；matching 状态也保留一个可聚焦的取消按钮。
-  // 只依赖「是否打开」而不是整个 flow：匹配状态更新时不该反复抢走焦点。
   const flowOpen = flow != null
-  useEffect(() => {
-    if (!flowOpen) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        closeFlow()
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    modalRef.current?.focus()
-    return () => window.removeEventListener('keydown', onKey)
-  }, [flowOpen, closeFlow])
+  // 通用钩子负责 Tab 圈定、背景 inert、状态切换后的焦点修复和关闭后归还触发焦点。
+  useModalFocus(modalRef, flowOpen, closeFlow)
 
   useEffect(() => {
     // cancelled 守卫：切换条目时旧请求的响应不能覆盖新条目的数据
     let cancelled = false
+    const controller = new AbortController()
     // 组件复用时必须重置上一条目遗留的错误与数据，否则错误会永久遮住新内容
     setError('')
     setSubject(null)
@@ -89,6 +83,8 @@ export default function SubjectPage() {
     // 换条目也要作废上一轮的自动匹配并收起弹窗：
     // 否则在 A 条目发起的匹配会在用户切到 B 条目之后把用户带进 A 的某一集
     matchGenRef.current++
+    matchAbortRef.current?.abort()
+    matchAbortRef.current = null
     setFlow(null)
     if (!subjectId) {
       setError('无效的条目 ID')
@@ -96,7 +92,7 @@ export default function SubjectPage() {
       setFaved(isFavorite(subjectId))
       setWatchedEp(getSubjectProgress(subjectId)?.ep ?? 0)
       api
-        .bangumiSubject(subjectId)
+        .bangumiSubject(subjectId, controller.signal)
         .then((s) => {
           if (!cancelled) setSubject(s)
         })
@@ -104,7 +100,7 @@ export default function SubjectPage() {
           if (!cancelled) setError(errMsg(e))
         })
       api
-        .sources()
+        .sources(controller.signal)
         .then((list) => {
           if (!cancelled) setSources(list.filter((s) => s.enabled))
         })
@@ -117,8 +113,11 @@ export default function SubjectPage() {
     }
     return () => {
       cancelled = true
+      controller.abort()
       // 卸载后那条在飞的匹配同样不许再跳转（它做的是整页 location.assign）
       matchGenRef.current++
+      matchAbortRef.current?.abort()
+      matchAbortRef.current = null
     }
   }, [subjectId, sourcesRetry])
 
@@ -153,12 +152,12 @@ export default function SubjectPage() {
       sourceName: string,
       playUrl: string,
       animeName: string,
-      epSort: number,
+      epSort: number | string,
       epLabel: string,
       next?: { source: string; play: string; title: string; anime: string; ep: string; bep?: string } | null,
       subjectUrl?: string,
-      /** 正片才写条目级进度；SP/OP/ED 的 sort 也从 1 开始，写进去会把本篇标成已看 */
-      mainEpisode = true,
+      /** 经过源剧集身份校验的本篇集号，与源侧 epSort 分开。 */
+      bangumiEp?: number,
     ) => {
       const params = new URLSearchParams({
         source: sourceName,
@@ -170,7 +169,7 @@ export default function SubjectPage() {
         subject: String(subjectId),
       })
       // ep 是数据源侧集号（连播时会变），bep 才是条目侧的 Bangumi 集号
-      if (mainEpisode) params.set('bep', String(epSort))
+      if (bangumiEp != null) params.set('bep', String(bangumiEp))
       if (next) params.set('next', JSON.stringify(next))
       // 数据源详情页地址：连播链条在「URL 里没带下一集」时靠它重新取列表
       if (subjectUrl) params.set('surl', subjectUrl)
@@ -183,14 +182,15 @@ export default function SubjectPage() {
   const nextOf = useCallback(
     (
       sourceName: string,
-      episodes: { name: string; playUrl: string; sortNum: number | null; sort: string }[],
+      episodes: EpisodesResult['episodes'],
       index: number,
       animeName: string,
-      /** 下一页对应的 Bangumi 集号；源站集号不能直接当条目进度用 */
-      nextBep?: number,
+      /** 已确认的当前 Bangumi 集号；下一集只能从这个映射继续推导。 */
+      currentBep?: number,
     ) => {
       const ep = episodes[index + 1]
-      if (!ep) return null
+      if (index < 0 || !ep) return null
+      const nextBep = nextBangumiEpisode(episodes[index], ep, currentBep)
       return {
         source: sourceName,
         play: ep.playUrl,
@@ -198,7 +198,7 @@ export default function SubjectPage() {
         anime: animeName,
         ep: String(ep.sortNum ?? ep.sort),
         // 下一集是番外/特典时不能把「Bangumi 下一话」写成它的条目进度
-        bep: nextBep != null && !isSpecialEpisodeName(ep.name) ? String(nextBep) : undefined,
+        bep: nextBep != null ? String(nextBep) : undefined,
       }
     },
     [],
@@ -215,13 +215,16 @@ export default function SubjectPage() {
     async (sourceName: string, ep: BgmEpisode, auto: boolean) => {
       if (!subject) return
       const animeName = subject.name_cn || subject.name
+      matchAbortRef.current?.abort()
+      const controller = new AbortController()
+      matchAbortRef.current = controller
       const gen = ++matchGenRef.current
       // 每次写状态与跳转前都要确认这一轮还是「当前这一轮」：
       // 失败分支原来用 `f ? … : f` 只是「弹窗没了就不写」，并不能阻止成功分支跳转
-      const alive = () => gen === matchGenRef.current
+      const alive = () => gen === matchGenRef.current && !controller.signal.aborted
       setFlow((f) => (f ? { ...f, pickingSource: false, matching: true, matchError: '', matchedSource: sourceName } : f))
       try {
-        const hits = await api.sourceSearch(sourceName, animeName)
+        const hits = await api.sourceSearch(sourceName, animeName, controller.signal)
         if (!alive()) return
         if (hits.length === 0) {
           setFlow((f) =>
@@ -233,7 +236,7 @@ export default function SubjectPage() {
         // （用户点第一季第一集、播出来却是最终季/番外，就是这么来的）。
         // 按「季号 + 类型 + 标题相似度」挑最像这个条目的那一条。
         const best = pickBestHit(hits, [subject.name_cn, subject.name]) ?? hits[0]
-        const result = await api.sourceEpisodes(sourceName, best.url)
+        const result = await api.sourceEpisodes(sourceName, best.url, controller.signal)
         if (!alive()) return
         if (result.episodes.length === 0) {
           setFlow((f) =>
@@ -275,23 +278,16 @@ export default function SubjectPage() {
             ? result.episodes.filter((e) => e.channel === matched.channel)
             : result.episodes
           const idx = chain.findIndex((e) => e.playUrl === matched.playUrl)
-          const nextSource = idx >= 0 ? chain[idx + 1] : undefined
-          // 只有源站集号与当前集连续时，才能确信下一页就是 Bangumi 的下一话。
-          const nextBep =
-            (ep.type ?? 0) === 0 &&
-            matched.sortNum != null &&
-            nextSource?.sortNum === matched.sortNum + 1
-              ? want + 1
-              : undefined
+          const currentBep = confirmedBangumiEpisode(ep, matched)
           goPlay(
             sourceName,
             matched.playUrl,
             animeName,
-            want,
+            matched.sortNum ?? matched.sort,
             matched.name,
-            nextOf(sourceName, chain, idx, animeName, nextBep),
+            nextOf(sourceName, chain, idx, animeName, currentBep),
             best.url,
-            (ep.type ?? 0) === 0,
+            currentBep,
           )
           return
         }
@@ -304,6 +300,8 @@ export default function SubjectPage() {
         // 上一轮的失败会把错误写进这一轮的弹窗里
         if (!alive()) return
         setFlow((f) => (f ? { ...f, matching: false, matchError: errMsg(e) } : f))
+      } finally {
+        if (matchAbortRef.current === controller) matchAbortRef.current = null
       }
     },
     [subject, goPlay, nextOf],
@@ -338,6 +336,8 @@ export default function SubjectPage() {
           srcSet={coverSrcSet}
           sizes="(max-width: 720px) 40vw, 220px"
           alt={subject.name_cn || subject.name}
+          loading="eager"
+          fetchPriority="high"
         />
         <div className="meta">
           <h1>{subject.name_cn || subject.name}</h1>
@@ -514,23 +514,16 @@ export default function SubjectPage() {
                         const flat = flow.pickingEpisodes?.episodes ?? []
                         const chain = ep.channel ? flat.filter((x) => x.channel === ep.channel) : flat
                         const at = chain.findIndex((x) => x.playUrl === ep.playUrl)
-                        const nextSource = at >= 0 ? chain[at + 1] : undefined
-                        const currentBep = flow.episode.sort ?? 1
-                        const nextBep =
-                          (flow.episode.type ?? 0) === 0 &&
-                          ep.sortNum != null &&
-                          nextSource?.sortNum === ep.sortNum + 1
-                            ? currentBep + 1
-                            : undefined
+                        const currentBep = confirmedBangumiEpisode(flow.episode, ep)
                         goPlay(
                           flow.matchedSource,
                           ep.playUrl,
                           subject.name_cn || subject.name,
-                          currentBep,
+                          ep.sortNum ?? ep.sort,
                           ep.name,
-                          nextOf(flow.matchedSource, chain, at, subject.name_cn || subject.name, nextBep),
+                          nextOf(flow.matchedSource, chain, at, subject.name_cn || subject.name, currentBep),
                           flow.sourceSubjectUrl,
-                          (flow.episode.type ?? 0) === 0,
+                          currentBep,
                         )
                       }}
                     >

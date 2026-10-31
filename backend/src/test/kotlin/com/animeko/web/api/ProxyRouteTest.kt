@@ -236,8 +236,9 @@ class ProxyRouteTest {
         val resp = client.get("/api/proxy") { parameter("url", "https://cdn.example.com/video.mp4") }
         assertEquals(HttpStatusCode.OK, resp.status)
         assertEquals("BYTES", resp.bodyAsText())
-        // 没有会话就没有额外头：手动直链播放本来就是无凭据场景
-        assertEquals(emptyMap(), h.stub.requests.single().second.filterKeys { it != "Range" })
+        // BN-004 契约更正：identity 是代理的内容编码策略，不是内联源站凭据。
+        // 无会话仍不得携带 UA/Referer/Cookie，但显式要求上游 identity。
+        assertEquals(mapOf(HttpHeaders.AcceptEncoding to "identity"), h.stub.requests.single().second.filterKeys { it != "Range" })
     }
 
     @Test

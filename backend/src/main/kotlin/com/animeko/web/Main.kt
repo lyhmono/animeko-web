@@ -4,6 +4,8 @@ import com.animeko.web.api.configureApiRoutes
 import com.animeko.web.api.configureStaticFrontend
 import com.animeko.web.auth.LoginRateLimiter
 import com.animeko.web.auth.SessionStore
+import com.animeko.web.auth.CredentialVerifier
+import com.animeko.web.auth.ConfiguredCredentialVerifier
 import com.animeko.web.bangumi.BangumiClient
 import com.animeko.web.bangumi.BgmChannelStore
 import com.animeko.web.bangumi.SubjectNotFoundException
@@ -19,6 +21,7 @@ import com.animeko.web.selector.SelectorException
 import com.animeko.web.selector.SelectorRepository
 import com.animeko.web.selector.SubscriptionService
 import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
@@ -27,6 +30,7 @@ import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
 import io.ktor.server.plugins.compression.Compression
 import io.ktor.server.plugins.compression.gzip
+import io.ktor.server.plugins.compression.condition
 import io.ktor.server.plugins.compression.matchContentType
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.statuspages.StatusPages
@@ -50,6 +54,7 @@ fun Application.module(
     proxySessions: ProxySessionStore = ProxySessionStore(),
     siteSessions: SessionStore = SessionStore(),
     loginLimiter: LoginRateLimiter = LoginRateLimiter(),
+    credentialVerifier: CredentialVerifier = ConfiguredCredentialVerifier(cfg),
 ) {
     install(ContentNegotiation) {
         json(Json { ignoreUnknownKeys = true; encodeDefaults = true })
@@ -58,6 +63,16 @@ fun Application.module(
     // 只对文本类响应压缩：视频/分片走流式，压缩只会白烧 CPU 还可能破坏 Range 透传。
     install(Compression) {
         gzip {
+            // Proxy encodings and byte ranges describe upstream bytes; compression would invalidate them.
+            // Ktor keeps response and OutgoingContent metadata separately, so check both.
+            condition { content ->
+                response.headers[HttpHeaders.ContentEncoding] == null &&
+                    content.headers[HttpHeaders.ContentEncoding] == null &&
+                    response.headers[HttpHeaders.ContentRange] == null &&
+                    content.headers[HttpHeaders.ContentRange] == null &&
+                    response.status() != HttpStatusCode.PartialContent &&
+                    content.status != HttpStatusCode.PartialContent
+            }
             matchContentType(
                 ContentType.Text.CSS,
                 ContentType.Text.Html,
@@ -71,6 +86,7 @@ fun Application.module(
         }
     }
     install(StatusPages) {
+        exception<CancellationException> { _, cause -> throw cause }
         // 日志里只记路径、不记完整查询串：/api/proxy 的查询串含 sid（能力令牌）
         // 与媒体地址，落进日志文件就等于一份可重放的代理 URL
         exception<SelectorException> { call, cause ->
@@ -108,6 +124,7 @@ fun Application.module(
             )
         }
         exception<Throwable> { call, cause ->
+            if (cause is CancellationException) throw cause
             appLog.error("未处理异常: {}", call.request.path(), cause)
             // 兜底不回显 cause.message：里面常带路径/上游地址等内部信息，日志里已有完整堆栈
             call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "INTERNAL_ERROR"))
@@ -156,7 +173,7 @@ fun Application.module(
 
     configureApiRoutes(
         cfg, bangumi, repo, engine, fetcher, sessions,
-        siteSessions, loginLimiter, userData, subscriptions,
+        siteSessions, loginLimiter, userData, subscriptions, credentialVerifier,
     )
     configureStaticFrontend(cfg)
 

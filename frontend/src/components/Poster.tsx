@@ -14,12 +14,17 @@ export default function Poster({
   alt,
   className = '',
   sizes,
+  loading = 'lazy',
+  fetchPriority,
 }: {
   src: string
   srcSet?: string
   alt: string
   className?: string
   sizes?: string
+  /** 列表默认懒加载；首屏主图由调用方明确提升优先级。 */
+  loading?: 'eager' | 'lazy'
+  fetchPriority?: 'high' | 'low' | 'auto'
 }) {
   // 失败状态按地址记，而不是一个布尔：列表复用组件时（同一个 key 换了 src）
   // 布尔会跟着旧地址留下来 —— 新图直接走代理，甚至直接显示占位块
@@ -39,7 +44,8 @@ export default function Poster({
       srcSet={viaProxy ? undefined : srcSet}
       sizes={sizes}
       alt={alt}
-      loading="lazy"
+      loading={loading}
+      fetchPriority={fetchPriority}
       // 不发 Referer。默认行为会把**当前页的完整 URL**送给每家第三方图床
       // （Bangumi 的 CDN、各数据源自己的 img 域名），而搜索页的地址是
       // /search?q=<关键词> —— 等于把用户搜了什么、以及这台自建实例的域名，

@@ -40,6 +40,15 @@ dependencies {
     testImplementation("io.ktor:ktor-server-test-host:3.1.3")
 }
 
+// 构建镜像的独立依赖层需要下载实际 JAR，而不仅是 dependency report 元数据。
+tasks.register("prefetchDependencies") {
+    doLast {
+        listOf("compileClasspath", "runtimeClasspath", "testCompileClasspath", "testRuntimeClasspath").forEach { name ->
+            configurations.getByName(name).files
+        }
+    }
+}
+
 tasks.test {
     useJUnitPlatform()
     // 测试 JVM 必须自己声明文本编码，不能继承调用者的 locale。

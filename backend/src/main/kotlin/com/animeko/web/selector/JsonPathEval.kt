@@ -1,260 +1,296 @@
 package com.animeko.web.selector
 
 import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 
-/**
- * 极简 JsonPath 求值器，覆盖 animeko selector 配置用到的子集：
- *
- * - `$`                        根
- * - `.key` / `['key']`         子属性（对数组自动映射到每个元素，与 Jayway 一致）
- * - `['k1','k2']`              多属性
- * - `[*]` / `.*`               数组全部元素 / 对象全部值
- * - `[0]`                      数组下标
- * - `..key`                    深度扫描（递归查找所有名为 key 的值）
- */
+/** Small JsonPath subset: properties, wildcards, array indices and recursive descent. */
 object JsonPathEval {
-
-    /**
-     * 单步中间结果的上限。
-     *
-     * `..key` 是递归扫描，而**连续几段就会组合爆炸**：实测深度 128 的文档配
-     * `$..a..a..a..a`，0.96 秒产出 10,668,000 个元素，再多一段就直接把进程打死
-     * （120 秒都没跑完）。128 恰好等于 JsonGuard 允许的最大深度，所以深度闸门
-     * 一点忙都帮不上——爆炸来自「扫描次数」而不是「嵌套深度」。
-     *
-     * 触发条件是社区配置里的选择器字符串（`selectNames`/`selectLinks`），而配置
-     * 可以从聚合订阅直接导入，等于让第三方文本决定本机分配多少内存。
-     * 真实的搜索页最多几百到几千条，20000 已经宽松到不可能误伤。
-     * 超限按「这个选择器扫不出东西」处理（返回 null），单条数据源失败而不是整服务。
-     */
     private const val MAX_NODES = 20_000
+    private const val MAX_WORK = 200_000
+    internal const val MAX_PATH_LENGTH = 2_048
+    private const val MAX_STEPS = 64
+    private const val MAX_DEPTH = 128
+    private const val MAX_PLANS = 256
 
-    fun evaluate(path: String, root: JsonElement): List<JsonElement>? {
-        val p = path.trim()
-        if (!p.startsWith("$")) return null
-        if (p == "$") return listOf(root)
-        var current: List<JsonElement> = listOf(root)
-        var i = 1
-        while (i < p.length) {
-            when (p[i]) {
-                '.' -> {
-                    if (i + 1 < p.length && p[i + 1] == '.') {
-                        // 深度扫描: ..key
-                        i += 2
-                        val (key, next) = readKey(p, i)
-                        if (key.isEmpty()) return null
-                        current = appendCapped(current) { deepScan(it, key) } ?: return null
-                        i = next
-                        continue
+    private class BudgetExceeded : RuntimeException(null, null, false, false)
+
+    /** Per evaluation/request, never shared with a compiled plan or another caller. */
+    class Budget(
+        private val maxWork: Int = MAX_WORK,
+        internal val maxResults: Int = MAX_NODES,
+        private val checkCancelled: () -> Unit = {},
+    ) {
+        var workUsed: Int = 0
+            private set
+
+        internal fun visit() {
+            if (workUsed % 128 == 0) checkCancelled()
+            if (++workUsed > maxWork) throw BudgetExceeded()
+        }
+    }
+
+    private sealed interface Step {
+        data class Property(val keys: List<String>) : Step
+        data object Wildcard : Step
+        data class Index(val value: Int) : Step
+        data class Deep(val key: String) : Step
+    }
+
+    private data class Plan(val steps: List<Step>)
+    private val plans = object : LinkedHashMap<String, Plan?>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Plan?>): Boolean = size > MAX_PLANS
+    }
+
+    fun evaluate(path: String, root: JsonElement, budget: Budget = Budget()): List<JsonElement>? = bounded {
+        val plan = compile(path) ?: return@bounded null
+        execute(plan.steps, listOf(root), aligned = false, budget)
+    }
+
+    /** Missing properties (including intermediate objects) keep an explicit position. */
+    fun evaluateAligned(path: String, root: JsonElement, budget: Budget = Budget()): List<JsonElement>? = bounded {
+        val plan = compile(path) ?: return@bounded null
+        execute(plan.steps, listOf(root), aligned = true, budget)
+    }
+
+    internal data class IndexedRecord(val record: JsonElement, val name: JsonElement?, val link: JsonElement?)
+
+    /** Resolve both fields against the same records; unrelated fan-outs are not safe to zip. */
+    internal fun indexedValues(
+        namePath: String,
+        linkPath: String,
+        root: JsonElement,
+        budget: Budget = Budget(),
+    ): List<IndexedRecord>? = bounded {
+        val names = compile(namePath)?.steps ?: return@bounded null
+        val links = compile(linkPath)?.steps ?: return@bounded null
+        var common = 0
+        while (common < minOf(names.size, links.size) && names[common] == links[common]) common++
+        // Identical field selectors still need their parent records, not the field values.
+        if (common == names.size && common == links.size && common > 0) common--
+        val nameTail = names.drop(common)
+        val linkTail = links.drop(common)
+        if ((nameTail + linkTail).any { it is Step.Wildcard || it is Step.Deep }) return@bounded null
+        val context = execute(names.take(common), listOf(root), aligned = false, budget)
+        val records = Collector(budget)
+        for (element in context) walkArrayLeaves(element, budget) { records.emit(it) }
+        val result = ArrayList<IndexedRecord>(records.values.size)
+        for (record in records.values) {
+            val name = execute(nameTail, listOf(record), aligned = true, budget).firstOrNull()
+            val link = execute(linkTail, listOf(record), aligned = true, budget).firstOrNull()
+            result.add(IndexedRecord(record, name, link))
+        }
+        result
+    }
+
+    private inline fun <T> bounded(block: () -> T): T? = try {
+        block()
+    } catch (_: BudgetExceeded) {
+        null
+    }
+
+    private class Collector(private val budget: Budget) {
+        val values = ArrayList<JsonElement>()
+        fun emit(value: JsonElement) {
+            budget.visit()
+            if (values.size >= budget.maxResults) throw BudgetExceeded()
+            values.add(value)
+        }
+    }
+
+    private fun execute(steps: List<Step>, initial: List<JsonElement>, aligned: Boolean, budget: Budget): List<JsonElement> {
+        var current = initial
+        for (step in steps) {
+            val out = Collector(budget)
+            for (element in current) {
+                when (step) {
+                    is Step.Property -> {
+                        if (aligned) {
+                            if (step.keys.isNotEmpty()) walkArrayLeaves(element, budget) { leaf ->
+                                val obj = leaf as? JsonObject
+                                var value: JsonElement = JsonNull
+                                for (key in step.keys) {
+                                    budget.visit()
+                                    val found = obj?.get(key)
+                                    if (found != null) { value = found; break }
+                                }
+                                out.emit(value)
+                            }
+                        } else {
+                            // Preserve the general evaluator's key-major multi-property order.
+                            for (key in step.keys) walkArrayLeaves(element, budget) { leaf ->
+                                budget.visit()
+                                (leaf as? JsonObject)?.get(key)?.let(out::emit)
+                            }
+                        }
                     }
-                    i++
-                    if (i < p.length && p[i] == '*') {
-                        current = appendCapped(current) { children(it) } ?: return null
-                        i++
-                        continue
+                    Step.Wildcard -> {
+                        budget.visit()
+                        val children = when (element) {
+                            is JsonArray -> element
+                            is JsonObject -> element.values
+                            else -> emptyList()
+                        }
+                        for (child in children) out.emit(child)
                     }
-                    val (key, next) = readKey(p, i)
-                    if (key.isEmpty()) return null
-                    current = appendCapped(current) { property(it, key) } ?: return null
-                    i = next
+                    is Step.Index -> {
+                        budget.visit()
+                        val value = (element as? JsonArray)?.getOrNull(step.value)
+                        if (value != null) out.emit(value) else if (aligned) out.emit(JsonNull)
+                    }
+                    is Step.Deep -> deepScan(element, step.key, out, budget)
                 }
-
-                '[' -> {
-                    val close = findClosingBracket(p, i) ?: return null
-                    val inner = p.substring(i + 1, close).trim()
-                    current = applyBracket(current, inner) ?: return null
-                    i = close + 1
-                }
-
-                else -> return null
             }
+            current = out.values
         }
         return current
     }
 
-    private fun applyBracket(current: List<JsonElement>, inner: String): List<JsonElement>? {
-        if (inner == "*") return appendCapped(current) { children(it) }
-        // 多属性: 'a','b' 或 "a","b"。这里保持 Jayway 语义：一个元素命中几个键就贡献几项、
-        // 一个都不命中贡献 0 项。需要「按位置配对」的调用方请用 evaluateAligned()，
-        // 不要在通用求值器里偷偷改语义 —— 那会让所有其它路径的行为变得不可预期。
-        if (inner.contains("'") || inner.contains("\"")) {
-            val keys = multiKeyNames(inner) ?: return null
-            return appendMultiKeys(current, keys)
-        }
-        // 下标
-        inner.toIntOrNull()?.let { idx ->
-            return current.mapNotNull { e -> (e as? JsonArray)?.getOrNull(idx) }
-        }
-        // 单 key（无引号）
-        return appendCapped(current) { property(it, inner) }
-    }
-
-    /**
-     * 有界 flatMap：先检查追加后的总数，再真正写入。
-     *
-     * 旧写法 `current.flatMap { … }` 会先把全部结果装进 ArrayList，之后才判 MAX_NODES；
-     * `$..a..a` 让 2 万个中间结果各自再产出 2 万项时，峰值是先分配约 4 亿个引用，
-     * 限额检查只是事后道歉。这里在每次 add 之前用 Long 判断，超限直接放弃整个选择器。
-     */
-    private inline fun appendCapped(
-        current: List<JsonElement>,
-        crossinline expand: (JsonElement) -> List<JsonElement>,
-    ): List<JsonElement>? {
-        val out = ArrayList<JsonElement>(minOf(current.size, MAX_NODES))
-        for (element in current) {
-            val items = expand(element)
-            if (items.isEmpty()) continue
-            if (out.size.toLong() + items.size > MAX_NODES) return null
-            out.addAll(items)
-        }
-        return out
-    }
-
-    /** 多属性选择器的逐键累加：同样在分配前检查上限，避免 keys × 数组扇出的峰值。 */
-    private fun appendMultiKeys(current: List<JsonElement>, keys: List<String>): List<JsonElement>? {
-        val out = ArrayList<JsonElement>(minOf(current.size, MAX_NODES))
-        for (element in current) {
-            for (key in keys) {
-                val items = property(element, key)
-                if (items.isEmpty()) continue
-                if (out.size.toLong() + items.size > MAX_NODES) return null
-                out.addAll(items)
+    /** Iterator frames avoid both recursive stack growth and eagerly pushing wide arrays. */
+    private fun walkArrayLeaves(root: JsonElement, budget: Budget, leaf: (JsonElement) -> Unit) {
+        val stack = ArrayDeque<Iterator<JsonElement>>()
+        var items = listOf(root).iterator()
+        while (true) {
+            if (items.hasNext()) {
+                val element = items.next()
+                budget.visit()
+                if (element is JsonArray) {
+                    if (stack.size >= MAX_DEPTH) throw BudgetExceeded()
+                    stack.addLast(items)
+                    items = element.iterator()
+                } else leaf(element)
+            } else {
+                if (stack.isEmpty()) return
+                items = stack.removeLast()
             }
         }
-        return out
     }
 
-    private fun multiKeyNames(inner: String): List<String>? {
-        if (!(inner.contains("'") || inner.contains("\""))) return null
-        val keys = Regex("""['"]([^'"]+)['"]""").findAll(inner).map { it.groupValues[1] }.toList()
-        return keys.ifEmpty { null }
+    private fun deepScan(root: JsonElement, key: String, out: Collector, budget: Budget) {
+        val stack = ArrayDeque<Iterator<JsonElement>>()
+        var items = listOf(root).iterator()
+        while (true) {
+            if (items.hasNext()) {
+                val element = items.next()
+                budget.visit()
+                val children = when (element) {
+                    is JsonObject -> {
+                        element[key]?.let(out::emit)
+                        element.values
+                    }
+                    is JsonArray -> element
+                    else -> null
+                }
+                if (children != null) {
+                    if (stack.size >= MAX_DEPTH) throw BudgetExceeded()
+                    stack.addLast(items)
+                    items = children.iterator()
+                }
+            } else {
+                if (stack.isEmpty()) return
+                items = stack.removeLast()
+            }
+        }
     }
 
-    /**
-     * 与 [evaluate] 同，但**结尾的多属性选择器按元素对齐**：
-     * 每个元素恰好贡献一项（取第一个命中的键，都没有则贡献 JsonNull 占格）。
-     *
-     * 存在的理由：数据源的 `selectNames` / `selectLinks` 形如
-     * `$[*]['title','name']` 与 `$[*]['url','link']`，调用方是**按下标配对**名字与地址的。
-     * 按 Jayway 语义，缺键的元素贡献 0 项、同时带两个键的元素贡献 2 项，于是两条列表长度
-     * 不同、整体错位 —— 症状不是报错而是「显示 A 的名字，点进去播 B 的地址」这种静默错结果。
-     * 补一个占位格让上层按「空名字」丢掉那一条，后面的条目就不会前移。
-     */
-    fun evaluateAligned(path: String, root: JsonElement): List<JsonElement>? {
+    private fun compile(path: String): Plan? {
+        if (path.length > MAX_PATH_LENGTH) return null
         val p = path.trim()
-        // 这里以前是 Regex("""^(.+)\[(.+)\]$""").matchEntire(p)。
-        // 两个贪婪 .+ 加行尾锚点在最坏情况下是**平方级**回溯：实测长度 20001 要 2.7s、
-        // 40001 要 10.5s、80001 要 42s，而选择器字符串来自第三方配置、每次搜索都会重新跑一遍
-        // ——一份 `selectNames = "$[[[[[…"` 的配置就能把这台机器的 CPU 按住。
-        // 语义与那条正则完全一致（贪婪的 group1 恰好停在**最后一个** `[`），但不需要回溯。
-        val close = p.length - 1
-        val open = p.lastIndexOf('[')
-        if (open <= 0 || close <= open || p[close] != ']') return evaluate(p, root)
-        val prefix = p.substring(0, open)
-        val keys = multiKeyNames(p.substring(open + 1, close))
-        if (keys.isNullOrEmpty()) return evaluate(p, root)
-        val elements = evaluate(prefix, root) ?: return null
-        val out = ArrayList<JsonElement>(minOf(elements.size, MAX_NODES))
-        for (element in elements) {
-            val items = alignedFor(element, keys)
-            if (items.isEmpty()) continue
-            if (out.size.toLong() + items.size > MAX_NODES) return null
-            out.addAll(items)
+        return synchronized(plans) {
+            if (plans.containsKey(p)) plans[p] else parse(p).also { plans[p] = it }
         }
-        return out
     }
 
-    /**
-     * 对一个元素产出「每个叶子一条」的结果：对象贡献 1 条（取第一个命中的键，
-     * 全都没有则 JsonNull 占格）；数组递归到它的每个叶子。
-     *
-     * 必须递归展开数组：默认选择器 `$[*]['title','name']` 作用在
-     * `{"code":0,"data":[{...},{...}]}` 这种根上时，`$[*]` 给出的是**数组本身**，
-     * 旧实现正是靠 property() 对数组的自动展开才拿到两项。只按「一个元素一条」
-     * 处理会把整个数组压成一条，反而丢数据。
-     */
-    private fun alignedFor(e: JsonElement, keys: List<String>): List<JsonElement> = when (e) {
-        is JsonArray -> e.flatMap { alignedFor(it, keys) }
-        is JsonObject -> listOf(
-            keys.asSequence()
-                .mapNotNull { e[it] }
-                .firstOrNull() ?: JsonNull,
-        )
-        else -> emptyList()
-    }
-
-    /** 属性访问：对象取键值；数组自动映射到每个元素（Jayway 语义） */
-    private fun property(e: JsonElement, key: String): List<JsonElement> = when (e) {
-        is JsonObject -> listOfNotNull(e[key])
-        is JsonArray -> e.flatMap { property(it, key) }
-        else -> emptyList()
-    }
-
-    private fun children(e: JsonElement): List<JsonElement> = when (e) {
-        is JsonArray -> e.toList()
-        is JsonObject -> e.values.toList()
-        else -> emptyList()
-    }
-
-    private fun deepScan(e: JsonElement, key: String): List<JsonElement> {
-        val result = ArrayList<JsonElement>()
-
-        fun walk(el: JsonElement) {
-            // 上限要在**收集的过程中**就生效：一次深扫本身也可能覆盖整棵子树，
-            // 等它返回再判等于先把内存花完再道歉
-            if (result.size > MAX_NODES) return
-            when (el) {
-                is JsonObject -> {
-                    el[key]?.let { result.add(it) }
-                    el.values.forEach { walk(it) }
-                }
-
-                is JsonArray -> el.forEach { walk(it) }
-                else -> Unit
-            }
-        }
-        walk(e)
-        return result
-    }
-
-    private fun readKey(p: String, start: Int): Pair<String, Int> {
-        var i = start
-        val sb = StringBuilder()
-        while (i < p.length && (p[i].isLetterOrDigit() || p[i] == '_' || p[i] == '-')) {
-            sb.append(p[i])
-            i++
-        }
-        return sb.toString() to i
-    }
-
-    private fun findClosingBracket(p: String, open: Int): Int? {
-        var depth = 0
-        var i = open
+    private fun parse(p: String): Plan? {
+        if (!p.startsWith('$')) return null
+        val steps = ArrayList<Step>()
+        var i = 1
         while (i < p.length) {
+            if (steps.size >= MAX_STEPS) return null
             when (p[i]) {
-                '[' -> depth++
-                ']' -> {
-                    depth--
-                    if (depth == 0) return i
+                '.' -> {
+                    i++
+                    val deep = p.getOrNull(i) == '.'
+                    if (deep) i++
+                    if (!deep && p.getOrNull(i) == '*') {
+                        steps.add(Step.Wildcard)
+                        i++
+                    } else {
+                        val start = i
+                        while (i < p.length && (p[i].isLetterOrDigit() || p[i] in "_-")) i++
+                        if (start == i) return null
+                        val key = p.substring(start, i)
+                        steps.add(if (deep) Step.Deep(key) else Step.Property(listOf(key)))
+                    }
                 }
+                '[' -> {
+                    val start = ++i
+                    var quote: Char? = null
+                    while (i < p.length) {
+                        val ch = p[i]
+                        if (quote != null) {
+                            if (ch == '\\') i++ else if (ch == quote) quote = null
+                        } else {
+                            if (ch == '\'' || ch == '"') quote = ch else if (ch == ']') break
+                            else if (ch == '[') return null
+                        }
+                        i++
+                    }
+                    if (i >= p.length || quote != null) return null
+                    val inner = p.substring(start, i).trim()
+                    val step = when {
+                        inner == "*" -> Step.Wildcard
+                        inner.toIntOrNull() != null -> Step.Index(inner.toInt())
+                        inner.startsWith('\'') || inner.startsWith('"') -> Step.Property(readQuotedKeys(inner) ?: return null)
+                        inner.isEmpty() -> Step.Property(emptyList())
+                        inner.all { it.isLetterOrDigit() || it in "_-" } -> Step.Property(listOf(inner))
+                        else -> return null
+                    }
+                    steps.add(step)
+                    i++
+                }
+                else -> return null
             }
+        }
+        return Plan(steps)
+    }
+
+    private fun readQuotedKeys(inner: String): List<String>? {
+        val keys = ArrayList<String>()
+        var i = 0
+        while (i < inner.length) {
+            while (i < inner.length && inner[i].isWhitespace()) i++
+            val quote = inner.getOrNull(i++) ?: return null
+            if (quote != '\'' && quote != '"') return null
+            val key = StringBuilder()
+            while (i < inner.length && inner[i] != quote) {
+                if (inner[i] == '\\') { i++; if (i == inner.length) return null }
+                key.append(inner[i++])
+            }
+            if (i >= inner.length || key.isEmpty() || keys.size >= 16) return null
             i++
+            keys.add(key.toString())
+            while (i < inner.length && inner[i].isWhitespace()) i++
+            if (i == inner.length) return keys
+            if (inner[i++] != ',' || i == inner.length) return null
         }
         return null
     }
 
-    /** 取出字符串值（数组取第一个、对象取第一个 value），与 animeko 的取值语义一致 */
-    fun singleString(e: JsonElement?): String? = when (e) {
-        is JsonArray -> e.firstOrNull()?.let { singleString(it) }
-        is JsonObject -> e.values.firstOrNull()?.let { singleString(it) }
-        // JSON 的 null 也是 JsonPrimitive，content 会给出字面串 "null"，
-        // 于是空字段能被当成有效标题/链接；contentOrNull 才对 null 返回 null
-        is JsonPrimitive -> e.contentOrNull
-        else -> null
+    /** Unwrap one value, preserving JSON null instead of the literal string "null". */
+    fun singleString(e: JsonElement?): String? {
+        var value = e
+        repeat(MAX_DEPTH + 1) {
+            value = when (val current = value) {
+                is JsonArray -> current.firstOrNull()
+                is JsonObject -> current.values.firstOrNull()
+                is JsonPrimitive -> return current.contentOrNull
+                else -> return null
+            }
+        }
+        return null
     }
 }

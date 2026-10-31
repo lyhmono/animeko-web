@@ -3,6 +3,8 @@ package com.animeko.web.bangumi
 import com.animeko.web.http.Fetcher
 import com.animeko.web.http.HttpResult
 import com.animeko.web.http.StreamResult
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.test.runTest
 import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -32,33 +34,37 @@ class BangumiChannelTest {
             throw UnsupportedOperationException()
     }
 
-    /**
-     * 搜索需要能解析出 BgmSearchResponse 的响应体（`[]` 会解析失败）。
-     * 两条回归用例都用它。对任意主机一律返回 200（镜像的 calendar 除外），
-     * 所以「自定义通道里的两个中转」也自然可用，不需要额外参数。
-     */
+    /** Virtual delays force different search/calendar winners; no real upstream is contacted. */
     private class SearchStub(
         private val searchBody: String = """{"total":0,"data":[],"limit":24,"offset":0}""",
     ) : Fetcher {
         val seen = mutableListOf<String>()
+        val completed = mutableListOf<String>()
         override suspend fun fetch(url: String, headers: Map<String, String>, followRedirects: Boolean): HttpResult {
             seen.add(url)
             val isCalendar = url.contains("/v0/calendar")
-            // 官方与自定义中转的放送端点可用；镜像的是 404（真实情况）
+            delay(if (url.startsWith(BangumiClient.OFFICIAL_BASE)) 10 else 100)
             val status = if (isCalendar && url.contains("bgmapi.anibt.net")) 404 else 200
             val body = if (isCalendar) "[]" else searchBody
+            completed.add(url)
             return HttpResult(status, mapOf("content-type" to listOf("application/json")), body.toByteArray())
         }
         override suspend fun post(url: String, body: String, headers: Map<String, String>, contentType: String): HttpResult {
             seen.add(url)
-            // 自定义地址不在 seen 里被判定为失败会让快速路径失效，这里一律 200
+            delay(if (url.startsWith(BangumiClient.MIRROR_BASE)) 10 else 100)
+            completed.add(url)
             return HttpResult(200, mapOf("content-type" to listOf("application/json")), searchBody.toByteArray())
         }
         override suspend fun fetchStream(url: String, headers: Map<String, String>, followRedirects: Boolean): StreamResult =
             throw UnsupportedOperationException()
     }
 
-    private fun store(): BgmChannelStore = BgmChannelStore(Files.createTempDirectory("bgmchan").resolve("c.json"))
+    private fun store(): BgmChannelStore = BgmChannelStore(
+        Files.createTempDirectory(
+            java.nio.file.Path.of(System.getenv("TMPDIR") ?: System.getProperty("java.io.tmpdir")),
+            "bgmchan",
+        ).resolve("c.json"),
+    )
 
     @Test
     fun `an oversized saved custom channel falls back to auto`() {
@@ -196,27 +202,23 @@ class BangumiChannelTest {
      *  - 下一条：搜索锚定镜像 → 放送表不能跟着撞 404
      */
     @Test
-    fun `calendar does not hijack the preferred base used by search`() {
+    fun `calendar does not hijack the preferred base used by search`() = runTest {
         val stub = SearchStub()
         val client = BangumiClient(stub, channelStore = store())
-        kotlinx.coroutines.runBlocking {
-            client.setChannel(
-                BgmChannelConfig(
-                    BgmChannel.CUSTOM,
-                    listOf("https://relay-a.example.com", "https://relay-b.example.com"),
-                ),
-            )
-            // 先跑搜索：两个地址都能回，竞速定下某个首选
-            client.search("孤独摇滚")
-            stub.seen.clear()
-            // 再取放送表：可能由另一个地址胜出
-            runCatching { client.calendar() }
-            stub.seen.clear()
-            // 关键断言：搜索仍走「搜索那次」定下的首选（快路径=单次请求），
-            // 没有被放送表那次竞速改写
-            client.search("孤独摇滚")
-            assertEquals(1, stub.seen.size, "搜索应走已记住的首选（单次请求），实际：${stub.seen}")
-        }
+        client.search("establish mirror winner")
+        stub.seen.clear()
+        client.search("confirm search preference")
+        val searchPreferred = "${BangumiClient.MIRROR_BASE}/v0/search/subjects"
+        assertEquals(listOf(searchPreferred), stub.seen, "the mirror must actually be the warm search winner")
+
+        stub.seen.clear()
+        stub.completed.clear()
+        assertEquals(emptyList(), client.calendar())
+        assertEquals(listOf("${BangumiClient.OFFICIAL_BASE}/v0/calendar"), stub.completed, "calendar must be won by a different base")
+
+        stub.seen.clear()
+        client.search("after calendar")
+        assertEquals(listOf(searchPreferred), stub.seen, "calendar must preserve the exact search winner, not merely a single request")
     }
 
     /**
@@ -227,21 +229,20 @@ class BangumiChannelTest {
      * 拿到 404 就整块消失 —— 而官方明明是通的。
      */
     @Test
-    fun `calendar still reaches official after search anchored on mirror`() {
+    fun `calendar still reaches official after search anchored on mirror`() = runTest {
         val stub = SearchStub()
         val client = BangumiClient(stub, channelStore = store())
-        kotlinx.coroutines.runBlocking {
-            // AUTO：两个候选都返回合法搜索结果，竞速会锚定其中某个
-            runCatching { client.search("孤独摇滚") }
-            stub.seen.clear()
-            // 放送表必须拿到官方那份（空数组也算成功），不能因镜像 404 整体失败
-            val days = client.calendar()
-            assertEquals(0, days.size)
-            // 关键断言：确实打了官方的 calendar（而不是只撞镜像 404 就放弃）
-            assertTrue(
-                stub.seen.any { it.startsWith("https://api.bgm.tv") && it.contains("/v0/calendar") },
-                "预期向官方请求放送表，实际请求：${stub.seen}",
-            )
-        }
+        client.search("establish mirror winner")
+        stub.seen.clear()
+        client.search("confirm mirror winner")
+        assertEquals(listOf("${BangumiClient.MIRROR_BASE}/v0/search/subjects"), stub.seen)
+        stub.seen.clear()
+
+        val days = client.calendar()
+        assertEquals(0, days.size)
+        assertTrue(
+            stub.seen.any { it == "${BangumiClient.OFFICIAL_BASE}/v0/calendar" },
+            "预期向官方请求放送表，实际请求：${stub.seen}",
+        )
     }
 }

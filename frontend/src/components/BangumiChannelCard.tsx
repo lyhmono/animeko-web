@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, errMsg } from '../api'
 import type { BgmChannelInfo, BgmChannelKind, BgmProbeResult } from '../types'
 
@@ -33,34 +33,65 @@ export default function BangumiChannelCard() {
   const [probeError, setProbeError] = useState('')
   const [saving, setSaving] = useState(false)
   const [saveMsg, setSaveMsg] = useState('')
+  const probeRef = useRef<AbortController | null>(null)
+  const probeSeqRef = useRef(0)
+  const saveRef = useRef<AbortController | null>(null)
 
-  const load = () => {
+  useEffect(() => {
+    const ctrl = new AbortController()
     api
-      .bangumiChannel()
+      .bangumiChannel(ctrl.signal)
       .then((i) => {
+        if (ctrl.signal.aborted) return
         setInfo(i)
         setSelected(i.channel)
         setCustomText(i.customUrls.join('\n'))
         setProbeResults(null)
       })
-      .catch((e) => setLoadError(errMsg(e)))
-  }
+      .catch((e) => { if (!ctrl.signal.aborted) setLoadError(errMsg(e)) })
+    return () => {
+      ctrl.abort()
+      probeSeqRef.current++
+      probeRef.current?.abort()
+      probeRef.current = null
+      saveRef.current?.abort()
+      saveRef.current = null
+    }
+  }, [])
 
-  useEffect(load, [])
+  const invalidateProbe = () => {
+    probeSeqRef.current++
+    probeRef.current?.abort()
+    probeRef.current = null
+    setProbing(false)
+    setProbeResults(null)
+    setProbeError('')
+  }
 
   // 选完通道先探一下：切通道最坏的结果是「切过去才发现不通」，一次探测能避免
   const doProbe = () => {
+    if (probeRef.current || saveRef.current) return
+    const ctrl = new AbortController()
+    probeRef.current = ctrl
+    const seq = ++probeSeqRef.current
+    const current = () => !ctrl.signal.aborted && seq === probeSeqRef.current && probeRef.current === ctrl
     setProbing(true)
     setProbeError('')
     setProbeResults(null)
     api
-      .probeBangumiChannel({ channel: selected, customUrls: splitUrls(customText) })
-      .then(setProbeResults)
-      .catch((e) => setProbeError(errMsg(e)))
-      .finally(() => setProbing(false))
+      .probeBangumiChannel({ channel: selected, customUrls: splitUrls(customText) }, ctrl.signal)
+      .then((results) => { if (current()) setProbeResults(results) })
+      .catch((e) => { if (current()) setProbeError(errMsg(e)) })
+      .finally(() => {
+        if (current()) {
+          probeRef.current = null
+          setProbing(false)
+        }
+      })
   }
 
   const doSave = () => {
+    if (saveRef.current) return
     const urls = splitUrls(customText)
     // 本地能判定的事不要往返一趟：CUSTOM 没填地址是**点下去就知道**的错误，
     // 等服务端 400 再显示会让按钮白转一圈
@@ -68,17 +99,27 @@ export default function BangumiChannelCard() {
       setSaveMsg('保存失败：自定义通道需要至少一个地址')
       return
     }
+    invalidateProbe()
+    const ctrl = new AbortController()
+    saveRef.current = ctrl
+    const current = () => !ctrl.signal.aborted && saveRef.current === ctrl
     setSaving(true)
     setSaveMsg('')
     api
-      .setBangumiChannel(selected, urls)
+      .setBangumiChannel(selected, urls, ctrl.signal)
       .then((i) => {
+        if (!current()) return
         setInfo(i)
         setSaveMsg('已保存，立即生效（无需重启）')
         setProbeResults(null)
       })
-      .catch((e) => setSaveMsg(`保存失败：${errMsg(e)}`))
-      .finally(() => setSaving(false))
+      .catch((e) => { if (current()) setSaveMsg(`保存失败：${errMsg(e)}`) })
+      .finally(() => {
+        if (current()) {
+          saveRef.current = null
+          setSaving(false)
+        }
+      })
   }
 
   if (loadError) {
@@ -114,9 +155,10 @@ export default function BangumiChannelCard() {
               name="bgm-channel"
               value={c.value}
               checked={selected === c.value}
+              disabled={saving}
               onChange={() => {
                 setSelected(c.value)
-                setProbeResults(null)
+                invalidateProbe()
                 setSaveMsg('')
               }}
             />
@@ -137,9 +179,10 @@ export default function BangumiChannelCard() {
           rows={3}
           placeholder={'https://your-relay.example.com\n（每行一个，按顺序尝试）'}
           value={customText}
+          disabled={saving}
           onChange={(e) => {
             setCustomText(e.target.value)
-            setProbeResults(null)
+            invalidateProbe()
           }}
           aria-label="自定义 Bangumi API 地址"
         />
@@ -153,7 +196,7 @@ export default function BangumiChannelCard() {
       </div>
 
       <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-        <button className="btn btn-secondary btn-sm" onClick={doProbe} disabled={probing}>
+        <button className="btn btn-secondary btn-sm" onClick={doProbe} disabled={probing || saving}>
           {probing ? '探测中…' : '测试连通性'}
         </button>
         <button className="btn btn-sm" onClick={doSave} disabled={saving}>

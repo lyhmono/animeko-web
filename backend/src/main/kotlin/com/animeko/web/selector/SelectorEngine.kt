@@ -7,11 +7,9 @@ import com.animeko.web.http.JsonGuard
 import com.animeko.web.http.UrlGuard
 import com.animeko.web.http.UpstreamException
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
@@ -84,19 +82,38 @@ class SelectorException(message: String) : Exception(message)
 class SelectorEngine(
     private val fetcher: Fetcher,
     private val allowPrivateTargets: Boolean = false,
+    private val monotonicMillis: () -> Long = { System.nanoTime() / 1_000_000 },
+    private val guardUrl: suspend (String, Boolean) -> String = { url, allowPrivate ->
+        SelectorUrlGuard.shared.requireAllowed(url, allowPrivate)
+    },
 ) {
 
     private val json = Json { ignoreUnknownKeys = true }
-    private val lastRequestAt = mutableMapOf<String, Long>()
+    private val sourceThrottle = SourceThrottle(monotonicMillis)
+    private data class SearchKey(val config: SelectorSearchConfig, val keyword: String)
+    private val searches = SingleFlight<SearchKey, List<SubjectHit>>()
 
     // ---- Phase 1 + 2: 搜索并列出条目 ----
 
     suspend fun search(cfg: SelectorSearchConfig, keyword: String): List<SubjectHit> {
         require(cfg.searchUrl.isNotBlank()) { "searchUrl 未配置" }
+        currentCoroutineContext().ensureActive()
         val kw = cfg.resolvedAutoMatch().processKeyword(keyword)
+        return searches.run(SearchKey(cfg, kw)) { searchProcessed(cfg, kw) }
+    }
+
+    /** Explicit internal refresh bypass; it still observes the source's admission interval. */
+    internal suspend fun searchFresh(cfg: SelectorSearchConfig, keyword: String): List<SubjectHit> {
+        require(cfg.searchUrl.isNotBlank()) { "searchUrl 未配置" }
+        currentCoroutineContext().ensureActive()
+        return searchProcessed(cfg, cfg.resolvedAutoMatch().processKeyword(keyword))
+    }
+
+    private suspend fun searchProcessed(cfg: SelectorSearchConfig, kw: String): List<SubjectHit> {
         val url = cfg.searchUrl.replace("{keyword}", URLEncoder.encode(kw, "UTF-8"))
-        val body = fetchPage(cfg, url, mapOf("User-Agent" to cfg.userAgentOrDefault()), "数据源搜索页")
-        val base = baseOf(cfg, url)
+        val page = fetchPage(cfg, url, mapOf("User-Agent" to cfg.userAgentOrDefault()), "数据源搜索页")
+        val body = page.body
+        val base = baseOf(cfg, page.finalUrl)
         val hits = when (cfg.subjectFormatId) {
             SubjectFormatJsonPathIndexed.ID -> selectJsonPathIndexed(body, cfg, base)
             SubjectFormatIndexed.ID -> selectIndexed(Jsoup.parse(body, base), cfg, base)
@@ -114,9 +131,9 @@ class SelectorEngine(
     suspend fun episodes(cfg: SelectorSearchConfig, subjectUrl: String): EpisodesResult {
         require(subjectUrl.startsWith("http")) { "subjectUrl 必须是绝对地址" }
         val target = UrlGuard.requireNotLiteralInternal(subjectUrl, allowPrivateTargets)
-        val body = fetchPage(cfg, target, mapOf("User-Agent" to cfg.userAgentOrDefault()), "数据源详情页")
-        val base = baseOf(cfg, target)
-        val doc = Jsoup.parse(body, base)
+        val page = fetchPage(cfg, target, mapOf("User-Agent" to cfg.userAgentOrDefault()), "数据源详情页")
+        val base = baseOf(cfg, page.finalUrl)
+        val doc = Jsoup.parse(page.body, base)
         return when (cfg.channelFormatId) {
             ChannelFormatIndexGrouped.ID -> selectIndexGrouped(doc, cfg, base)
             else -> selectNoChannel(doc, cfg, base)
@@ -152,63 +169,46 @@ class SelectorEngine(
             ?: throw SelectorException("matchVideoUrl 正则无效")
         val nestedRegex = SafeRegex.compile(mv.matchNestedUrl)
 
-        val html = fetchPage(cfg, target, headers, "播放页")
-        // 源自己的 matchVideoUrl 始终优先；兜底要等所有页面都试完才采用，
-        // 否则一个通用扩展名会把配置里更精确的线路抢掉
-        var fallback: String? = null
-        // 所有候选共用同一份字符预算：预算是「一次解析」的额度，不是每条 URL 的额度。
-        // 后者会让几千条畸形候选各自烧满 2M 次回溯，把一次解析按在 CPU 上几十秒。
+        val page = fetchPage(cfg, target, headers, "播放页")
+        val resultReferer = mv.addHeadersToVideo.referer.ifBlank { baseOf(cfg, page.finalUrl) }
+        fun resolved(url: String) = ResolvedTarget(url, resultReferer, ua, cookies, cookieHosts)
         val budget = SafeRegex.Budget()
-        // 候选只解析一次：findVideoUrl 与 genericVideoUrl 原先各自 Jsoup.parse + 扫 URL，
-        // 8MB 页面等于白做两遍解析与两遍正则。
-        val pageCandidates = videoCandidates(html, target)
-        findVideoUrl(pageCandidates, videoRegex, budget)?.let {
-            return ResolvedTarget(it, referer, ua, cookies, cookieHosts)
-        }
-        genericVideoUrl(pageCandidates)?.let { fallback = it }
+        val context = currentCoroutineContext()
+        val analysis = PageAnalysis(page.body, page.finalUrl) { context.ensureActive() }
+        findVideoUrl(analysis.videoCandidates, videoRegex, budget)?.let { return resolved(it) }
+        var fallback = genericVideoUrl(analysis.videoCandidates)
         if (mv.enableNestedUrl && nestedRegex != null) {
-            // 嵌套候选：DOM 中的 iframe/a/video/source 绝对地址 + 原文中的绝对 URL
-            val doc = Jsoup.parse(html, target)
-            val nestedCandidates = LinkedHashSet<String>()
-            doc.select("iframe[src]").forEach { nestedCandidates.add(it.absUrl("src")) }
-            doc.select("a[href]").forEach { nestedCandidates.add(it.absUrl("href")) }
-            candidateUrls(html).forEach { nestedCandidates.add(it) }
-            // 与 videoCandidates 同一条规则：长度先判，正则后判，顺序不能颠倒
-            // （`&&` 是短路的，反过来就等于没挡）。
-            val nested = nestedCandidates.filter {
-                it.length in 11..MAX_CANDIDATE_URL_LEN && it.startsWith("http") &&
-                    SafeRegex.contains(nestedRegex, it, budget = budget)
-            }.take(MAX_NESTED_PAGES)
-            val deadline = System.currentTimeMillis() + NESTED_BUDGET_MS
-            for (n in nested) {
-                // 每个嵌套页都要一次完整抓取（单次超时 20s），不设总预算的话
-                // 一次解析能拖到一分多钟，前端早已断开而服务端还在跑。
-                if (System.currentTimeMillis() > deadline) break
-                val sub = runCatching {
-                    // 嵌套地址来自页面内容，同样要过校验：否则播放页里塞一个
-                    // iframe="http://127.0.0.1:..." 就能借服务端去敲内网。非法候选直接跳过，
-                    // 不让它把整次解析打断。
-                    // Cookie 只在「与播放页同主机」时才带：iframe 可以指向任意第三方，
-                    // 那等于把源站 Cookie 送给页面作者指定的地方。
-                    val nestedHost = UrlGuard.hostOf(n)
-                    val nestedHeaders = if (nestedHost != null && nestedHost == UrlGuard.hostOf(target)) {
-                        headers
-                    } else {
-                        headers - "Cookie"
+            val visited = mutableSetOf(target.substringBefore('#'), page.finalUrl.substringBefore('#'))
+            // One real coroutine deadline covers throttling, guards and the complete body read.
+            val found = withTimeoutOrNull(NESTED_BUDGET_MS) {
+                val nestedContext = currentCoroutineContext()
+                val nested = analysis.nestedCandidates.asSequence().filter {
+                    nestedContext.ensureActive()
+                    it.substringBefore('#') !in visited && !budget.exhausted &&
+                        SafeRegex.contains(nestedRegex, it, budget = budget)
+                }.take(MAX_NESTED_PAGES)
+                for (n in nested) {
+                    nestedContext.ensureActive()
+                    visited.add(n.substringBefore('#'))
+                    val sub = try {
+                        // A new DOM base never grants the redirected host the original source Cookie.
+                        val sameCookieHost = UrlGuard.hostOf(n) == UrlGuard.hostOf(target) &&
+                            !UrlGuard.isInsecureDowngrade(target, n)
+                        val nestedHeaders = if (sameCookieHost) headers else headers - "Cookie"
+                        fetchPage(cfg, UrlGuard.requireNotLiteralInternal(n, allowPrivateTargets), nestedHeaders, "嵌套播放页")
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        continue
                     }
-                    fetchPage(
-                        cfg,
-                        UrlGuard.requireNotLiteralInternal(n, allowPrivateTargets),
-                        nestedHeaders,
-                        "嵌套播放页",
-                    )
-                }.getOrNull() ?: continue
-                val subCandidates = videoCandidates(sub, n)
-                findVideoUrl(subCandidates, videoRegex, budget)?.let {
-                    return ResolvedTarget(it, referer, ua, cookies, cookieHosts)
+                    visited.add(sub.finalUrl.substringBefore('#'))
+                    val subAnalysis = PageAnalysis(sub.body, sub.finalUrl) { nestedContext.ensureActive() }
+                    findVideoUrl(subAnalysis.videoCandidates, videoRegex, budget)?.let { return@withTimeoutOrNull it }
+                    if (fallback == null) fallback = genericVideoUrl(subAnalysis.videoCandidates)
                 }
-                if (fallback == null) fallback = genericVideoUrl(subCandidates)
+                null
             }
+            if (found != null) return resolved(found)
         }
         fallback?.let {
             // 说清楚走了兜底：这等于「配置里的 CDN 白名单过期了」，
@@ -217,7 +217,7 @@ class SelectorEngine(
             // 原样进容器日志等于把可用凭据抄进一份谁都能读的文件
             // （同一个理由已经用在 /api/proxy 的日志上）。
             appLog.info("matchVideoUrl 没有命中，改用通用扩展名兜底：{}", urlForLog(it))
-            return ResolvedTarget(it, referer, ua, cookies, cookieHosts)
+            return resolved(it)
         }
         throw SelectorException("未能从播放页提取视频地址（NO_VIDEO_URL_FOUND）")
     }
@@ -279,37 +279,33 @@ class SelectorEngine(
         }
     }
 
-    private fun selectJsonPathIndexed(body: String, cfg: SelectorSearchConfig, base: String): List<SubjectHit> {
+    private suspend fun selectJsonPathIndexed(body: String, cfg: SelectorSearchConfig, base: String): List<SubjectHit> {
+        val context = currentCoroutineContext()
+        context.ensureActive()
         val c = cfg.selectorSubjectFormatJsonPathIndexed
         val root: JsonElement = try {
-            // 源站返回什么不由我们决定：先用深度闸门挡住「一把左括号」那种
-            // 会打穿栈的载荷（StackOverflowError 不是 Exception，下面的 catch 接不住）
             JsonGuard.requireShallow(body)
             json.parseToJsonElement(body)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             return emptyList()
         }
-        // 保留位置（取不到字符串就置空串）再配对，理由同 pairIndexed
-        // 名字、地址、封面都是**按下标配对**的，所以必须用对齐版求值：
-        // 通用求值器按 Jayway 语义让缺键元素贡献 0 项、双键元素贡献 2 项，
-        // 结果不是报错而是整列表错位 —— 显示 A 的名字、点进去播 B 的地址
-        val urls = JsonPathEval.evaluateAligned(c.selectLinks, root)
-            ?.map { JsonPathEval.singleString(it).orEmpty() }
-            ?: return emptyList()
-        val names = JsonPathEval.evaluateAligned(c.selectNames, root)
-            ?.map { JsonPathEval.singleString(it).orEmpty() }
-            ?: return emptyList()
-        val covers = COVER_KEYS
-            .asSequence()
-            .mapNotNull { key ->
-                // `$[*]['key']` 而不是 `$[*].['key']`：后者在 `.` 后面接 `[`，
-                // 求值器会当成空键而整条返回 null（封面于是永远取不到）
-                JsonPathEval.evaluateAligned("$[*]['$key']", root)
-                    ?.map { JsonPathEval.singleString(it).orEmpty() }
-            }
-            .firstOrNull { it.any { v -> v.isNotBlank() } }
-            ?: emptyList()
-        return pairIndexed(names, urls, covers, c.linkTemplate, base)
+        val budget = JsonPathEval.Budget(checkCancelled = { context.ensureActive() })
+        val records = JsonPathEval.indexedValues(c.selectNames, c.selectLinks, root, budget)
+            ?: throw SelectorException("JsonPath 选择器无效、记录范围不一致或工作预算耗尽，请检查名称与地址路径")
+        return records.mapIndexedNotNull { index, row ->
+            ensureAliveEvery(index)
+            val name = JsonPathEval.singleString(row.name).orEmpty()
+            val href = JsonPathEval.singleString(row.link).orEmpty()
+            if (name.isBlank() || href.isBlank()) return@mapIndexedNotNull null
+            // Keys fall back within each record, not across the whole result list or root metadata.
+            val objectRecord = row.record as? kotlinx.serialization.json.JsonObject
+            val cover = COVER_KEYS.asSequence().mapNotNull { key ->
+                JsonPathEval.singleString(objectRecord?.get(key))?.trim()?.takeIf { it.isNotEmpty() }
+            }.map { absUrl(base, it) }.firstOrNull { it.startsWith("http://") || it.startsWith("https://") }
+            SubjectHit(name, applyLink(c.linkTemplate, href, base), cover)
+        }
     }
 
     /**
@@ -489,12 +485,17 @@ class SelectorEngine(
 
     // ---------- 视频地址提取 ----------
 
-    private fun findVideoUrl(
+    private suspend fun findVideoUrl(
         candidates: List<String>,
         videoRegex: Pattern,
         budget: SafeRegex.Budget,
-    ): String? = candidates.firstOrNull {
-        !budget.exhausted && SafeRegex.contains(videoRegex, it, budget = budget)
+    ): String? {
+        for ((index, candidate) in candidates.withIndex()) {
+            ensureAliveEvery(index)
+            if (budget.exhausted) return null
+            if (SafeRegex.contains(videoRegex, candidate, budget = budget)) return candidate
+        }
+        return null
     }
 
     /**
@@ -511,74 +512,12 @@ class SelectorEngine(
         candidates.firstOrNull { GENERIC_M3U8.containsMatchIn(it) }
             ?: candidates.firstOrNull { GENERIC_VIDEO.containsMatchIn(it) }
 
-    private fun videoCandidates(html: String, pageUrl: String): List<String> {
-        val doc = Jsoup.parse(html, pageUrl)
-        val candidates = LinkedHashSet<String>()
-        doc.select("iframe[src]").forEach { candidates.add(it.absUrl("src")) }
-        doc.select("a[href]").forEach { candidates.add(it.absUrl("href")) }
-        doc.select("video[src], source[src]").forEach { candidates.add(it.absUrl("src")) }
-        candidateUrls(html).forEach { candidates.add(it) }
-        // 长度上限要挡在**所有**候选上，而不是只挡在 candidateUrls 那条扫描路径上：
-        // DOM 里抽出来的 href 是原样进集合的（`<a href="https://x/aaaa…30 万个 a">`），
-        // 少这一格，配置里一个 (a+)+$ 就会在那种串上跑 —— JVM 的 java.util.regex 没有超时，
-        // 而这条链路的正则与页面内容都是别人写的。实测代价：一次解析 6 秒起步，
-        // 且完全取决于机器忙不忙（这类只会抖出来说明它本来就挡不住）。
-        return candidates.filter { it.length in 11..MAX_CANDIDATE_URL_LEN && it.startsWith("http") }
-            .take(MAX_VIDEO_CANDIDATES)
-    }
-
-    private fun candidateUrls(html: String): List<String> {
-        // 排除集要覆盖 JS 模板串与对象字面量：反引号字符串是现在最主流的写法，
-        // `}` 紧随对象字面量。漏一个都会让带垃圾尾缀的 URL 命中 containsMatchIn
-        // 并被整串返回（表现为「解析成功但播放 404」）。
-        val regex = Regex("""https?://[^\s"'<>`{}\\)\]]+""")
-        // 必须再扫一遍「解过转义」的副本：AppleCMS 的 player_aaaa 把地址写成
-        //   {"url":"https:\/\/v6.xx.com\/a\/index.m3u8"}
-        // 而上面那个正则把 \ 当作 URL 的终止符 —— 于是「页面里明明就写着 m3u8，
-        // 却报 NO_VIDEO_URL_FOUND」。实测这类源占社区订阅的一大半，
-        // 是「视频播放不了」的头号成因，不是源站真的藏了地址。
-        return listOf(html, unescapeJsStrings(html))
-            .flatMap { regex.findAll(it) }
-            .map { it.value.trim().trimEnd('`', '}', '{', '(', ')', '.', ',', ';', '!') }
-            // 上限是给**后面那些来自配置的字符串正则**用的：JVM 的 java.util.regex 没有超时，
-        // 一个 (a+)+$ 这样的模式配上一个 8MB 不换行的 token 就永远跑不完，
-        // 而这条链路的输入是第三方页面内容。超过这个长度的地址也不可能是可播地址。
-        .filter { it.length in 11..MAX_CANDIDATE_URL_LEN }
-            .distinct()
-            .toList()
-    }
-
-    /**
-     * 只解 URL 抽取用得到的三种转义（\uXXXX、\xNN、\/）。
-     * 不去动原始 HTML —— 那是 Jsoup 要解析的东西，这里只服务于一份候选副本。
-     */
-    private fun unescapeJsStrings(text: String): String =
-        text.replace(Regex("""\\u([0-9a-fA-F]{4})""")) { m ->
-            m.groupValues[1].toIntOrNull(16)?.toChar()?.toString() ?: m.value
-        }.replace(Regex("""\\x([0-9a-fA-F]{2})""")) { m ->
-            m.groupValues[1].toIntOrNull(16)?.toChar()?.toString() ?: m.value
-        }.replace("\\/", "/")
-
     // ---------- 工具 ----------
 
-    /**
-     * 源级限速：三个采集 phase（搜索/详情/播放页）都过这里。
-     * 锁内只推进「下一次允许请求的时间戳」，等待用 delay 放到锁外。
-     * 之前是持锁 Thread.sleep：既阻塞协程所在的 IO 线程，
-     * 又让所有数据源的搜索互相排队（A 源的 3 秒间隔会拖住 B 源）。
-     * 更早的版本只在搜索 phase 限速，连点播放仍然能瞬间打满详情页与播放页。
-     */
+    /** Source-local cancellable waiting; only admitted requests commit a monotonic start. */
     private suspend fun throttle(cfg: SelectorSearchConfig) {
         val interval = effectiveInterval(cfg.requestInterval)
-        if (interval <= 0) return
-        val wait = synchronized(lastRequestAt) {
-            val now = System.currentTimeMillis()
-            val last = lastRequestAt[cfg.searchUrl] ?: 0L
-            val planned = maxOf(now, last + interval)
-            lastRequestAt[cfg.searchUrl] = planned
-            planned - now
-        }
-        if (wait > 0) delay(wait)
+        sourceThrottle.await(cfg.searchUrl, interval)
     }
 
     /**
@@ -603,12 +542,14 @@ class SelectorEngine(
      * 连接超时/拒绝这类异常也要包住：否则一路掉进兜底 handler，
      * 前端只看到一个没有上下文的 500，而不是「上游不可用」的 502。
      */
+    private data class FetchedPage(val body: String, val finalUrl: String)
+
     private suspend fun fetchPage(
         cfg: SelectorSearchConfig?,
         url: String,
         headers: Map<String, String>,
         source: String,
-    ): String {
+    ): FetchedPage {
         var target = guard(url)
         // 实际发出去的头。跨主机跳转时要从中剥掉凭据，见下面重定向处。
         var sent = headers
@@ -626,7 +567,7 @@ class SelectorEngine(
             }
             if (result.status !in 301..399) {
                 if (result.status !in 200..299) throw UpstreamException("$source 返回 ${result.status}")
-                return decodePage(result)
+                return FetchedPage(decodePage(result), target)
             }
             val location = result.header("location")
                 ?: throw UpstreamException("$source 返回 ${result.status} 但没有 Location")
@@ -651,15 +592,9 @@ class SelectorEngine(
      * 之前用的是不解析的 requireNotLiteralInternal，一个「公网域名 -> 内网 IP」
      * 的解析记录就能绕过，而数据源与它页面里的链接都是社区内容，不可信。
      * 解析不出来时 UrlGuard 放行（交给真实请求去失败），所以测试里的 .test 保留域名不受影响。
-     * 阻塞的解析放在 IO 线程上做。
+     * 阻塞 DNS 在专用有界工作队列执行；取消不等待不可中断的原生解析，Blocked 类型保持不变。
      */
-    private suspend fun guard(url: String): String =
-        withContext(Dispatchers.IO) {
-            // 原样抛 Blocked：StatusPages 会对外回 403 + 一句通用文案。
-            // 在这里换成 SelectorException 会把拒绝原因（含「主机名 -> 内网 IP」）
-            // 回显给任何能连到这台机器的人，那是网络拓扑泄露。
-            UrlGuard.requireAllowed(url, allowPrivateTargets)
-        }
+    private suspend fun guard(url: String): String = guardUrl(url, allowPrivateTargets)
 
     /**
      * 按 BOM / Content-Type / `<meta charset>` 解码源站页面。
@@ -724,12 +659,6 @@ class SelectorEngine(
     companion object {
         /** 抓取页面体积上限：同时约束「用户自定义正则」的输入规模（JVM 正则没有超时） */
         const val MAX_PAGE_BYTES: Long = 8L * 1024 * 1024
-
-        /** 单个候选 URL 的长度上限，见 candidateUrls */
-        private const val MAX_CANDIDATE_URL_LEN = 4096
-
-        /** 单页参与正则匹配的候选数上限：8MB 页面能塞几十万条链接，没必要全扫 */
-        private const val MAX_VIDEO_CANDIDATES = 5_000
 
         private val CHARSET_PARAM = Regex("""charset\s*=\s*["']?([A-Za-z0-9._-]+)""", RegexOption.IGNORE_CASE)
         private val META_CHARSET = Regex(
@@ -810,25 +739,22 @@ class SelectorEngine(
             }
         }
 
-        private fun looksLikeXPath(selector: String): Boolean {
-            val s = selector.trim()
-            return s.startsWith("//") || s.startsWith("xpath:") ||
-                (s.startsWith("/") && !s.startsWith("/*")) || s.startsWith("(")
-        }
-
-        /** CSS / XPath 自适应查询；JSoup 1.18+ 原生支持 selectXpath */
+        /** CSS / XPath 自适应查询；不允许 jsoup 的无预算内嵌正则。 */
         fun queryAll(root: Element, selector: String): List<Element>? {
             if (selector.isBlank()) return null
             val raw = selector.trim()
-            val xpath = looksLikeXPath(raw)
-            // `xpath:` 是配置里常见的显式前缀，但 Jsoup 的 selectXpath 只接受裸 XPath。
-            // 以前把它原样传进去，带前缀的写法必然失败，README 宣称的 XPath 支持形同虚设。
+            val xpath = SelectorPolicy.isXPath(raw)
+            if (runCatching { SelectorPolicy.requireSafeQuery(selector) }.isFailure) return null
             val xpathExpr = if (raw.startsWith("xpath:")) raw.removePrefix("xpath:").trim() else raw
             return try {
                 if (xpath) root.selectXpath(xpathExpr).toList() else root.select(raw).toList()
             } catch (e: Exception) {
                 try {
-                    if (xpath) root.select(raw).toList() else root.selectXpath(raw).toList()
+                    if (xpath) {
+                        // The CSS fallback must pass its own policy, including escaped names.
+                        SelectorPolicy.requireSafeQuery(raw, css = true)
+                        root.select(raw).toList()
+                    } else root.selectXpath(raw).toList()
                 } catch (e2: Exception) {
                     null
                 }

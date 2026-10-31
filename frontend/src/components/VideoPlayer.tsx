@@ -1,6 +1,5 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
-import Hls from 'hls.js'
-import { isDirectPlayable } from '../api'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
+import { attachPlayback } from '../lib/playback'
 import { getPlayerPrefs, savePlayerPrefs } from '../lib/storage'
 import {
   IconBrightness,
@@ -30,6 +29,8 @@ interface Props {
   resumeGate?: boolean
   /** 自增表示“用户已经做出续播选择，现在可以开始播放” */
   playRequest?: number
+  /** 显式重试可以复用同一地址；不能仅靠 src 字符串是否变化决定重新加载。 */
+  reloadRequest?: number
   /**
    * 当前这一集的稳定标识（源 + 播放页地址）。同一集换 CDN/重解析时不变，
    * 换手动地址或换集时变化 —— 只有前者需要沿用当前的播放位置。
@@ -43,8 +44,8 @@ interface Props {
   onNextEpisode?: () => void
   onProgress?: (time: number, duration: number) => void
   onEnded?: () => void
-  /** status 为清单请求的 HTTP 状态码（410=会话过期、403=目标不被允许），供上层决定重新解析 */
-  onError?: (message: string, status?: number) => void
+  /** 媒体 HTTP 状态不能代替本站鉴权；只有明确的代理业务错误码才说明代理会话失效。 */
+  onError?: (message: string, status?: number, context?: { code?: string }) => void
 }
 
 /**
@@ -110,6 +111,7 @@ export default function VideoPlayer({
   startAt,
   resumeGate = false,
   playRequest = 0,
+  reloadRequest = 0,
   playKey = '',
   fullscreenTarget,
   theater = false,
@@ -155,6 +157,10 @@ export default function VideoPlayer({
   const brightnessRef = useRef(1)
   /** 倍速菜单开合（自绘 popover 取代原生 select 的视觉） */
   const [rateOpen, setRateOpen] = useState(false)
+  const rateButtonRef = useRef<HTMLButtonElement>(null)
+  useEffect(() => {
+    if (rateOpen) containerRef.current?.querySelector<HTMLButtonElement>('.rate-item.active')?.focus()
+  }, [rateOpen])
 
   // 用 ref 持有最新回调：父组件每次渲染都会传入新的回调引用，
   // 若把回调列入 effect 依赖，timeupdate → 父组件重渲染 → 回调引用变化 →
@@ -167,27 +173,29 @@ export default function VideoPlayer({
   const fallbackSrcRef = useRef(fallbackSrc)
   const useFallbackRef = useRef(false)
   const activeSrcRef = useRef(src)
-  /** 当前源是否交给 hls.js：原生 video 的 error 没有 HTTP 状态，需要单独判定代理会话过期 */
+  /** hls.js 拥有解码恢复和HTTP状态事件；原生路径只报告真实MediaError，不猜代理状态。 */
   const hlsActiveRef = useRef(false)
-  const mediaRecoveredRef = useRef(false)
   const resumeGateRef = useRef(resumeGate)
+  const startAtRef = useRef(startAt)
+  const mediaGenerationRef = useRef(0)
+  const readyGenerationRef = useRef(-1)
 
   /**
    * 直连优先：主地址失败（防盗链、CORS、网络）时切到服务端中转，只切一次。
    * 换源/重新解析（src 变化）后重新给直连一次机会 —— 新地址可能是另一台主机。
    */
   const [useFallback, setUseFallback] = useState(false)
-  const [lastPrimarySrc, setLastPrimarySrc] = useState(src)
-  if (src !== lastPrimarySrc) {
+  const [lastLoad, setLastLoad] = useState({ src, reloadRequest, playKey })
+  if (src !== lastLoad.src || reloadRequest !== lastLoad.reloadRequest || playKey !== lastLoad.playKey) {
     // render 阶段同步派生状态：用 effect 重置会让新 src 先带着旧的 useFallback 加载一帧
-    setLastPrimarySrc(src)
+    setLastLoad({ src, reloadRequest, playKey })
     if (useFallback) setUseFallback(false)
   }
   const activeSrc = useFallback && fallbackSrc ? fallbackSrc : src
 
   // 事件回调与“当前源/是否等待续播选择”只绑一次，经 ref 读取最新值。
   // 放在 activeSrc 声明之后：activeSrc 是 render 阶段的派生值，ref 必须跟着最新一次渲染走。
-  useEffect(() => {
+  useLayoutEffect(() => {
     onErrorRef.current = onError
     onProgressRef.current = onProgress
     onEndedRef.current = onEnded
@@ -196,6 +204,7 @@ export default function VideoPlayer({
     useFallbackRef.current = useFallback
     activeSrcRef.current = activeSrc
     resumeGateRef.current = resumeGate
+    startAtRef.current = startAt
   })
 
   // 加载源
@@ -209,14 +218,28 @@ export default function VideoPlayer({
    */
   const loadedPlayKeyRef = useRef(playKey)
   const currentPlayKeyRef = useRef(playKey)
+  // 在被动 effect 清源之前关闭闸门，load()/destroy() 的 reset 事件不能写断点。
+  useLayoutEffect(() => {
+    readyGenerationRef.current = -1
+    mediaGenerationRef.current++
+    return () => {
+      readyGenerationRef.current = -1
+      mediaGenerationRef.current++
+    }
+  }, [activeSrc, reloadRequest, playKey])
   useEffect(() => {
     const video = videoRef.current
     if (!video || !activeSrc) return
     loadedPlayKeyRef.current = playKey
-    let hls: Hls | null = null
+    const generation = ++mediaGenerationRef.current
+    readyGenerationRef.current = -1
     hlsActiveRef.current = false
-    mediaRecoveredRef.current = false
     setError(null)
+    setPlaying(false)
+    setCurrent(0)
+    setDuration(0)
+    setBufferedEnd(0)
+    setBuffering(true)
     // 换源（切集）后要重新允许定位一次，否则第二集的断点续播永远不生效
     startAtAppliedRef.current = false
     // 同样要重新允许自动开播一次：连播是整页跳转，新视频不该要求再点一下
@@ -227,48 +250,25 @@ export default function VideoPlayer({
     // removeAttribute('src') 清不掉它，只能显式抹）
     applyBrightness(1)
 
-    if (isDirectPlayable(activeSrc)) {
-      video.src = activeSrc
-    } else if (Hls.isSupported()) {
-      hls = new Hls({ enableWorker: true, fragLoadingTimeOut: 30000 })
-      hlsActiveRef.current = true
-      hls.loadSource(activeSrc)
-      hls.attachMedia(video)
-      hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (!data.fatal) return
-        // 解码/缓冲类的 MEDIA_ERROR 先尝试 hls.js 自己的恢复；直接切代理对这类错误无效。
-        // 只给一次机会，避免不可恢复的源把播放器钉在恢复循环里。
-        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !mediaRecoveredRef.current) {
-          mediaRecoveredRef.current = true
-          hls?.recoverMediaError()
-          return
-        }
-        // 直连的清单拿不到（CORS/防盗链）：先悄悄换成服务端中转，这不算最终失败。
-        // 只有“备用地址确实不同”才值得切：关闭直连时 src === fallbackSrc，
-        // 再切一次 activeSrc 不变，effect 不会重跑，错误就会被静默吞掉。
-        if (!useFallback && fallbackSrc && fallbackSrc !== activeSrc) {
+    const stopPlayback = attachPlayback(video, activeSrc, {
+      isCurrent: () => generation === mediaGenerationRef.current,
+      onHlsActive: (active) => { hlsActiveRef.current = active },
+      onError: (msg, status, context) => {
+        readyGenerationRef.current = -1
+        setBuffering(false)
+        if (!useFallbackRef.current && fallbackSrcRef.current && fallbackSrcRef.current !== activeSrc) {
+          useFallbackRef.current = true
           setUseFallback(true)
           return
         }
-        // 清单加载失败时把 HTTP 状态码一起抛出：410 是「播放会话过期」，
-        // 与「源站拒绝代理」是两回事，上层据此自动重新解析一次
-        const status = (data.response as { code?: number } | undefined)?.code
-        const msg =
-          data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR
-            ? `视频清单加载失败（HTTP ${status ?? '未知'}，源站可能拒绝了服务端代理）`
-            : `播放错误: ${data.details}`
         setError(msg)
-        onErrorRef.current?.(msg, status)
-      })
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = activeSrc
-    } else {
-      const msg = '当前浏览器不支持 HLS 播放'
-      setError(msg)
-      onErrorRef.current?.(msg)
-    }
+        onErrorRef.current?.(msg, status, context)
+      },
+    })
 
     return () => {
+      readyGenerationRef.current = -1
+      mediaGenerationRef.current++
       // 只有还在同一集时才记住当前位置：直接回退/410 重解析换的是同一集的
       // 另一条地址，要续播；playKey 已经变了（手动换地址/换集）则不能沿用。
       if (currentPlayKeyRef.current === loadedPlayKeyRef.current) {
@@ -276,11 +276,11 @@ export default function VideoPlayer({
         if (Number.isFinite(at) && at > 0) resumeAtRef.current = at
       }
       hlsActiveRef.current = false
-      hls?.destroy()
+      stopPlayback()
       video.removeAttribute('src')
       video.load()
     }
-  }, [activeSrc])
+  }, [activeSrc, reloadRequest, playKey])
 
   // 断点续播：加载后定位一次
   useEffect(() => {
@@ -302,17 +302,21 @@ export default function VideoPlayer({
     if (video.readyState >= 1) apply()
     video.addEventListener('loadedmetadata', apply)
     return () => video.removeEventListener('loadedmetadata', apply)
-  }, [startAt, activeSrc])
+  }, [startAt, activeSrc, reloadRequest, playKey])
 
   // 用户在续播条上做出选择后开始播放。此时 resumeGate 已经放开，
   // 但 canplay 早就过了，不会自己再触发一次自动开播。
   useEffect(() => {
     if (!playRequest) return
     const video = videoRef.current
-    if (!video) return
+    // 异步 HLS import/attach 尚未完成时保留自动开播机会，等当前媒体的 canplay。
+    if (!video || !video.currentSrc || video.readyState < 2 || resumeGateRef.current) return
+    const generation = mediaGenerationRef.current
     autoplayTriedRef.current = true
     setAutoplayBlocked(false)
-    void video.play().catch(() => setAutoplayBlocked(true))
+    void video.play().catch(() => {
+      if (generation === mediaGenerationRef.current) setAutoplayBlocked(true)
+    })
   }, [playRequest])
 
   // 同一集换源（直连→中转、410 重解析）要续上当前位置，靠 playKey 区分：
@@ -338,7 +342,7 @@ export default function VideoPlayer({
     if (hideTimerRef.current) clearTimeout(hideTimerRef.current)
     hideTimerRef.current = setTimeout(() => {
       // 暂停时不隐藏：暂停是「正在操作」的状态，把控制条收起来只会逼用户再晃一次鼠标
-      if (!videoRef.current?.paused) setControlsVisible(false)
+      if (!videoRef.current?.paused && !containerRef.current?.contains(document.activeElement)) setControlsVisible(false)
     }, 3000)
   }, [])
 
@@ -378,6 +382,9 @@ export default function VideoPlayer({
     const video = videoRef.current
     if (!video) return
     const onTime = () => {
+      if (readyGenerationRef.current !== mediaGenerationRef.current || resumeGateRef.current ||
+        resumeAtRef.current > 0 || ((startAtRef.current ?? 0) > 0 && !startAtAppliedRef.current) ||
+        !video.currentSrc || video.readyState < 2 || video.seeking || video.error) return
       setCurrent(video.currentTime)
       const total = Number.isFinite(video.duration) ? video.duration : 0
       onProgressRef.current?.(video.currentTime, total)
@@ -388,22 +395,35 @@ export default function VideoPlayer({
       setAutoplayBlocked(false)
       setBuffering(false)
     }
-    const onPause = () => setPlaying(false)
+    const onPause = () => {
+      setPlaying(false)
+      revealControls()
+    }
     // 媒体就绪时自己开始播。以前整条链路上只有 togglePlay 会调 play()，
     // 也就是说**从不自动开播**：而控件是自己画的（controls={false}，没有原生大播放键），
     // 于是「加载完停在画面上」和「坏了」看起来一模一样，连播每集都要再点一次。
     // 浏览器可能拒绝（无用户手势），那种情况显式给一个居中的播放按钮，别让用户猜。
     const onCanPlay = () => {
       const v = videoRef.current
-      // 没有 src（hls.js 还没 attach 上）时不记「已尝试」，否则这一次空转会吃掉整集的自动开播
-      if (!v || autoplayTriedRef.current || !v.src) return
+      // MMS 可以用 <source src="blob:…"> 而不设置 video.src；currentSrc 才是已选媒体。
+      if (!v || !v.currentSrc || v.readyState < 2 || v.error) return
+      readyGenerationRef.current = mediaGenerationRef.current
+      setBuffering(false)
+      if (autoplayTriedRef.current) return
       // 有历史进度时等用户选「继续/从头」：自动从 0 播会把续播点覆盖掉
       if (resumeGateRef.current) return
       autoplayTriedRef.current = true
       // 断点续播的定位与这里并行没问题：currentTime 在播放中同样可以赋值
-      v.play().catch(() => setAutoplayBlocked(true))
+      const generation = mediaGenerationRef.current
+      void v.play().catch(() => {
+        if (generation === mediaGenerationRef.current) setAutoplayBlocked(true)
+      })
     }
     const onEnd = () => {
+      // ended 同样会清服务器断点/启动连播，不能让旧媒体或清源事件越过写入闸门。
+      if (readyGenerationRef.current !== mediaGenerationRef.current || resumeGateRef.current ||
+        resumeAtRef.current > 0 || ((startAtRef.current ?? 0) > 0 && !startAtAppliedRef.current) ||
+        !video.currentSrc || video.readyState < 2 || video.seeking || video.error) return
       setPlaying(false)
       onEndedRef.current?.()
     }
@@ -415,6 +435,8 @@ export default function VideoPlayer({
     const onMediaError = () => {
       // 没有 error 对象的 error 事件是切源/卸载清理时补发的，别当成播放失败
       if (!video.error) return
+      // hls.js 已经拥有解码恢复及带来源的错误事件，不再从原生事件重复回退/报错。
+      if (hlsActiveRef.current) return
       // 直连被源站拒绝（403/404/CORS）：先切服务端中转再试一次。
       // fallback 与当前源相同时（关闭直连/混合内容）不能切：切了也不会触发重新加载，
       // 只会吞掉错误，最后表现为黑屏且没有任何提示。
@@ -422,21 +444,17 @@ export default function VideoPlayer({
         fallbackSrcRef.current &&
         fallbackSrcRef.current !== activeSrcRef.current
       ) {
+        useFallbackRef.current = true
         setUseFallback(true)
         setError(null)
         return
       }
       const code = video.error.code
       const msg = `视频加载失败（MEDIA_ERROR_${code}），源站可能拒绝了代理请求，可尝试下方手动地址播放`
-      // 原生 <video> 的 error 只有 MediaError，没有 HTTP 状态；当前是代理地址时
-      // 最常见的原因是播放会话过期（410）。交给上层按 410 重新解析一次
-      // （PlayerPage 用 retriedKeyRef 限次），否则 mp4/ iOS 原生 HLS 永远只能手贴地址。
-      // hls.js 分支自己会带 data.response.code，不走这个猜测。
-      if (!hlsActiveRef.current && activeSrcRef.current.includes('/api/proxy?')) {
-        setError('播放会话可能已过期，正在重新解析地址…')
-        onErrorRef.current?.(msg, 410)
-        return
-      }
+      // MediaError 不含 HTTP 来源/状态，尤其解码失败不能猜成代理会话 410。
+      // 原生路径在有限的直连→代理回退后显示真实错误，由用户明确重试。
+      readyGenerationRef.current = -1
+      setBuffering(false)
       setError(msg)
       onErrorRef.current?.(msg)
     }
@@ -563,12 +581,43 @@ export default function VideoPlayer({
     nativeVideoFullscreen()
   }
 
+  const onRateMenuKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const items = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]'))
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      event.stopPropagation()
+      setRateOpen(false)
+      rateButtonRef.current?.focus()
+      return
+    }
+    if (!items.length) return
+    const index = Math.max(0, items.indexOf(document.activeElement as HTMLButtonElement))
+    let next: number
+    switch (event.key) {
+      case 'ArrowDown':
+      case 'ArrowRight': next = (index + 1) % items.length; break
+      case 'ArrowUp':
+      case 'ArrowLeft': next = (index + items.length - 1) % items.length; break
+      case 'Home': next = 0; break
+      case 'End': next = items.length - 1; break
+      default: return
+    }
+    event.preventDefault()
+    event.stopPropagation()
+    items[next].focus()
+  }
+
   // ---- 键盘快捷键（绑一次，回调经 ref 读取，避免重绑监听） ----
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (isTypingTarget(e.target) || e.ctrlKey || e.altKey || e.metaKey) return
+      if (isTypingTarget(e.target) || e.ctrlKey || e.altKey || e.metaKey || e.defaultPrevented) return
+      if (!(e.target instanceof HTMLElement) || !containerRef.current?.contains(e.target)) return
+      // 原生 range 的方向键留给当前滑条；自绘菜单的按键由菜单自身处理。
+      if (e.target.closest('[role="menu"]') ||
+        (e.target.tagName === 'INPUT' && (e.target as HTMLInputElement).type === 'range' && e.key.startsWith('Arrow'))) return
       const video = videoRef.current
       if (!video) return
+      revealControls()
       switch (e.key) {
         case ' ':
           // 焦点落在按钮/链接上时空格会触发原生 click，这里再 togglePlay 就等于放一下又暂停
@@ -759,7 +808,8 @@ export default function VideoPlayer({
     if (tapTimerRef.current) clearTimeout(tapTimerRef.current)
     tapTimerRef.current = setTimeout(() => {
       tapTimerRef.current = undefined
-      if (controlsVisibleRef.current) setControlsVisible(false)
+      if (controlsVisibleRef.current && !videoRef.current?.paused &&
+        !containerRef.current?.contains(document.activeElement)) setControlsVisible(false)
       else revealControls()
     }, DOUBLE_TAP_MS)
   }
@@ -780,6 +830,11 @@ export default function VideoPlayer({
     <div
       ref={containerRef}
       className={`video-shell${theater ? ' theater' : ''}${controlsVisible ? '' : ' hide-controls'}`}
+      tabIndex={0}
+      aria-label="视频播放器"
+      onFocusCapture={revealControls}
+      onKeyDownCapture={revealControls}
+      onBlurCapture={revealControls}
       // 隐藏之后也必须能被鼠标移动唤出：之前写成 `controlsVisible && revealControls()`，
       // 一旦自动收起，移动鼠标就再也不会显示控制条，只能先点一下画面
       onPointerMove={() => revealControls()}
@@ -888,18 +943,22 @@ export default function VideoPlayer({
               aria-label="音量"
             />
           </div>
-          <div className="rate-group">
+          <div className="rate-group" onBlurCapture={(event) => {
+            if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setRateOpen(false)
+          }}>
             <button
+              ref={rateButtonRef}
               className="player-btn"
               onClick={() => setRateOpen((v) => !v)}
               aria-label="倍速"
               title="播放倍速"
               aria-expanded={rateOpen}
+              aria-haspopup="menu"
             >
               <IconGauge size={16} />
             </button>
             {rateOpen && (
-              <div className="rate-menu" role="menu">
+              <div className="rate-menu" role="menu" aria-label="播放倍速" onKeyDown={onRateMenuKeyDown}>
                 {RATES.map((r) => (
                   <button
                     key={r}
@@ -907,9 +966,11 @@ export default function VideoPlayer({
                     onClick={() => {
                       setRate(r)
                       setRateOpen(false)
+                      rateButtonRef.current?.focus()
                     }}
                     role="menuitemradio"
                     aria-checked={r === rate}
+                    tabIndex={r === rate ? 0 : -1}
                   >
                     {r === 1 ? '1.0x 标准' : `${r}x`}
                   </button>

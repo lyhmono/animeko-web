@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { api, errMsg, UNAUTHORIZED_EVENT } from '../api'
 import VideoPlayer from '../components/VideoPlayer'
-import { isSpecialEpisodeName } from '../lib/titleMatch'
+import { nextBangumiEpisode, sourceEpisodeIsSpecial } from '../lib/episodeProgress'
+import { probeSession } from '../lib/auth'
 import {
   addRecent,
   clearProgress,
@@ -94,6 +95,7 @@ export default function PlayerPage() {
   const [resumeTime, setResumeTime] = useState<number | null>(null)
   /** 用户已选择续播方式后自增，通知播放器可以开始播放 */
   const [playRequest, setPlayRequest] = useState(0)
+  const [reloadRequest, setReloadRequest] = useState(0)
   const [resolving, setResolving] = useState(false)
   const [error, setError] = useState('')
   const [manualUrl, setManualUrl] = useState('')
@@ -112,20 +114,47 @@ export default function PlayerPage() {
   /** 顺带多算出来的一集：带进下一跳的 URL，让下一页仍能走零成本的旧路径 */
   const successorRef = useRef<NextEpisode | null>(null)
   const chainSeqRef = useRef(0)
+  const chainAbortRef = useRef<AbortController | null>(null)
   const target = nextInfo ?? autoNext
 
   const lastWriteRef = useRef<number | null>(null)
   const stageRef = useRef<HTMLDivElement | null>(null)
   const resolveSeqRef = useRef(0)
+  const resolveAbortRef = useRef<AbortController | null>(null)
   // 播放会话过期后自动重新解析一次（长暂停会让剩余分片全部失效），再失败才报错
   const [resolveNonce, setResolveNonce] = useState(0)
   const retriedKeyRef = useRef<string | null>(null)
   const resetForRef = useRef<string | null>(null)
+  const playGenerationRef = useRef(0)
+  const mediaErrorSeqRef = useRef(0)
+  const mediaProbeAbortRef = useRef<AbortController | null>(null)
+
+  // 媒体错误的会话探测不能跨越换集、重解析或卸载，迟到的 401 不能注销新播放。
+  useLayoutEffect(() => {
+    playGenerationRef.current++
+    mediaProbeAbortRef.current?.abort()
+    mediaProbeAbortRef.current = null
+    return () => {
+      playGenerationRef.current++
+      mediaProbeAbortRef.current?.abort()
+      mediaProbeAbortRef.current = null
+    }
+  }, [source, playUrl, src, resolveNonce, reloadRequest])
 
   // 解析视频地址 + 写入最近观看
   useEffect(() => {
     if (!source || !playUrl) return
     let alive = true
+    resolveAbortRef.current?.abort()
+    const controller = new AbortController()
+    resolveAbortRef.current = controller
+    const seq = ++resolveSeqRef.current
+    const cleanup = () => {
+      alive = false
+      controller.abort()
+      if (resolveAbortRef.current === controller) resolveAbortRef.current = null
+      resolveSeqRef.current++
+    }
     setError('')
     lastWriteRef.current = null
     const playKey = `${source}|${playUrl}`
@@ -137,24 +166,25 @@ export default function PlayerPage() {
     }
     // source=manual：playUrl 即媒体直链，跳过数据源解析直接经 /api/proxy 播放
     if (source === 'manual') {
-      resolveSeqRef.current++
+      setResolving(false)
       const proxy = proxyUrlFor(playUrl)
       setFallbackSrc(proxy)
       setSrc(getDirectPlayback() ? (directUrlFor(playUrl) ?? proxy) : proxy)
       addRecent({ source, playUrl, title: title || playUrl, anime: animeName, ep, ts: Date.now() })
-      return
+      return cleanup
     }
     // 序号守卫：解析可能耗时几十秒，期间换集或改用手播时过期响应必须丢弃，
     // 否则它会覆盖新的 src、把「最近观看」记到错误的条目上
-    const seq = ++resolveSeqRef.current
     setResolving(true)
     api
-      .resolveVideo(source, playUrl)
+      .resolveVideo(source, playUrl, controller.signal)
       .then((video) => {
-        if (!alive || seq !== resolveSeqRef.current) return
+        if (!alive || controller.signal.aborted || seq !== resolveSeqRef.current) return
         // 直连优先：视频流量不经过这台服务器；直连被防盗链/CORS 拒绝时播放器会自动回退
         setFallbackSrc(video.proxyPath)
         setSrc(getDirectPlayback() ? (directUrlFor(video.url) ?? video.proxyPath) : video.proxyPath)
+        // 新解析仍可能返回同一个URL；成功重解析也必须真的开启新加载世代。
+        setReloadRequest((n) => n + 1)
         addRecent({
           source,
           playUrl,
@@ -165,19 +195,28 @@ export default function PlayerPage() {
         })
       })
       .catch((e) => {
-        if (!alive || seq !== resolveSeqRef.current) return
+        if (!alive || controller.signal.aborted || seq !== resolveSeqRef.current) return
         setError(`视频地址解析失败：${errMsg(e)}（可尝试下方手动地址播放）`)
       })
       .finally(() => {
         if (alive && seq === resolveSeqRef.current) setResolving(false)
+        if (resolveAbortRef.current === controller) resolveAbortRef.current = null
       })
     // 离页后丢弃在飞的解析结果：光靠 setState 不会阻止 addRecent 往服务端
     // 写一条「最近观看」，那会给用户留下一条从未看过的记录。
-    return () => {
-      alive = false
-      resolveSeqRef.current++
-    }
+    return cleanup
   }, [source, playUrl, title, animeName, ep, resolveNonce])
+
+  useEffect(() => {
+    setAutoNext(null)
+    successorRef.current = null
+    setNextCountdown(null)
+    return () => {
+      chainSeqRef.current++
+      chainAbortRef.current?.abort()
+      chainAbortRef.current = null
+    }
+  }, [source, subjectUrl, playUrl, bep])
 
   // 断点续播：读取历史进度
   useEffect(() => {
@@ -208,10 +247,13 @@ export default function PlayerPage() {
    */
   const resolveChain = async () => {
     if (!source || !subjectUrl || !playUrl) return
+    chainAbortRef.current?.abort()
+    const controller = new AbortController()
+    chainAbortRef.current = controller
     const seq = ++chainSeqRef.current
     try {
-      const result = await api.sourceEpisodes(source, subjectUrl)
-      if (seq !== chainSeqRef.current) return
+      const result = await api.sourceEpisodes(source, subjectUrl, controller.signal)
+      if (controller.signal.aborted || seq !== chainSeqRef.current) return
       // 当前这一集属于哪条线路，就只在那条线路里续播。原实现优先用扁平列表，
       // 当前线路最后一集会连到另一条线路的第一集（正片完结后自动跳番外/下一季）。
       const group = result.groups.find((g) => g.episodes.some((e) => e.playUrl === playUrl))
@@ -227,25 +269,25 @@ export default function PlayerPage() {
         title: `${animeName || title} ${e.name}`,
         anime: animeName,
         ep: String(e.sortNum ?? e.sort),
-        bep: nextBep != null && !isSpecialEpisodeName(e.name) ? nextBep : undefined,
+        bep: nextBep != null && !sourceEpisodeIsSpecial(e) ? nextBep : undefined,
       })
       const nx = list[i + 1]
       if (!nx) return
       // 源站集号连续时，Bangumi 集号也连续；否则宁可不写条目进度，也不写错一集。
-      const nxBep = Number.isInteger(currentBep) && currentBep > 0 &&
-          current.sortNum != null && nx.sortNum === current.sortNum + 1
-        ? String(currentBep + 1)
-        : undefined
-      setAutoNext(mk(nx, nxBep))
+      const nxBep = nextBangumiEpisode(current, nx, currentBep)
+      const normalizedNext = mk(nx, nxBep != null ? String(nxBep) : undefined)
+      setAutoNext(normalizedNext)
       const after = list[i + 2]
-      const afterBep = nxBep != null && nx.sortNum != null && after?.sortNum === nx.sortNum + 1
-        ? String(Number(nxBep) + 1)
-        : undefined
-      successorRef.current = after ? mk(after, afterBep) : null
+      // 必须从已归一化的 next.bep 推导；SP 或断号清掉映射后不可在后一集“复活”。
+      const afterBep = nextBangumiEpisode(nx, after,
+        normalizedNext.bep != null ? Number(normalizedNext.bep) : undefined)
+      successorRef.current = after ? mk(after, afterBep != null ? String(afterBep) : undefined) : null
       setNextCountdown(5)
     } catch {
       // 取列表失败就停在今天的行为上（停在当前，用户仍可手动选）。
       // 不弹错误框：视频已经播完了，此时那句「拿不到剧集列表」只是噪声
+    } finally {
+      if (chainAbortRef.current === controller) chainAbortRef.current = null
     }
   }
 
@@ -303,9 +345,15 @@ export default function PlayerPage() {
   const playManualUrl = () => {
     const url = manualUrl.trim()
     if (!url) return
+    // 先取消旧源任务，再写新媒体；不等URL effect清理才阻止旧解析记录最近观看。
+    resolveSeqRef.current++
+    resolveAbortRef.current?.abort()
+    resolveAbortRef.current = null
+    setResolving(false)
     const proxy = proxyUrlFor(url)
     setFallbackSrc(proxy)
     setSrc(getDirectPlayback() ? (directUrlFor(url) ?? proxy) : proxy)
+    setReloadRequest((n) => n + 1)
     setError('')
     // 手动换地址是本页**唯一不整页跳转**的换片路径（其余走 location.assign，组件重挂）。
     // 所以两份状态必须在这里自己清掉，否则会跟着带到新视频上：
@@ -320,6 +368,8 @@ export default function PlayerPage() {
     setAutoNext(null)
     successorRef.current = null
     chainSeqRef.current++
+    chainAbortRef.current?.abort()
+    chainAbortRef.current = null
     addRecent({
       source: 'manual',
       playUrl: url,
@@ -363,29 +413,47 @@ export default function PlayerPage() {
             startAt={startAt}
             resumeGate={resumeTime != null}
             playRequest={playRequest}
+            reloadRequest={reloadRequest}
             playKey={`${source}|${playUrl}`}
             fullscreenTarget={stageRef}
             theater
             onNextEpisode={target ? gotoNext : undefined}
             onProgress={handleProgress}
             onEnded={handleEnded}
-            onError={(msg, status) => {
+            onError={async (msg, status, context) => {
               const key = `${source}|${playUrl}`
-              // 登录会话没了：分片会一直 401。这里必须把界面切回登录页 ——
-              // 播放器只会报「视频加载失败」，用户没有任何线索知道是会话过期了
+              const generation = playGenerationRef.current
+              const seq = ++mediaErrorSeqRef.current
+              mediaProbeAbortRef.current?.abort()
+              mediaProbeAbortRef.current = null
+              setError(msg)
+              // 代理保留媒体上游的 HTTP 状态；401 本身不能证明本站登录失效。
               if (status === 401) {
-                window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
-                setError('登录已过期，请重新登录')
+                const controller = new AbortController()
+                mediaProbeAbortRef.current = controller
+                try {
+                  const session = await probeSession(controller.signal)
+                  if (controller.signal.aborted || generation !== playGenerationRef.current || seq !== mediaErrorSeqRef.current) return
+                  if (session.authEnabled && !session.authenticated) {
+                    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+                    setError('登录已过期，请重新登录')
+                  }
+                } catch {
+                  // 探测失败不等于未登录；保留原媒体错误，让用户可以重试/换源。
+                } finally {
+                  if (mediaProbeAbortRef.current === controller) mediaProbeAbortRef.current = null
+                }
                 return
               }
-              // 410=播放会话过期、403=sid 与目标主机不匹配：重新解析即可拿到新会话
-              if ((status === 410 || status === 403) && retriedKeyRef.current !== key) {
+              // 只有本站明确的代理会话错误才值得重新解析，源站同号响应不是会话故障。
+              const sessionError = context?.code === 'PROXY_SESSION_EXPIRED' ||
+                context?.code === 'PROXY_SESSION_TARGET_MISMATCH'
+              if (source !== 'manual' && sessionError && retriedKeyRef.current !== key) {
                 retriedKeyRef.current = key
                 setError('播放会话已过期，正在重新解析地址…')
                 setResolveNonce((n) => n + 1)
                 return
               }
-              setError(msg)
             }}
           />
         )}
@@ -424,7 +492,18 @@ export default function PlayerPage() {
         </div>
       )}
 
-      {error && <div className="error-box">{error}</div>}
+      {error && (
+        <div className="error-box">
+          {error}{' '}
+          <button className="btn btn-sm" disabled={resolving} onClick={() => {
+            setError('')
+            if (source === 'manual') setReloadRequest((n) => n + 1)
+            else setResolveNonce((n) => n + 1)
+          }}>
+            重试播放
+          </button>
+        </div>
+      )}
 
       <div className="player-info">
         <h2>{title}</h2>

@@ -21,7 +21,8 @@
   --border-strong: #333947;
   --text: #eceef2;
   --text-secondary: #9ba3b4;
-  --text-dim: #646c7d;
+  /* 信息性小字在 bg/card/elevated/hover 四种纯色底上均达到 AA。 */
+  --text-dim: #858d9f;
   --accent: #e3b04e;
   --accent-hover: #f2c266;
   --accent-dim: rgba(227, 176, 78, 0.14);
@@ -61,7 +62,7 @@
   --border-strong: #c8bda6;
   --text: #221f19;
   --text-secondary: #5d5749;
-  --text-dim: #8a8271;
+  --text-dim: #706756;
   --accent: #a87418;
   --accent-hover: #8f6210;
   --accent-dim: rgba(168, 116, 24, 0.1);
@@ -240,33 +241,6 @@ textarea::placeholder {
   z-index: 101;
 }
 
-/*
- * 中等宽度（721-1100px）：顶栏放不下 logo + 搜索框 + 5 个文字导航 + 2 个按钮。
- * 实测 5 个链接约 378px，加上 320px 搜索框与 logo 会重叠 —— 而原来的断点只有
- * 720px（手机）和 640px，这段区间完全没人管。
- * 这里改用纯图标：链接宽度降到约 42px/个，整组约 220px，任何宽度都放得下。
- * 用 title 属性保留悬停提示，功能不受影响（图标本身够辨识）。
- */
-@media (min-width: 721px) and (max-width: 1100px) {
-  .nav-tabs {
-    /* 与桌面默认保持一致：按钮组是固定尺寸，不随断点变化 */
-    right: 104px;
-  }
-
-  .nav-tabs .nav-icon {
-    display: inline-flex;
-  }
-
-  .nav-tabs .nav-text {
-    display: none;
-  }
-
-  .nav-tabs a {
-    padding: 7px 10px;
-    gap: 0;
-  }
-}
-
 .nav-tabs a,
 .nav-links a {
   padding: 7px 13px;
@@ -294,6 +268,22 @@ textarea::placeholder {
 .nav-tabs .nav-icon,
 .nav-links .nav-icon {
   display: none;
+}
+
+/* 中宽导航的覆盖必须在基础 display/padding 之后，手机断点之前。 */
+@media (min-width: 721px) and (max-width: 1100px) {
+  .nav-tabs .nav-icon {
+    display: inline-flex;
+  }
+
+  .nav-tabs .nav-text {
+    display: none;
+  }
+
+  .nav-tabs a {
+    padding: 7px 10px;
+    gap: 0;
+  }
 }
 
 /*
@@ -1114,29 +1104,33 @@ textarea::placeholder {
    搜索结果
    ============================================================ */
 
-.result-grid {
+.result-grid,
+.fav-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
   gap: 16px;
 }
 
-.subject-card {
+.subject-card,
+.fav-card {
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   overflow: hidden;
-  transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s;
+  transition: transform 0.12s ease, border-color 0.15s, box-shadow 0.15s, background 0.15s;
   display: block;
   position: relative;
 }
 
-.subject-card:hover {
+.subject-card:hover,
+.fav-card:hover {
   transform: translateY(-3px);
   border-color: var(--accent);
   box-shadow: var(--shadow-hover);
 }
 
-.subject-card .cover {
+.subject-card .cover,
+.fav-card .cover {
   width: 100%;
   aspect-ratio: 3 / 4;
   object-fit: cover;
@@ -1144,11 +1138,13 @@ textarea::placeholder {
   display: block;
 }
 
-.subject-card .info {
+.subject-card .info,
+.fav-card .info {
   padding: 10px 12px;
 }
 
-.subject-card .title {
+.subject-card .title,
+.fav-card .title {
   font-size: 14px;
   font-weight: 500;
   display: -webkit-box;
@@ -1158,7 +1154,8 @@ textarea::placeholder {
   min-height: 44px;
 }
 
-.subject-card .meta {
+.subject-card .meta,
+.fav-card .meta {
   margin-top: 6px;
   font-size: 12px;
   color: var(--text-dim);
@@ -2191,7 +2188,6 @@ textarea::placeholder {
 
 .fav-status:focus {
   border-color: var(--accent);
-  outline: none;
 }
 
 .fav-status.status-watching {
@@ -2206,56 +2202,18 @@ textarea::placeholder {
 .fav-status.status-onhold {
   color: var(--text-dim);
 }
-.fav-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-  gap: 16px;
-}
-
-.fav-card {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  overflow: hidden;
-  transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s;
-  display: block;
-  position: relative;
-}
-
-.fav-card:hover {
-  transform: translateY(-3px);
-  border-color: var(--accent);
-  box-shadow: var(--shadow-hover);
-}
-
-.fav-card .cover {
-  width: 100%;
-  aspect-ratio: 3 / 4;
-  object-fit: cover;
-  background: var(--bg-hover);
-  display: block;
-}
-
-.fav-card .info {
-  padding: 10px 12px;
-}
-
-.fav-card .title {
-  font-size: 14px;
-  font-weight: 500;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  min-height: 44px;
+.fav-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 16px;
+  font-size: 13px;
+  color: var(--text-dim);
 }
 
 .fav-card .meta {
-  margin-top: 6px;
-  font-size: 12px;
-  color: var(--text-dim);
-  display: flex;
-  justify-content: space-between;
   align-items: center;
 }
 
@@ -2276,7 +2234,8 @@ textarea::placeholder {
   transition: opacity 0.15s;
 }
 
-.fav-card:hover .fav-remove {
+.fav-card:hover .fav-remove,
+.fav-card:focus-within .fav-remove {
   opacity: 1;
 }
 
@@ -2735,9 +2694,7 @@ select:hover:not(:focus) {
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 
-.source-item,
-.subject-card,
-.fav-card {
+.source-item {
   transition: transform 0.12s ease, border-color 0.15s, box-shadow 0.15s, background 0.15s;
 }
 

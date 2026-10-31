@@ -285,45 +285,44 @@ class AuthFlowTest {
     }
 
     @Test
-    fun `repeated failures get rate limited but the right password is never locked out`() = testApplication {
-        val limiter = LoginRateLimiter(maxAttempts = 3, windowMs = 60_000)
-        application { module(config(), loginLimiter = limiter) }
+    fun `exhausted login budget hides correct and incorrect candidates until the window resets`() = testApplication {
+        var now = 0L
+        val limiter = LoginRateLimiter(maxAttempts = 3, windowMs = 60_000, now = { now })
+        val sessions = SessionStore()
+        val existing = sessions.create()
+        application { module(config(), siteSessions = sessions, loginLimiter = limiter) }
         repeat(3) {
             assertEquals(
                 HttpStatusCode.Unauthorized,
                 client.post("/api/session/login") { setBody("""{"username":"me","password":"nope"}""") }.status,
             )
         }
-        // 超限额之后，**猜错**不再得到 yes/no：在线爆破的速率就这么被封住
+        // 契约更正（BAPP-01）：429/200 对照仍是验密 oracle，不是限速修复。
+        // 没有已验证随机会话时，正确和错误候选都必须在比较前被同一预算拒绝。
         val blockedWrong = client.post("/api/session/login") {
             setBody("""{"username":"me","password":"nope"}""")
         }
-        assertEquals(HttpStatusCode.TooManyRequests, blockedWrong.status)
-        assertTrue(blockedWrong.headers[HttpHeaders.RetryAfter]?.isNotBlank() == true, "429 要给浏览器 Retry-After")
-
-        // 但**猜对的人不能被自己的正确口令挡在门外**。这一格原先是 429，理由写着
-        // 「让在线爆破没有意义」——那站不住：攻击者口令对了本来就该进去，
-        // 等 5 分钟再来一次即可，被这个决定付出的代价是零。
-        // 收代价的是机主：会话只存内存，容器一重启就必须重新走登录页，
-        // 而直连部署下限速键是来源 IP（攻击者只锁得到自己），
-        // 反代没配 ANIMEKO_TRUSTED_PROXY_HOPS 时全站共用代理那一个键 ——
-        // 任何匿名访客都能持续把机主锁在他自己家门外。
-        // 实测（8 次错口令后）：正确口令 429 Retry-After: 300，
-        // 而同一时刻同一套凭据走 Basic 打保护接口是 200，两条路径自相矛盾。
         val blockedRight = client.post("/api/session/login") {
             setBody("""{"username":"me","password":"correct horse"}""")
         }
-        assertEquals(HttpStatusCode.OK, blockedRight.status, blockedRight.bodyAsText())
-        // 这个 200 必须是真的能用（不是回了个成功却不发会话）
-        assertEquals(
-            HttpStatusCode.OK,
-            client.get("/api/selector/sources") { header(HttpHeaders.Cookie, cookieOf(blockedRight)) }.status,
-        )
-        // 成功登录清掉本客户端的账：只有「确实知道口令」的人才有能力重置计数器
-        assertEquals(
-            HttpStatusCode.Unauthorized,
-            client.post("/api/session/login") { setBody("""{"username":"me","password":"nope"}""") }.status,
-        )
+        assertEquals(HttpStatusCode.TooManyRequests, blockedWrong.status)
+        assertEquals(HttpStatusCode.TooManyRequests, blockedRight.status, blockedRight.bodyAsText())
+        assertEquals(blockedWrong.bodyAsText(), blockedRight.bodyAsText())
+        assertEquals(blockedWrong.headers[HttpHeaders.RetryAfter], blockedRight.headers[HttpHeaders.RetryAfter])
+        assertTrue(blockedWrong.headers[HttpHeaders.RetryAfter]?.isNotBlank() == true)
+        assertTrue(blockedRight.headers.getAll(HttpHeaders.SetCookie).isNullOrEmpty())
+        assertEquals(1, limiter.trackedClients, "拒绝不能创建新的来源桶")
+
+        // 安全正向对照：之前签发、已验证的随机 Cookie/Bearer 不被口令桶连坐。
+        for ((name, value) in listOf(HttpHeaders.Cookie to "animeko_session=$existing", HttpHeaders.Authorization to "Bearer $existing")) {
+            assertEquals(HttpStatusCode.OK, client.get("/api/data") { header(name, value) }.status)
+        }
+        now = 60_001
+        val recovered = client.post("/api/session/login") {
+            setBody("""{"username":"me","password":"correct horse"}""")
+        }
+        assertEquals(HttpStatusCode.OK, recovered.status, recovered.bodyAsText())
+        assertEquals(HttpStatusCode.OK, client.get("/api/data") { header(HttpHeaders.Cookie, cookieOf(recovered)) }.status)
     }
 
     @Test
@@ -482,18 +481,22 @@ class AuthFlowTest {
 
         val other = client.post("/api/session/login") {
             header(HttpHeaders.XForwardedFor, "203.0.113.8")
-            // 用**错**口令问：这里要证明的是「各记各的账」，
-            // 而正确口令在哪个客户端都该是 200（上一条用例专门管这件事）
+            // 用错口令证明另一个来源还有独立的验密预算。
             setBody("""{"username":"me","password":"nope"}""")
         }
         assertEquals(HttpStatusCode.Unauthorized, other.status, other.bodyAsText())
 
-        // 已经被限流的 .7 仍然能用正确口令进来：限速不许被拿来锁站
+        // 同一个耗尽桶不能用正确候选绕过；未耗尽的其它来源仍可登录。
         val owner = client.post("/api/session/login") {
             header(HttpHeaders.XForwardedFor, "203.0.113.7")
             setBody("""{"username":"me","password":"correct horse"}""")
         }
-        assertEquals(HttpStatusCode.OK, owner.status, owner.bodyAsText())
+        assertEquals(HttpStatusCode.TooManyRequests, owner.status, owner.bodyAsText())
+        val otherOwner = client.post("/api/session/login") {
+            header(HttpHeaders.XForwardedFor, "203.0.113.8")
+            setBody("""{"username":"me","password":"correct horse"}""")
+        }
+        assertEquals(HttpStatusCode.OK, otherOwner.status, otherOwner.bodyAsText())
     }
 
     @Test

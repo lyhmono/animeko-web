@@ -119,7 +119,7 @@ export default function AiringCalendar() {
           只看我追的{favCountInWeek > 0 ? `（${favCountInWeek}）` : ''}
         </button>
       </h2>
-      <div className="airing-tabs" role="tablist" aria-label="选择星期">
+      <div className="airing-tabs" role="group" aria-label="选择星期">
         {days.map((d, i) => {
           const favOnDay = d.items.filter((it) => favIds.has(it.id)).length
           const dim = onlyFav ? favOnDay === 0 : d.items.length === 0
@@ -128,8 +128,8 @@ export default function AiringCalendar() {
               key={d.weekday.id}
               className={`airing-tab${i === selected ? ' active' : ''}${dim ? ' empty' : ''}`}
               onClick={() => setSelected(i)}
-              role="tab"
-              aria-selected={i === selected}
+              type="button"
+              aria-pressed={i === selected}
               title={
                 onlyFav
                   ? favOnDay > 0
