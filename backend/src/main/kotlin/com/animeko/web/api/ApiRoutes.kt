@@ -2,16 +2,14 @@ package com.animeko.web.api
 
 import com.animeko.web.auth.LoginRateLimiter
 import com.animeko.web.auth.SessionStore
+import com.animeko.web.auth.CredentialVerifier
+import com.animeko.web.auth.ConfiguredCredentialVerifier
 import com.animeko.web.bangumi.BangumiClient
 import com.animeko.web.bangumi.BgmChannelResponse
 import com.animeko.web.config.AppConfig
 import com.animeko.web.appLog
 import com.animeko.web.data.UserDataStore
 import com.animeko.web.http.Fetcher
-import com.animeko.web.http.JsonGuard
-import com.animeko.web.http.StreamResult
-import com.animeko.web.http.UrlGuard
-import com.animeko.web.http.UpstreamException
 import com.animeko.web.proxy.HlsRewriter
 import com.animeko.web.proxy.ProxySessionStore
 import com.animeko.web.selector.SelectorEngine
@@ -27,16 +25,10 @@ import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.ApplicationCallPipeline
 import io.ktor.server.application.call
-import io.ktor.server.request.contentLength
 import io.ktor.server.request.path
-import io.ktor.server.request.receiveChannel
-import io.ktor.utils.io.readAvailable
 import io.ktor.server.response.ApplicationResponse
 import io.ktor.server.response.header
 import io.ktor.server.response.respond
-import io.ktor.server.response.respondBytes
-import io.ktor.server.response.respondFile
-import io.ktor.server.response.respondOutputStream
 import io.ktor.server.response.respondText
 import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
@@ -44,6 +36,9 @@ import io.ktor.server.routing.post
 import io.ktor.server.routing.put
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
+import io.ktor.util.AttributeKey
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
@@ -53,11 +48,8 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import java.io.ByteArrayOutputStream
-import java.io.File
-import java.io.InputStream
 import java.net.URI
-import java.security.MessageDigest
+
 
 private val prettyJson = Json { ignoreUnknownKeys = true }
 
@@ -65,6 +57,7 @@ private const val HEALTH_PATH = "/api/health"
 
 private const val LOGIN_PATH = "/api/session/login"
 private const val LOGOUT_PATH = "/api/session/logout"
+private val VERIFIED_BEARER_SESSION = AttributeKey<String>("verified-bearer-session")
 
 /**
  * 登录会话 Cookie 名。
@@ -109,8 +102,6 @@ private fun ApplicationCall.sessionTokens(): List<String> =
 
 private const val PROXY_PATH = "/api/proxy"
 
-/** 播放清单体积上限：防止有人把 .m3u8 指向一个大文件，readText() 直接把堆吃光。 */
-private const val MAX_PLAYLIST_BYTES = 4L * 1024 * 1024
 
 @kotlinx.serialization.Serializable
 data class HealthResponse(
@@ -162,6 +153,7 @@ fun Application.configureApiRoutes(
     limiter: LoginRateLimiter,
     userData: UserDataStore,
     subscriptions: SubscriptionService,
+    credentialVerifier: CredentialVerifier = ConfiguredCredentialVerifier(cfg),
 ) {
     routing {
         intercept(ApplicationCallPipeline.Call) {
@@ -178,7 +170,7 @@ fun Application.configureApiRoutes(
                 return@intercept
             }
             if (cfg.authEnabled && call.isProtectedApiCall()) {
-                when (call.authenticate(cfg, site, limiter)) {
+                when (call.authenticate(cfg, site, limiter, credentialVerifier)) {
                     AuthResult.Authorized -> Unit
                     // 限速期间连「猜对了没有」都不回答：不下发质询（那会勾起浏览器反复弹窗），
                     // 也不给 401（401 与 403 的区别就是一个 yes/no 预言机）
@@ -232,7 +224,7 @@ fun Application.configureApiRoutes(
                     // 只承认会话 Cookie。这个接口免鉴权、也不该有副作用，
                     // 若它连 Authorization 头一起判定，就等于给「口令猜对了没有」
                     // 开了一个免限流的免费预言机。
-                    authenticated = !cfg.authEnabled || call.hasValidSession(site),
+                    authenticated = !cfg.authEnabled || call.hasValidSession(site, cfg),
                 ),
             )
         }
@@ -241,50 +233,37 @@ fun Application.configureApiRoutes(
         post(LOGIN_PATH) {
             // CSRF 检查在根 intercept 里，登录接口也在它的覆盖范围内（只豁免鉴权，不豁免 CSRF）
             val clientKey = call.rateLimitKey(cfg)
-            // 顺序必须与 authenticate() 那条一致：**先验证，只有猜错的人才去问限速器**。
-            // 原先是进门先 blocked()，于是超限窗口内连「输对了口令」也一律 429。
-            // 那一格挡不住攻击者（他口令对的时候本来就该进去，等窗口过后再来一次就行），
-            // 却能机主锁在自己家门外：会话只存内存，容器一重启就必须重新走登录页，
-            // 而任何人都能持续把这条路占住。直连部署下限速键是来源 IP（攻击者只锁自己），
-            // 但反代没配 ANIMEKO_TRUSTED_PROXY_HOPS 时全站共用代理那一个键 —— 实测
-            // 8 次错口令后 POST /api/session/login 带**正确**口令回 429 Retry-After: 300，
-            // 而同一时刻同一套凭据走 Authorization: Basic 打保护接口回 200：两条路径互相矛盾。
-            // 猜测速率照样被封死：超限期间的错误口令仍是 429，且不再往计数里加。
+            if (!cfg.authEnabled) {
+                call.respond(HttpStatusCode.Conflict, mapOf("error" to "服务端未配置登录凭据，无需登录"))
+                return@post
+            }
+            // 随机会话已经通过验证，既无需重新验口令，也不受口令桶连坐。
+            if (call.hasValidSession(site, cfg) || call.validBearerSession(site) != null) {
+                call.respond(SessionStateResponse(authenticated = true, user = cfg.authUser ?: "token"))
+                return@post
+            }
+            // 先原子取得许可再读表单/验密。超限时所有候选都走同一个答复，
+            // 正确口令不能作为绕过限速的判定入口；可信代理配置解决共享来源误锁。
+            if (!limiter.tryAcquire(clientKey)) {
+                call.response.header(HttpHeaders.RetryAfter, limiter.retryAfterSeconds(clientKey).toString())
+                call.respond(HttpStatusCode.TooManyRequests, mapOf("error" to "凭据校验次数过多，请稍后再试"))
+                return@post
+            }
             // 请求体只能读一次：分两次 bodyField(...) 会让第二个字段永远为空，
             // 表现是「口令明明对了却提示请填写口令」。
             val form = bodyObject(call, MAX_LOGIN_BODY_BYTES)
             val username = form?.stringField("username").orEmpty()
             val password = form?.stringField("password").orEmpty()
             when {
-                !cfg.authEnabled -> call.respond(
-                    HttpStatusCode.Conflict,
-                    mapOf("error" to "服务端未配置登录凭据，无需登录"),
-                )
                 form == null || password.isEmpty() -> call.respond(
                     HttpStatusCode.BadRequest,
                     mapOf("error" to "请填写口令"),
                 )
-                !credentialsMatch(cfg, username, password) -> {
-                    if (limiter.blocked(clientKey)) {
-                        call.response.header(
-                            HttpHeaders.RetryAfter,
-                            limiter.retryAfterSeconds(clientKey).toString(),
-                        )
-                        call.respond(
-                            HttpStatusCode.TooManyRequests,
-                            mapOf("error" to "失败次数过多，请稍后再试"),
-                        )
-                    } else {
-                        limiter.onFailure(clientKey)
-                        appLog.warn(
-                            "登录失败: user={} ip={} 累计={}",
-                            username.take(40), clientKey, limiter.attempts(clientKey),
-                        )
-                        call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "账号或口令不正确"))
-                    }
+                !credentialVerifier.password(username, password) -> {
+                    appLog.warn("登录失败: user={} ip={} 累计={}", username.take(40), clientKey, limiter.attempts(clientKey))
+                    call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "账号或口令不正确"))
                 }
                 else -> {
-                    limiter.onSuccess(clientKey)
                     val token = site.create()
                     call.response.setSessionCookie(cfg, token, site.ttlSeconds())
                     call.respond(
@@ -301,6 +280,7 @@ fun Application.configureApiRoutes(
         post(LOGOUT_PATH) {
             // 两个都作废：它们是同一台机器签发的同一份会话的两种写法
             call.sessionTokens().forEach { site.invalidate(it) }
+            call.attributes.getOrNull(VERIFIED_BEARER_SESSION)?.let(site::invalidate)
             call.response.clearSessionCookie(cfg)
             call.respond(SessionStateResponse(authenticated = false))
         }
@@ -355,8 +335,8 @@ fun Application.configureApiRoutes(
                 "CUSTOM" -> com.animeko.web.bangumi.BgmChannel.CUSTOM
                 else -> throw IllegalArgumentException("无法识别的 channel「$raw」，只接受 AUTO/OFFICIAL/MIRROR/CUSTOM")
             }
-            val custom = form?.stringArrayField("customUrls").orEmpty()
-            val saved = bangumi.setChannel(com.animeko.web.bangumi.BgmChannelConfig(channel, custom))
+            val custom = form.stringArrayField("customUrls")
+            val saved = withContext(Dispatchers.IO) { bangumi.setChannel(com.animeko.web.bangumi.BgmChannelConfig(channel, custom)) }
             call.respond(
                 BgmChannelResponse(
                     channel = saved.channel,
@@ -405,14 +385,13 @@ fun Application.configureApiRoutes(
 
         // ---- 数据源管理 ----
         get("/api/selector/sources") {
-            call.respond(repo.list())
+            call.respond(withContext(Dispatchers.IO) { repo.list() })
         }
 
         post("/api/selector/sources") {
             val text = call.receiveCappedText()
             try {
-                val args = repo.importJson(text)
-                repo.save(args)
+                val args = withContext(Dispatchers.IO) { repo.importJson(text).also { repo.save(it) } }
                 call.respond(HttpStatusCode.Created, args)
             } catch (e: IllegalArgumentException) {
                 call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "invalid config")))
@@ -429,7 +408,7 @@ fun Application.configureApiRoutes(
             }.getOrNull()
             if (enabled == null) {
                 call.respond(HttpStatusCode.BadRequest, mapOf("error" to "enabled 必须是布尔值"))
-            } else if (repo.setEnabled(name, enabled)) {
+            } else if (withContext(Dispatchers.IO) { repo.setEnabled(name, enabled) }) {
                 call.respond(SourceEnabledResponse(name = name, enabled = enabled))
             } else {
                 call.respond(HttpStatusCode.NotFound, mapOf("error" to "source not found"))
@@ -438,7 +417,7 @@ fun Application.configureApiRoutes(
 
         delete("/api/selector/sources/{name}") {
             val name = call.parameters["name"]
-            if (name != null && repo.delete(name)) {
+            if (name != null && withContext(Dispatchers.IO) { repo.delete(name) }) {
                 call.respond(mapOf("deleted" to name))
             } else {
                 call.respond(HttpStatusCode.NotFound, mapOf("error" to "source not found"))
@@ -489,7 +468,7 @@ fun Application.configureApiRoutes(
 
         // ---- 个人数据（收藏 / 历史 / 进度 / 搜索记录）----
         get("/api/data") {
-            val snapshot = userData.read()
+            val snapshot = withContext(Dispatchers.IO) { userData.read() }
             call.response.header(HttpHeaders.ETag, "\"${snapshot.etag}\"")
             // 个人数据（收藏/历史/进度）绝不能进任何缓存：这份响应的内容随「谁在问」而变，
             // 而 HTTP 里没有 Vary 能表达按会话用户区分。浏览器磁盘缓存一旦存下上一份，
@@ -507,7 +486,7 @@ fun Application.configureApiRoutes(
             // 于是「*」和「多值里含正确指纹」这两种合法写法都恒定 409
             val ifMatch = call.request.headers[HttpHeaders.IfMatch]?.trim()?.takeIf { it.isNotEmpty() }
             try {
-                val snapshot = userData.write(text, ifMatch)
+                val snapshot = withContext(Dispatchers.IO) { userData.write(text, ifMatch) }
                 call.response.header(HttpHeaders.ETag, "\"${snapshot.etag}\"")
                 // 回字节数：前端可以据此提示「数据快满了」，而不是只有一句失败
                 call.respond(DataSavedResponse(bytes = text.toByteArray(Charsets.UTF_8).size.toLong()))
@@ -520,7 +499,7 @@ fun Application.configureApiRoutes(
 
         // ---- 数据源采集 ----
         post("/api/selector/sources/{name}/search") {
-            val source = repo.find(call.parameters["name"] ?: "", enabledOnly = true)
+            val source = withContext(Dispatchers.IO) { repo.find(call.parameters["name"] ?: "", enabledOnly = true) }
             if (source == null) {
                 call.respond(HttpStatusCode.NotFound, mapOf("error" to "source not found"))
             } else {
@@ -534,7 +513,7 @@ fun Application.configureApiRoutes(
         }
 
         post("/api/selector/sources/{name}/episodes") {
-            val source = repo.find(call.parameters["name"] ?: "", enabledOnly = true)
+            val source = withContext(Dispatchers.IO) { repo.find(call.parameters["name"] ?: "", enabledOnly = true) }
             if (source == null) {
                 call.respond(HttpStatusCode.NotFound, mapOf("error" to "source not found"))
             } else {
@@ -548,7 +527,7 @@ fun Application.configureApiRoutes(
         }
 
         post("/api/selector/sources/{name}/video") {
-            val source = repo.find(call.parameters["name"] ?: "", enabledOnly = true)
+            val source = withContext(Dispatchers.IO) { repo.find(call.parameters["name"] ?: "", enabledOnly = true) }
             if (source == null) {
                 call.respond(HttpStatusCode.NotFound, mapOf("error" to "source not found"))
             } else {
@@ -579,94 +558,6 @@ fun Application.configureApiRoutes(
         get("/api/proxy") { proxyVideo(call, fetcher, cfg, sessions) }
     }
 }
-
-// ---- 静态前端 ----
-
-fun Application.configureStaticFrontend(cfg: AppConfig) {
-    val dir = File(cfg.frontendDir).absoluteFile
-    if (!dir.isDirectory) {
-        appLog.warn("前端目录不存在，跳过静态托管: {}", dir.absolutePath)
-        return
-    }
-    routing {
-        // 静态文件 + SPA 回退（单一路由显式处理）。
-        // 不使用 staticFiles()：它与 catch-all 路由共存时不会消费文件请求，
-        // 导致 JS/CSS 全部被 SPA 回退劫持成 index.html（前端白屏）。
-        // 这里显式把请求路径解析到文件；找不到再回退 index.html。
-        get("/{...}") {
-            val path = call.request.path()
-            // 归一化后再判：`//api/nope`、`/%61pi/nope` 也算 api 路径，
-            // 不能回退成 index.html（那会把「api 打错了」变成一份 200 的 HTML）
-            if (call.pathSegments().firstOrNull() == "api" || path.startsWith("/api/") || path == "/api") return@get
-            val rel = path.removePrefix("/")
-            val index = File(dir, "index.html")
-            val file = if (rel.isEmpty()) index else dir.resolve(rel).normalize()
-            when {
-                file.isFile && file.startsWith(dir) -> {
-                    // 只在确认文件在 dir 内之后才 relativeTo：Windows 上不同盘根会抛
-                    // IllegalArgumentException，不能把一次静态资源请求变成 400。
-                    // 缓存策略必须按**归一化后的**路径判断：`/assets/../index.html` 的原始
-                    // rel 以 assets/ 开头，但实际文件是 index.html，不能给它 immutable。
-                    val normalizedRel = if (file == index) {
-                        "index.html"
-                    } else {
-                        file.relativeTo(dir).path.replace(File.separatorChar, '/')
-                    }
-                    when {
-                        // 带内容哈希的产物可以长期强缓存
-                        normalizedRel.startsWith("assets/") ->
-                            call.response.header(HttpHeaders.CacheControl, "public, max-age=31536000, immutable")
-                        // 入口文档（含直接访问 /index.html）必须每次回源：
-                        // 缓存住它就等于缓存住一批重新部署后已不存在的 chunk 文件名。
-                        // sw.js 同理、且更要紧：浏览器发现 SW 文件有变化才会装新版本，
-                        // 而它判断依据是响应本身 —— 缓存住就等于让更新永远装不上。
-                        // manifest 一起带上，改图标/改名后要能立刻生效。
-                        normalizedRel == "index.html" || normalizedRel == "sw.js" ||
-                            normalizedRel == "manifest.webmanifest" ->
-                            call.response.header(HttpHeaders.CacheControl, "no-cache")
-                    }
-                    if (normalizedRel == "manifest.webmanifest") {
-                        // Ktor 的扩展名映射不认识 .webmanifest，会落到 octet-stream，
-                        // 部分浏览器会因此直接忽略这份 manifest。显式给正确类型。
-                        // 用 respondBytes 而不是 LocalFileContent：后者在这个 Ktor
-                        // 版本里不在 io.ktor.http.content 下（编译期就报 Unresolved）。
-                        // manifest 只有几百字节，读进内存没有负担。
-                        call.respondBytes(file.readBytes(), ContentType.parse("application/manifest+json"))
-                    } else {
-                        call.respondFile(file)
-                    }
-                }
-                // 缺失的静态资源必须 404，不能回退 index.html：
-                // 那等于把 HTML 当 JS/CSS 返回（200 + text/html），浏览器报模块 MIME 错误；
-                // 重新部署后 chunk 文件名变了，用户缓存里的旧 index.html 就会永久白屏。
-                looksLikeAsset(rel) -> call.respond(HttpStatusCode.NotFound)
-                else -> {
-                    if (index.isFile) {
-                        call.response.header(HttpHeaders.CacheControl, "no-cache")
-                        call.respondFile(index)
-                    } else {
-                        call.respond(HttpStatusCode.NotFound)
-                    }
-                }
-            }
-        }
-    }
-}
-
-private val assetExtensionRegex = Regex("""\.[A-Za-z0-9]{1,8}$""")
-
-/**
- * 缺失的静态资源要 404，不能回退成 index.html（那会让浏览器把 HTML 当 JS/CSS）。
- *
- * 判据只认两种：`/assets/` 下的构建产物，以及**根目录**带扩展名的文件。
- * 不能用「路径最后一段带扩展名」：数据源名本身可以带点（`Anime1.me`、`xx.720p`），
- * `/source/Anime1.me` 是 SPA 路由，按扩展名判会把它 404 掉 —— 站内跳转正常、
- * 一刷新或分享链接就变成 404。SPA 路由不会出现在根目录，这样既保住白屏防线，
- * 也不误伤带点的路由参数。
- */
-private fun looksLikeAsset(rel: String): Boolean =
-    rel.startsWith("assets/") ||
-        (!rel.contains('/') && assetExtensionRegex.containsMatchIn(rel))
 
 // ---- 鉴权 ----
 
@@ -817,7 +708,7 @@ private val PUBLIC_API_PATHS = setOf(
  * 与路由一致的归一化：按 / 拆段、丢掉空段、逐段 URL 解码。
  * 绝对形式请求行（`GET http://host/api/x`）先剥掉 scheme://host。
  */
-private fun ApplicationCall.pathSegments(): List<String> {
+internal fun ApplicationCall.pathSegments(): List<String> {
     var uri = request.local.uri
     if (uri.startsWith("http://", ignoreCase = true) || uri.startsWith("https://", ignoreCase = true)) {
         uri = uri.substringAfter("//").substringAfter("/", "/")
@@ -831,8 +722,19 @@ private fun ApplicationCall.pathSegments(): List<String> {
         }
 }
 
-private fun ApplicationCall.hasValidSession(site: SessionStore): Boolean =
-    sessionTokens().any { site.isValid(it) }
+private fun ApplicationCall.hasValidSession(site: SessionStore, cfg: AppConfig): Boolean {
+    val token = sessionTokens().firstOrNull(site::isValid) ?: return false
+    // 注销只发删除头；其余接口用原子周期门闩，让浏览器和服务端的空闲寿命一致。
+    if (pathSegments() != listOf("api", "session", "logout") && site.claimCookieRenewal(token)) {
+        response.setSessionCookie(cfg, token, site.ttlSeconds())
+    }
+    return true
+}
+
+/** 仅验证站点签发的随机会话，绝不在许可前比较配置 token。 */
+private fun ApplicationCall.validBearerSession(site: SessionStore): String? =
+    request.headers[HttpHeaders.Authorization]?.takeIf { it.startsWith("Bearer ") }
+        ?.removePrefix("Bearer ")?.trim()?.takeIf { it.isNotEmpty() && site.isValid(it) }
 
 /**
  * 这个 401 该不该附 Basic 质询。
@@ -862,36 +764,22 @@ private fun ApplicationCall.authenticate(
     cfg: AppConfig,
     site: SessionStore,
     limiter: LoginRateLimiter,
+    credentialVerifier: CredentialVerifier,
 ): AuthResult {
-    if (hasValidSession(site)) return AuthResult.Authorized
+    val bearerSession = validBearerSession(site)
+    if (bearerSession != null) attributes.put(VERIFIED_BEARER_SESSION, bearerSession)
+    if (hasValidSession(site, cfg) || bearerSession != null) return AuthResult.Authorized
     val header = request.headers["Authorization"] ?: return AuthResult.Failed
-    // 顺序很重要：**先验证，只有失败了才问限速器**。
-    // 反过来（先 blocked() 再验证）会让「超限期间的正确凭据」也被拒成 429 ——
-    // 那挡不住攻击者（他手里本来就没有正确凭据），却能锁死合法用户：
-    // 限速键在直连部署下就是来源 IP，而反代没配 ANIMEKO_TRUSTED_PROXY_HOPS 时
-    // 全站共用一个键，于是任何人发 8 个错口令就能让整站在窗口期内谁都进不来，
-    // 并且可以反复续期。爆破的预算照样被限（每窗口 8 次），只是不再拿它惩罚成功。
-    val ok = headerAuthorized(cfg, site, header)
-    if (ok) return AuthResult.Authorized
     val key = rateLimitKey(cfg)
-    if (limiter.blocked(key)) return AuthResult.Throttled
-    // 失败要记账，**成功不注销账**（成功在几行前就 return 了）。
-    // 这里原先是 `if (ok) limiter.onSuccess(key) else limiter.onFailure(key)`，
-    // 而 key 在直连部署下就是来源 IP：浏览器会自动附带缓存的 Basic 凭据，
-    // 受害者每正常访问一次就把攻击者的失败计数清零 —— 只要这个 IP 上还有人活着，
-    // 在线爆破就没有上限（反代没配 hops 时全站共用一个键，更容易触发）。
-    // 登录接口那边仍然在成功时清账：那是「确实知道口令」才能触发的动作，性质不同。
-    limiter.onFailure(key)
-    return AuthResult.Failed
+    if (!limiter.tryAcquire(key)) return AuthResult.Throttled
+    return if (headerAuthorized(credentialVerifier, header)) AuthResult.Authorized else AuthResult.Failed
 }
 
-private fun headerAuthorized(cfg: AppConfig, site: SessionStore, header: String): Boolean {
+private fun headerAuthorized(verifier: CredentialVerifier, header: String): Boolean {
     if (header.startsWith("Bearer ")) {
         val token = header.removePrefix("Bearer ").trim()
         if (token.isEmpty()) return false
-        // 也接受登录会话号：curl -H "Authorization: Bearer <会话号>" 便于脚本复放
-        if (site.isValid(token)) return true
-        return cfg.authToken != null && constantTimeEquals(token, cfg.authToken)
+        return verifier.bearer(token)
     }
     if (header.startsWith("Basic ")) {
         val decoded = runCatching {
@@ -899,21 +787,11 @@ private fun headerAuthorized(cfg: AppConfig, site: SessionStore, header: String)
         }.getOrNull() ?: return false
         val parts = decoded.split(":", limit = 2)
         if (parts.size != 2) return false
-        return credentialsMatch(cfg, parts[0], parts[1])
+        return verifier.password(parts[0], parts[1])
     }
     return false
 }
 
-/** Basic 质询弹窗 / Authorization 头用的凭据匹配。 */
-private fun credentialsMatch(cfg: AppConfig, user: String, pass: String): Boolean {
-    if (pass.isEmpty()) return false
-    if (cfg.authUser != null && cfg.authPassword != null) {
-        return constantTimeEquals(user, cfg.authUser) && constantTimeEquals(pass, cfg.authPassword)
-    }
-    // 只配了 token 的部署：把 token 当口令接受（用户名任意），
-    // 否则浏览器的质询弹窗无法完成认证，播放器与封面会全部 401。
-    return cfg.authToken != null && constantTimeEquals(pass, cfg.authToken)
-}
 
 /**
  * Cookie 头自己解析：Ktor 的 RequestCookies 会按 URI_ENCODING 解码值，
@@ -930,6 +808,8 @@ private fun ApplicationCall.cookieValue(name: String): String? =
         }
 
 private fun ApplicationResponse.setSessionCookie(cfg: AppConfig, value: String, maxAgeSeconds: Long) {
+    // A renewed session token is private even when the response body is a cacheable image.
+    header(HttpHeaders.CacheControl, "private, no-store")
     // SameSite=Strict：会话 Cookie 一旦种下，跨站请求就不会带上它，
     // 恶意站点连「借你的会话发一个写请求」都做不到（Origin 检查是第二层）。
     header(
@@ -945,7 +825,6 @@ private fun ApplicationResponse.setSessionCookie(cfg: AppConfig, value: String, 
     )
 }
 
-/** 凭据比较不走 String==（短路返回，长度/前缀可被时序探测）。 */
 /**
  * 注销时把**两个**名字都覆盖掉。只清当前那一个会留下另一半：
  * 站长开过 HTTPS（`__Host-` 那份）又关掉之后，旧浏览器里仍然揣着另一份同名会话，
@@ -953,6 +832,7 @@ private fun ApplicationResponse.setSessionCookie(cfg: AppConfig, value: String, 
  * 多下发一条无害：不存在的那个名字浏览器直接忽略。
  */
 private fun ApplicationResponse.clearSessionCookie(cfg: AppConfig) {
+    header(HttpHeaders.CacheControl, "private, no-store")
     listOf(HOST_PREFIXED_COOKIE, SESSION_COOKIE).forEach { name ->
         header(
             HttpHeaders.SetCookie,
@@ -964,298 +844,4 @@ private fun ApplicationResponse.clearSessionCookie(cfg: AppConfig) {
             },
         )
     }
-}
-
-private fun constantTimeEquals(a: String, b: String): Boolean =
-    MessageDigest.isEqual(a.toByteArray(Charsets.UTF_8), b.toByteArray(Charsets.UTF_8))
-
-// ---- 视频代理实现 ----
-
-private const val MAX_REDIRECTS = 5
-
-private suspend fun proxyVideo(
-    call: ApplicationCall,
-    fetcher: Fetcher,
-    cfg: AppConfig,
-    sessions: ProxySessionStore,
-) {
-    // 代理会把上游内容原样吐在同源下。CSP sandbox 只在「把代理地址当文档打开」时
-    // 生效（媒体/图片子资源不受影响），可以挡住上游 HTML/JS 在站点源下执行；
-    // 对 HTML/SVG/JS 再加 nosniff，避免浏览器按内容猜成脚本。
-    call.response.header("Content-Security-Policy", "sandbox")
-    // Ktor 已经解码过查询参数，不能再 URLDecoder 一次：
-    // 带签名/令牌的地址几乎都含 % 和 +，二次解码会把 ?sign=a%2Bb 变成 ?sign=a b，
-    // 表现为「解析成功但播放/清单 404」，且日志里看不出原因。
-    val requested = call.request.queryParameters["url"]?.trim().orEmpty()
-    if (requested.isBlank() || !requested.startsWith("http")) {
-        call.respond(HttpStatusCode.BadRequest, mapOf("error" to "invalid url"))
-        return
-    }
-    var url = UrlGuard.requireAllowed(requested, cfg.allowPrivateTargets)
-
-    // 上游所需请求头不再由查询参数带入：UA/Referer/Cookie 留在服务端会话库里，
-    // URL 里只出现一个随机 sid。此前这些值会被复制到每一个分片地址上，
-    // 等于把源站凭据批量写进浏览器历史与访问日志。
-    val sid = call.request.queryParameters["sid"]?.trim().orEmpty()
-    val headers = LinkedHashMap<String, String>()
-    if (sid.isNotEmpty()) {
-        // sid 是能力令牌，必须绑定目标主机：否则拿到一个 sid 就能用受害者的
-        // Cookie 去请求攻击者指定的任意地址。
-        val grant = sessions.grant(sid, url)
-        when (grant.kind) {
-            // 会话过期与「源站拒绝」必须可区分，否则排查播放故障只能猜
-            ProxySessionStore.Kind.EXPIRED -> {
-                call.respond(HttpStatusCode.Gone, mapOf("error" to "PROXY_SESSION_EXPIRED"))
-                return
-            }
-            ProxySessionStore.Kind.HOST_NOT_ALLOWED -> {
-                call.respond(
-                    HttpStatusCode.Forbidden,
-                    mapOf("error" to "PROXY_SESSION_TARGET_MISMATCH"),
-                )
-                return
-            }
-            ProxySessionStore.Kind.GRANTED -> headers.putAll(grant.headers)
-        }
-    }
-    call.request.headers["Range"]?.let { if (it.isNotBlank()) headers["Range"] = it }
-
-    var result = fetchStream(fetcher, url, headers)
-
-    // 手动跟随重定向（最多 MAX_REDIRECTS 次）
-    var redirects = 0
-    while (result.status in 301..399 && redirects < MAX_REDIRECTS) {
-        val location = result.header("location")
-        // 没有 Location 就没得跟：把这 3xx 原样透传给播放器。
-        // 此时**不能**关流 —— 后面的 readCapped / respondOutputStream 还要读它，
-        // 而 JDK 的响应体流关掉再读直接抛异常，表现成一个与源站无关的 500。
-        if (location.isNullOrBlank()) break
-        // 每一跳都重新校验：只校验入口地址的话，302 指向 127.0.0.1 照样打进内网。
-        val next = try {
-            UrlGuard.requireAllowed(
-                SelectorEngine.absUrl(url, location),
-                cfg.allowPrivateTargets,
-            )
-        } catch (e: Throwable) {
-            // 被拦下的这一跳不会再有消费者，必须关掉：否则每个「302 → 内网」的
-            // 探测请求都留下一条没人回收的上游连接，而这正是免鉴权可试的路径。
-            runCatching { result.body.close() }
-            throw e
-        }
-        if (UrlGuard.hostOf(next) != UrlGuard.hostOf(url) ||
-            UrlGuard.isInsecureDowngrade(url, next)
-        ) {
-            // 跨主机或 https→http 降级都不再带 Cookie：前者避免把源站凭据送给第三个
-            // 域名，后者避免 Cookie 明文经过链路中间人。
-            headers.remove("Cookie")
-        }
-        url = next
-        result.body.close()
-        result = fetchStream(fetcher, url, headers)
-        redirects++
-    }
-
-    // 跳转次数用尽后仍有有效 Location：这一跳从未经过 UrlGuard 校验，不能交给浏览器；
-    // 也必须放在 isHls 分支之前，否则 m3u8 的重定向环会被包装成一个无 Location 的 3xx。
-    if (result.status in 301..399 && !result.header("location").isNullOrBlank()) {
-        runCatching { result.body.close() }
-        throw UpstreamException("上游重定向次数过多（超过 $MAX_REDIRECTS 跳）")
-    }
-
-    val contentType = result.contentType
-    if (contentType?.let {
-            it.contains("html", ignoreCase = true) ||
-                it.contains("svg", ignoreCase = true) ||
-                it.contains("javascript", ignoreCase = true)
-        } == true
-    ) {
-        call.response.header("X-Content-Type-Options", "nosniff")
-    }
-    val isHls = url.contains(".m3u8", ignoreCase = true) ||
-        contentType?.contains("mpegurl", ignoreCase = true) == true
-
-    if (isHls) {
-        val upstreamOk = result.status == 200 || result.status == 206
-        val text = readCapped(result.body, MAX_PLAYLIST_BYTES)
-        // 只有 2xx 才改写。以前无论上游回什么都 respondText(...)，而它默认 200：
-        // 源站一个 403 防盗链页会被包装成「一份合法的 m3u8 清单」发回播放器，
-        // hls.js 既不会报错也不会切下一条线路/下一个源，用户只看到「加载中」然后黑屏。
-        val rewritten = if (upstreamOk) HlsRewriter.rewriteDetailed(text, url, sid = sid) else null
-        val body = rewritten?.body ?: text
-        if (rewritten != null) {
-            // 分片与密钥常在另一个主机（清单域 vs CDN 域）：只登记**这次真正改写出的**
-            // URI 主机，不由客户端、也不由评论行里的任意字符串扩大范围。
-            sessions.allowHosts(sid, rewritten.hosts)
-        }
-        val outType = if (upstreamOk) {
-            ContentType.parse("application/vnd.apple.mpegurl")
-        } else {
-            // 拒绝/出错时沿用上游的类型：把 403 的 HTML 错误页标成 m3u8，
-            // 播放器就会把它当清单去解析，而不是当失败去换一条线路
-            contentType?.let { runCatching { ContentType.parse(it) }.getOrNull() } ?: ContentType.Text.Plain
-        }
-        call.respondText(body, outType, if (upstreamOk) HttpStatusCode.OK else HttpStatusCode.fromValue(result.status))
-        return
-    }
-
-    val status = runCatching { HttpStatusCode.fromValue(result.status) }.getOrDefault(HttpStatusCode.BadGateway)
-    result.header("content-range")?.let { call.response.header("Content-Range", it) }
-    result.header("accept-ranges")?.let { call.response.header("Accept-Ranges", it) }
-    val ct = contentType?.let { runCatching { ContentType.parse(it) }.getOrNull() }
-    // content-length 只在「正常内容响应」上透传：3xx/错误体的声明长度与实际
-    // 转发内容经常对不上（上游断流、gzip 压缩前后长度差），浏览器会对着一个
-    // 永远等不到结尾的长度干转。那种情况交给 chunked，宁可没有长度也不错报。
-    val contentLength = if (result.status == 200 || result.status == 206) {
-        result.header("content-length")?.toLongOrNull()
-    } else {
-        null
-    }
-    // 封面/图标的浏览器缓存。经代理的图片 URL 只由内容决定（同一张封面永远是同一个
-    // /api/proxy 地址），缓存一天能省掉每次刷新都穿透服务器拉图床的开销。
-    // 只对图片生效：m3u8 清单缓存一天等于源站换源不生效，视频分片没有缓存的意义
-    // （每个分片只被请求一次，带签名的地址也不该进磁盘缓存）。
-    if (ct?.match("image/*") == true && result.status == 200) {
-        call.response.header(HttpHeaders.CacheControl, "public, max-age=86400")
-    }
-    // body 阶段刻意**不设**超时。试过，两种做法都不成立，理由写在这里免得被人再加回来：
-    //  1) 绝对期限（从响应头开始计时）会砍掉健康的慢速长传输。实测一部 700KB 的
-    //     「每秒给一段」的流被 4 秒期限砍断后，声明了 Content-Length 的响应既不补字节也不关闭，
-    //     客户端等满 90 秒仍在等 —— 播放器表现成卡死，比不设超时更糟。
-    //  2) 空闲期限也不成立：这条链路是同步 copyTo，两次 read 之间的耗时主要是
-    //     写出被客户端背压堵住的时间。按「距上次读到的间隔」判上游死活，误伤的是
-    //     边看边缓冲的正常观众；而真正危险的那种「read 自己永久卡住」，
-    //     在阻塞读返回之前根本没有任何检查点可以生效。
-    // 也就是说：在同步写出这条路径上，期限要么误伤正常播放，要么打不到真正的死流。
-    // 要正确解决得换成非阻塞写出（或对每个 read 做带超时的异步包裹），那是另一套机制。
-    // 现在靠三件已有的东西兜住：连接超时 + 响应头超时（JDK 层）、上游 EOF/断连时
-    // copyTo 自然返回、以及 Netty 对空闲连接的处理。
-    call.respondOutputStream(ct, status, contentLength) {
-        result.body.use { input -> input.copyTo(this) }
-    }
-}
-
-private suspend fun fetchStream(fetcher: Fetcher, url: String, headers: Map<String, String>): StreamResult =
-    try {
-        fetcher.fetchStream(url, headers, followRedirects = false)
-    } catch (e: UrlGuard.Blocked) {
-        throw e
-    } catch (e: Exception) {
-        throw UpstreamException("拉取上游失败: ${e.message ?: e::class.simpleName}")
-    }
-
-private fun readCapped(input: InputStream, maxBytes: Long): String =
-    input.use { stream ->
-        val buffer = ByteArray(8192)
-        val out = ByteArrayOutputStream()
-        var total = 0L
-        while (true) {
-            val n = stream.read(buffer)
-            if (n == -1) break
-            total += n
-            if (total > maxBytes) {
-                throw UpstreamException("播放清单超过 ${maxBytes / 1024 / 1024}MB 上限")
-            }
-            out.write(buffer, 0, n)
-        }
-        String(out.toByteArray(), Charsets.UTF_8)
-    }
-
-/**
- * 请求体上限。登录接口免鉴权也可达，不封顶等于让来访者决定这台机器的堆用量
- * （接收侧此前完全没有上限，只有落盘前的 importJson 才校验大小 —— 那时已经读进内存了）。
- */
-private const val MAX_BODY_BYTES = 1L * 1024 * 1024
-
-/**
- * 登录表单的体积上限，比通用上限小一个量级。
- *
- * 单独设一个数是上面那个顺序决定的：登录现在**先读体再判限速**（否则正确口令会被
- * 限速挡在门外），于是每个来敲门的请求都会真的读一次体。留 1MB 等于让被限流的客户端
- * 照旧能按请求体压带宽与堆；32KB 装得下任意长的 token，又让这件事没有可乘之处。
- */
-private const val MAX_LOGIN_BODY_BYTES = 32L * 1024
-
-/**
- * 「请求体超限」要能和「JSON 不合法」区分开。
- *
- * 它俩在 StatusPages 里都映射成 400，但**经由 bodyObject 的路由会先把它吞掉**：
- * bodyObject 对任何异常都返回 null，调用方于是回「请填写口令」或「missing keyword」。
- * 实测：40KB 的登录体（上限 32KB）得到的是 `{"error":"请填写口令"}` —— 状态码没错，
- * 但排查的人会去检查表单，而真正的问题是他发了 40KB。
- * 所以用一个专门类型标记它，bodyObject 见到就原样抛出（TooDeep 同理）。
- */
-private class RequestTooLarge(message: String) : IllegalArgumentException(message)
-
-private suspend fun bodyField(call: ApplicationCall, field: String): String? =
-    bodyObject(call)?.stringField(field)
-
-private suspend fun bodyObject(call: ApplicationCall, maxBytes: Long = MAX_BODY_BYTES): JsonObject? = try {
-    prettyJson.parseToJsonElement(call.receiveCappedText(maxBytes)).jsonObject
-} catch (e: RequestTooLarge) {
-    // 这两类「内容坏/太大」的结论必须原样传出去，不能伪装成「缺字段」
-    throw e
-} catch (e: JsonGuard.TooDeep) {
-    throw e
-} catch (e: Exception) {
-    null
-}
-
-/**
- * 取字符串字段。
- *
- * 两个坑都要避开：
- *  - `jsonPrimitive` 是强转，`{"url":{"a":1}}` 会抛 IllegalArgumentException，
- *    而它发生在 bodyObject 的 try 之外，于是一个形状奇怪的请求体变成 500；
- *  - `contentOrNull` 对**任何** primitive 都给得出文本，`{"url":true}` 会变成
- *    字符串 "true"，接着被 UrlGuard 判成「不允许的目标地址」回 400/403 ——
- *    把类型错误伪装成安全拒绝，排查时完全看不出是请求体写错了。
- * 所以：只接受字符串，其它一律当作缺字段（调用方本来就有缺失分支会给 400）。
- */
-private fun JsonObject.stringField(key: String): String? =
-    (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
-
-/**
- * 严格取字符串数组：不是数组、或数组里含非字符串项，都整字段判错。
- *
- * 旧写法 `get(key)?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }` 有两处不成立：
- *  - `jsonArray` 对对象是强转（虽然 IllegalArgumentException 会被兜底成 400，但那是巧合，
- *    不是这一行的设计意图）；
- *  - `contentOrNull` 对**数字**也给出文本，于是 `{"names":[1,2]}` 变成两个「源名」，
- *    导入一条都没匹配上却回 200 —— 类型错误被伪装成一次成功但空的结果。
- * 半收半丢同样糟：`["订阅甲",{"bad":1}]` 只导入一条却报成功，用户看不出少了东西。
- */
-private fun JsonObject.stringArrayField(key: String): List<String> {
-    val node = this[key] ?: return emptyList()
-    if (node is JsonNull) return emptyList()
-    val items = node as? JsonArray ?: throw IllegalArgumentException("$key 必须是字符串数组")
-    return items.map {
-        (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content
-            ?: throw IllegalArgumentException("$key 只能包含字符串")
-    }
-}
-
-private suspend fun ApplicationCall.receiveCappedText(maxBytes: Long = MAX_BODY_BYTES): String {
-    // 先看 Content-Length 挡掉老实的超大请求，再逐块累加，防止 chunked 传输谎报长度
-    val declared = request.contentLength()
-    if (declared != null && declared > maxBytes) {
-        throw RequestTooLarge("请求体超过 ${maxBytes / 1024}KB 上限")
-    }
-    val channel = request.receiveChannel()
-    val out = ByteArrayOutputStream()
-    val chunk = ByteArray(64 * 1024)
-    var total = 0L
-    while (true) {
-        val n = channel.readAvailable(chunk)
-        if (n == -1) break
-        total += n
-        if (total > maxBytes) throw RequestTooLarge("请求体超过 ${maxBytes / 1024}KB 上限")
-        out.write(chunk, 0, n)
-    }
-    val text = String(out.toByteArray(), Charsets.UTF_8)
-    // 体积上限挡不住「400KB 的一把左括号」：那种递归解析会打穿栈。
-    // 不能只指望下游接得住：catch (Exception) 接不住 Error，而 runCatching 接得住
-    // 却会把合法 JSON 判成坏文件搬走（两种后果都不是「这个请求被拒绝了」）。
-    // 详见 JsonGuard 的类注释。
-    JsonGuard.requireShallow(text)
-    return text
 }

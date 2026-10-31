@@ -32,14 +32,23 @@ export class ApiError extends Error {
  * 没有它，一个半开连接会让数据层的 PUT 永远停在「保存中」，后续写入全部排队。
  */
 const REQUEST_TIMEOUT_MS = 60_000
+const activeRequests = new Set<AbortController>()
 
-/** 发请求并统一处理错误。拆成一层是因为 /api/data 还需要读响应头（ETag）。 */
-async function send(path: string, init?: RequestInit): Promise<Response> {
+/** 确认切换或撤销会话时中止旧请求，迟到的 401 不得踢掉新会话。 */
+export function invalidateApiSession(): void {
+  const previous = [...activeRequests]
+  previous.forEach((controller) => activeRequests.delete(controller))
+  previous.forEach((controller) => controller.abort(new DOMException('会话已切换', 'AbortError')))
+}
+
+/** fetch、错误正文和成功正文共用一个期限；读完正文才释放取消监听。 */
+async function send<T>(path: string, consume: (resp: Response) => Promise<T>, init?: RequestInit): Promise<T> {
   const controller = new AbortController()
+  activeRequests.add(controller)
   const outer = init?.signal ?? undefined
-  const onOuterAbort = () => controller.abort()
+  const onOuterAbort = () => controller.abort(outer?.reason)
   if (outer) {
-    if (outer.aborted) controller.abort()
+    if (outer.aborted) onOuterAbort()
     else outer.addEventListener('abort', onOuterAbort, { once: true })
   }
   let timedOut = false
@@ -47,47 +56,45 @@ async function send(path: string, init?: RequestInit): Promise<Response> {
     timedOut = true
     controller.abort()
   }, REQUEST_TIMEOUT_MS)
-  let resp: Response
   try {
-    resp = await fetch(path, {
+    const resp = await fetch(path, {
       ...init,
       signal: controller.signal,
-      // init.headers 合进来而不是覆盖
       headers: { 'Content-Type': 'application/json', ...init?.headers },
     })
+    if (!resp.ok) {
+      let message = `${resp.status} ${resp.statusText}`
+      let code = ''
+      try {
+        const body = await resp.json()
+        if (body?.error) {
+          code = String(body.error)
+          message = `${resp.status} ${body.error}`
+        }
+      } catch {
+        // 非 JSON 错误响应仍保留 HTTP 状态；取消不能降级成业务错误。
+      }
+      controller.signal.throwIfAborted()
+      if (resp.status === 401 && path !== LOGIN_PATH) {
+        window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+      }
+      throw new ApiError(resp.status, message, code)
+    }
+    const result = await consume(resp)
+    controller.signal.throwIfAborted()
+    return result
   } catch (e) {
     if (timedOut) throw new Error(`请求超时（${REQUEST_TIMEOUT_MS / 1000} 秒），请检查网络或稍后重试`)
     throw e
   } finally {
+    activeRequests.delete(controller)
     clearTimeout(timer)
     outer?.removeEventListener('abort', onOuterAbort)
   }
-  if (!resp.ok) {
-    let message = `${resp.status} ${resp.statusText}`
-    let code = ''
-    try {
-      const body = await resp.json()
-      // 服务端对未预期异常只回 INTERNAL_ERROR（细节进服务端日志），
-      // 所以这里必须保留状态码，否则用户报障时没有任何可定位信息
-      if (body?.error) {
-        code = String(body.error)
-        message = `${resp.status} ${body.error}`
-      }
-    } catch {
-      // 非 JSON 错误响应
-    }
-    // 会话在服务端过期（30 天不用 / 重启容器 / 点了注销）后，任何请求都会撞上 401。
-    // 这里广播一次，让外层把界面切回登录页，而不是让用户对着「点了没反应」发呆。
-    if (resp.status === 401 && path !== LOGIN_PATH) {
-      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
-    }
-    throw new ApiError(resp.status, message, code)
-  }
-  return resp
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  return (await send(path, init)).json() as T
+  return send(path, (resp) => resp.json() as Promise<T>, init)
 }
 
 /** ETag 在 HTTP 上是带引号的字符串，比较前先脱引号（弱标记 W/ 也一起去掉）。 */
@@ -110,91 +117,100 @@ export const UNAUTHORIZED_EVENT = 'animeko-unauthorized'
 const LOGIN_PATH = '/api/session/login'
 
 export const api = {
-  health: () =>
+  health: (signal?: AbortSignal) =>
     request<{ status: string; version: string; authEnabled: boolean; authenticated: boolean }>(
       '/api/health',
+      { signal },
     ),
 
   // ---- 登录会话 ----
-  login: (username: string, password: string) =>
+  login: (username: string, password: string, signal?: AbortSignal) =>
     request<{ authenticated: boolean; user: string }>(LOGIN_PATH, {
       method: 'POST',
       body: JSON.stringify({ username, password }),
+      signal,
     }),
-  logout: () => request<{ authenticated: boolean }>('/api/session/logout', { method: 'POST' }),
+  logout: (signal?: AbortSignal) => request<{ authenticated: boolean }>('/api/session/logout', { method: 'POST', signal }),
 
   // ---- 个人数据（收藏 / 历史 / 进度，存服务端）----
   /**
    * 读文档并拿到版本指纹。
    * 一定要 ETag：PUT 是整份覆盖，没有基准的话，另一个标签页/设备的改动会被静默吃掉。
    */
-  loadDataWithEtag: async (): Promise<{ doc: UserData; etag: string }> => {
+  loadDataWithEtag: async (signal?: AbortSignal): Promise<{ doc: UserData; etag: string }> => {
     // no-store 两头都要写：服务端已经发了这个 Cache-Control，但老镜像还没重建时，
     // 浏览器自己的启发式缓存仍可能把上一个账号的收藏喂回来。
-    const resp = await send('/api/data', { cache: 'no-store' })
-    const text = await resp.text()
-    let doc: UserData = {}
-    if (text.trim()) {
-      const parsed = JSON.parse(text) as unknown
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) doc = parsed as UserData
-    }
-    return { doc, etag: unquote(resp.headers.get('ETag')) }
+    return send('/api/data', async (resp) => {
+      const text = await resp.text()
+      let doc: UserData = {}
+      if (text.trim()) {
+        const parsed = JSON.parse(text) as unknown
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) doc = parsed as UserData
+      }
+      return { doc, etag: unquote(resp.headers.get('ETag')) }
+    }, { cache: 'no-store', signal })
   },
   /**
    * 条件写。返回服务端新版本与落盘字节数；版本不符时服务端回 409 DATA_STALE。
    * bytes 不是装饰：服务端有 512KB 的文档上限，撞上之后每次保存都是 400，
    * 而「收藏点不动」这种症状没人会想到是满了 —— 所以要提前说。
    */
-  saveData: async (doc: unknown, etag: string): Promise<{ etag: string; bytes: number }> => {
-    const resp = await send('/api/data', {
+  saveData: async (doc: unknown, etag: string, signal?: AbortSignal): Promise<{ etag: string; bytes: number }> => {
+    return send('/api/data', async (resp) => {
+      let bytes = 0
+      try {
+        const body = (await resp.json()) as { bytes?: number }
+        bytes = typeof body?.bytes === 'number' ? body.bytes : 0
+      } catch (e) {
+        // 仅兼容旧服务端的空/非 JSON 正文；传输失败不能确认本次提交。
+        if (!(e instanceof SyntaxError)) throw e
+      }
+      return { etag: unquote(resp.headers.get('ETag')), bytes }
+    }, {
       method: 'PUT',
       body: JSON.stringify(doc),
       headers: etag ? { 'If-Match': `"${etag}"` } : undefined,
+      signal,
     })
-    let bytes = 0
-    try {
-      const body = (await resp.json()) as { bytes?: number }
-      bytes = typeof body?.bytes === 'number' ? body.bytes : 0
-    } catch {
-      // 老服务端不回 bytes：不能因此把一次成功的写入当成失败
-    }
-    return { etag: unquote(resp.headers.get('ETag')), bytes }
   },
 
   // ---- Bangumi ----
   searchBangumi: (q: string, signal?: AbortSignal) =>
     request<BgmSubject[]>(`/api/bangumi/search?q=${encodeURIComponent(q)}`, { signal }),
-  bangumiSubject: (id: number) => request<BgmSubject>(`/api/bangumi/subjects/${id}`),
+  bangumiSubject: (id: number, signal?: AbortSignal) => request<BgmSubject>(`/api/bangumi/subjects/${id}`, { signal }),
   /** 排行榜（发现页）。镜像同样支持该端点，因为它走的是 /v0/subjects */
   bangumiRanking: (offset: number, limit = 24, signal?: AbortSignal) =>
     request<BgmSubjectPage>(`/api/bangumi/ranking?offset=${offset}&limit=${limit}`, { signal }),
   /** 每日放送表。镜像部署下会上游 502，调用方按可选功能处理（拉不到就不显示） */
   bangumiCalendar: (signal?: AbortSignal) =>
     request<BgmCalendarDay[]>(`/api/bangumi/calendar`, { signal }),
-  bangumiChannel: () => request<BgmChannelInfo>('/api/bangumi/channel'),
-  setBangumiChannel: (channel: BgmChannelKind, customUrls: string[]) =>
+  bangumiChannel: (signal?: AbortSignal) => request<BgmChannelInfo>('/api/bangumi/channel', { signal }),
+  setBangumiChannel: (channel: BgmChannelKind, customUrls: string[], signal?: AbortSignal) =>
     request<BgmChannelInfo>('/api/bangumi/channel', {
       method: 'PUT',
       body: JSON.stringify({ channel, customUrls }),
+      signal,
     }),
-  probeBangumiChannel: (target?: { channel: BgmChannelKind; customUrls: string[] }) =>
+  probeBangumiChannel: (target?: { channel: BgmChannelKind; customUrls: string[] }, signal?: AbortSignal) =>
     request<BgmProbeResult[]>('/api/bangumi/channel/probe', {
       method: 'POST',
       body: JSON.stringify(target ?? {}),
+      signal,
     }),
 
   // ---- 数据源 ----
-  sources: () => request<StoredSource[]>('/api/selector/sources'),
-  importSource: (json: string) =>
-    request<StoredSource['arguments']>('/api/selector/sources', { method: 'POST', body: json }),
-  deleteSource: (name: string) =>
+  sources: (signal?: AbortSignal) => request<StoredSource[]>('/api/selector/sources', { signal }),
+  importSource: (json: string, signal?: AbortSignal) =>
+    request<StoredSource['arguments']>('/api/selector/sources', { method: 'POST', body: json, signal }),
+  deleteSource: (name: string, signal?: AbortSignal) =>
     request<{ deleted: string }>(`/api/selector/sources/${encodeURIComponent(name)}`, {
       method: 'DELETE',
+      signal,
     }),
-  setSourceEnabled: (name: string, enabled: boolean) =>
+  setSourceEnabled: (name: string, enabled: boolean, signal?: AbortSignal) =>
     request<{ name: string; enabled: boolean }>(
       `/api/selector/sources/${encodeURIComponent(name)}/enable`,
-      { method: 'POST', body: JSON.stringify({ enabled }) },
+      { method: 'POST', body: JSON.stringify({ enabled }), signal },
     ),
   sourceSearch: (name: string, keyword: string, signal?: AbortSignal) =>
     request<SubjectHit[]>(`/api/selector/sources/${encodeURIComponent(name)}/search`, {
@@ -202,27 +218,31 @@ export const api = {
       body: JSON.stringify({ keyword }),
       signal,
     }),
-  sourceEpisodes: (name: string, subjectUrl: string) =>
+  sourceEpisodes: (name: string, subjectUrl: string, signal?: AbortSignal) =>
     request<EpisodesResult>(`/api/selector/sources/${encodeURIComponent(name)}/episodes`, {
       method: 'POST',
       body: JSON.stringify({ subjectUrl }),
+      signal,
     }),
-  resolveVideo: (name: string, playUrl: string) =>
+  resolveVideo: (name: string, playUrl: string, signal?: AbortSignal) =>
     request<VideoSource>(`/api/selector/sources/${encodeURIComponent(name)}/video`, {
       method: 'POST',
       body: JSON.stringify({ playUrl }),
+      signal,
     }),
 
   // ---- 聚合订阅：先预览、勾选后再导入 ----
-  previewSubscription: (input: { url?: string; text?: string }) =>
+  previewSubscription: (input: { url?: string; text?: string }, signal?: AbortSignal) =>
     request<SubscriptionPreview>('/api/selector/subscriptions/preview', {
       method: 'POST',
       body: JSON.stringify(input),
+      signal,
     }),
-  importSubscription: (input: { url?: string; text?: string; names: string[]; fingerprint?: string }) =>
+  importSubscription: (input: { url?: string; text?: string; names: string[]; fingerprint?: string }, signal?: AbortSignal) =>
     request<SubscriptionImport>('/api/selector/subscriptions/import', {
       method: 'POST',
       body: JSON.stringify(input),
+      signal,
     }),
 
 }

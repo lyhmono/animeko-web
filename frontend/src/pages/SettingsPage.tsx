@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, errMsg } from '../api'
 import BangumiChannelCard from '../components/BangumiChannelCard'
 import {
@@ -30,6 +30,9 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false)
   /** 备份/恢复的结果提示（成功与失败共用一条，避免两套状态） */
   const [backupMsg, setBackupMsg] = useState('')
+  const [importing, setImporting] = useState(false)
+  const importInputRef = useRef<HTMLInputElement>(null)
+  const importInFlight = useRef(false)
 
   useEffect(() => onSyncChange(setSync), [])
 
@@ -85,13 +88,15 @@ export default function SettingsPage() {
   }
 
   const doImport = async (file: File | undefined) => {
-    if (!file) return
+    if (!file || !isUserDataLoaded() || importInFlight.current) return
     // 上限只是防呆：备份是纯文本，几千条收藏也就几百 KB。
     // 没有上限时选错一个大文件会把主线程卡在 JSON.parse 上。
     if (file.size > 10 * 1024 * 1024) {
       setBackupMsg('导入失败：文件超过 10MB，多半不是备份文件')
       return
     }
+    importInFlight.current = true
+    setImporting(true)
     setBackupMsg('导入中…')
     try {
       const summary = importUserData(await file.text())
@@ -113,6 +118,9 @@ export default function SettingsPage() {
       setBackupMsg(parts.length > 0 ? `已合并：${parts.join('、')}${tail}` : `备份里没有比本地更新的数据${tail}`)
     } catch (e) {
       setBackupMsg(`导入失败：${e instanceof Error ? e.message : '未知错误'}`)
+    } finally {
+      importInFlight.current = false
+      setImporting(false)
     }
   }
 
@@ -210,23 +218,27 @@ export default function SettingsPage() {
           >
             导出备份
           </button>
-          <label
+          <button
+            type="button"
             className="btn btn-secondary btn-sm"
-            style={{ cursor: isUserDataLoaded() ? 'pointer' : 'not-allowed', opacity: isUserDataLoaded() ? 1 : 0.5 }}
+            disabled={!isUserDataLoaded() || importing}
+            onClick={() => importInputRef.current?.click()}
           >
-            导入备份
-            <input
-              type="file"
-              accept=".json,application/json"
-              style={{ display: 'none' }}
-              onChange={(e) => {
-                // 先取出文件再清空 value：不清的话选同一个文件第二次不触发 change
-                const file = e.target.files?.[0]
-                e.target.value = ''
-                void doImport(file)
-              }}
-            />
-          </label>
+            {importing ? '导入中…' : '导入备份'}
+          </button>
+          <input
+            ref={importInputRef}
+            type="file"
+            accept=".json,application/json"
+            hidden
+            disabled={!isUserDataLoaded() || importing}
+            onChange={(e) => {
+              // 清空后可再次选择同一份文件。
+              const file = e.target.files?.[0]
+              e.target.value = ''
+              void doImport(file)
+            }}
+          />
         </div>
         {backupMsg && (
           <div

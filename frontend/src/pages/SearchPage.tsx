@@ -1,16 +1,18 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import Poster from '../components/Poster'
 import { api, errMsg } from '../api'
 import type { BgmSubject, SubjectHit } from '../types'
 import { addSearchHistory, favoriteIdSet, onDocChange } from '../lib/storage'
 import { IconHeartFilled, IconRefresh } from '../lib/icons'
+import { getSourceRevision, onSourcesChanged } from '../lib/sourceEvents'
 
 /**
  * 同时向多少个数据源发搜索请求。浏览器对同一来源只有 6 条连接，
  * 全占满之后连 /api/health 都要排队等超时（实测会让整个应用卡在启动页）。
  */
 const SOURCE_SEARCH_CONCURRENCY = 3
+const RESULT_BATCH = 20
 
 /**
  * 最近搜索的结果记忆。
@@ -22,6 +24,8 @@ const SOURCE_SEARCH_CONCURRENCY = 3
  * 嫌旧就点标题旁的刷新按钮，那会跳过缓存重新拉。
  */
 interface SearchSnapshot {
+  sourceRevision: number
+  sourceLimits: Record<string, number>
   bgm: BgmSubject[]
   /** 失败也要记进缓存：否则返回搜索页时错误消失，变成一句「无 Bangumi 结果」 */
   bgmError: string
@@ -53,6 +57,11 @@ export default function SearchPage() {
    *  缓存里已经没有它，自然就走正常搜索路径。比「跳过缓存」的布尔标志干净：
    *  少一个需要在 effect 里消费的隐式状态。 */
   const [runId, setRunId] = useState(0)
+  const [sourceRevision, setSourceRevision] = useState(getSourceRevision)
+  const [sourceLimits, setSourceLimits] = useState<Record<string, number>>({})
+  const sourceLimitsRef = useRef<Record<string, number>>({})
+
+  useEffect(() => onSourcesChanged(setSourceRevision), [])
 
   useEffect(
     () =>
@@ -70,7 +79,10 @@ export default function SearchPage() {
     // 换关键词/离开页面时把在飞的请求掐掉：光靠 cancelled 只是不采用结果，
     // 请求还占着那条连接，下一个页面的首屏请求就得排队等它超时
     const ctrl = new AbortController()
+    const current = () => !cancelled && !ctrl.signal.aborted && sourceRevision === getSourceRevision()
     if (!q) {
+      sourceLimitsRef.current = {}
+      setSourceLimits({})
       // 无关键词（直接打开 /search 或清空搜索词）：清空结果与加载态，避免骨架屏常驻
       setBgm([])
       setBgmError('')
@@ -85,7 +97,9 @@ export default function SearchPage() {
     // 缓存命中（典型路径：条目页 → 返回）：直接恢复上一轮的结果，
     // 一个请求都不发。骨架屏不重来、已看到的源结果原样还在。
     const cached = searchCache.get(q)
-    if (cached) {
+    if (cached && cached.sourceRevision === sourceRevision) {
+      sourceLimitsRef.current = cached.sourceLimits
+      setSourceLimits(cached.sourceLimits)
       // 收藏角标也必须刷新：缓存路径以前直接 return，用户在条目页点了收藏
       // 再返回时，卡片上的心形还停留在上一轮，看着像「收藏没生效」
       setFavIds(favoriteIdSet())
@@ -100,6 +114,8 @@ export default function SearchPage() {
       return
     }
     addSearchHistory(q)
+    sourceLimitsRef.current = {}
+    setSourceLimits({})
     setFavIds(favoriteIdSet())
     // 每次搜索都重置错误与上一轮结果，避免旧结果/旧错误残留
     setBgm([])
@@ -130,8 +146,10 @@ export default function SearchPage() {
     // 这种情形宁可让返回时重新搜一遍。
     let sourcesListFailed = false
     const remember = () => {
-      if (cancelled || !bgmDone || !sourcesDone || sourcesListFailed) return
+      if (!current() || !bgmDone || !sourcesDone || sourcesListFailed) return
       searchCache.set(q, {
+        sourceRevision,
+        sourceLimits: sourceLimitsRef.current,
         bgm: bgmSnapshot,
         bgmError: bgmErrSnapshot,
         sourceHits: hitsAcc,
@@ -147,28 +165,28 @@ export default function SearchPage() {
     api
       .searchBangumi(q, ctrl.signal)
       .then((r) => {
-        if (!cancelled) {
+        if (current()) {
           bgmSnapshot = r
           setBgm(r)
         }
       })
       .catch((e) => {
-        if (!cancelled) {
+        if (current()) {
           bgmErrSnapshot = errMsg(e)
           setBgmError(bgmErrSnapshot)
         }
       })
       .finally(() => {
-        if (cancelled) return
+        if (!current()) return
         setBgmLoading(false)
         bgmDone = true
         remember()
       })
 
     api
-      .sources()
+      .sources(ctrl.signal)
       .then(async (list) => {
-        if (cancelled) return
+        if (!current()) return
         const enabled = list.filter((s) => s.enabled)
         namesAcc = list.map((s) => ({ name: s.arguments.name, enabled: s.enabled }))
         setSources(enabled.map((s) => ({ name: s.arguments.name })))
@@ -181,17 +199,17 @@ export default function SearchPage() {
         // 重新打开标签页时整个应用卡在「正在连接服务器…」。
         let next = 0
         const worker = async () => {
-          while (next < enabled.length) {
+          while (current() && next < enabled.length) {
             const s = enabled[next++]
             const name = s.arguments.name
             try {
               const hits = await api.sourceSearch(name, q, ctrl.signal)
-              if (!cancelled) {
+              if (current()) {
                 hitsAcc = { ...hitsAcc, [name]: hits }
                 setSourceHits(hitsAcc)
               }
             } catch (e) {
-              if (!cancelled) {
+              if (current()) {
                 errorsAcc = { ...errorsAcc, [name]: errMsg(e) }
                 setSourceErrors(errorsAcc)
               }
@@ -201,16 +219,16 @@ export default function SearchPage() {
         await Promise.all(
           Array.from({ length: Math.min(SOURCE_SEARCH_CONCURRENCY, enabled.length) }, worker),
         )
-        if (!cancelled) setSourcesLoading(false)
+        if (current()) setSourcesLoading(false)
       })
       .catch((e) => {
-        if (cancelled) return
+        if (!current()) return
         sourcesListFailed = true
         setSources([])
         setSourcesError(errMsg(e))
       })
       .finally(() => {
-        if (cancelled) return
+        if (!current()) return
         setSourcesLoading(false)
         sourcesDone = true
         remember()
@@ -219,7 +237,15 @@ export default function SearchPage() {
       cancelled = true
       ctrl.abort()
     }
-  }, [q, runId])
+  }, [q, runId, sourceRevision])
+
+  const showMore = (name: string) => {
+    const next = { ...sourceLimitsRef.current, [name]: (sourceLimitsRef.current[name] ?? RESULT_BATCH) + RESULT_BATCH }
+    sourceLimitsRef.current = next
+    setSourceLimits(next)
+    const cached = searchCache.get(q)
+    if (cached?.sourceRevision === sourceRevision) searchCache.set(q, { ...cached, sourceLimits: next })
+  }
 
   const sourceDetailHref = (source: string, name: string, url: string, cover: string) =>
     `/source/${encodeURIComponent(source)}?url=${encodeURIComponent(url)}&title=${encodeURIComponent(name)}&cover=${encodeURIComponent(cover)}`
@@ -366,20 +392,22 @@ export default function SearchPage() {
       )}
       {ranked.order.map((name) => {
         const hits = sourceHits[name] ?? []
+        const shown = hits.slice(0, sourceLimits[name] ?? RESULT_BATCH)
+        const listId = `source-hits-${encodeURIComponent(name)}`
         const pending = !(name in sourceHits) && !(name in sourceErrors)
         return (
           <div key={name} style={{ marginBottom: 18 }}>
             <div style={{ fontSize: 14, marginBottom: 8, color: 'var(--text-secondary)' }}>
               {name}
               <span className="count" style={{ marginLeft: 8, fontSize: 12 }}>
-                {pending ? '搜索中…' : `${hits.length} 个结果`}
+                {pending ? '搜索中…' : `已显示 ${shown.length} / ${hits.length} 个结果`}
               </span>
             </div>
             {/* 有封面就排成卡片，没有就退回紧凑列表：
                 不同源的条目格式差别很大（CSS / JsonPath），不能假定都有图 */}
             {!pending && (hitsWithCovers(name) ? (
-              <div className="result-grid">
-                {hits.slice(0, 20).map((hit) => (
+              <div className="result-grid" id={listId}>
+                {shown.map((hit) => (
                   <Link
                     key={hit.url}
                     className="subject-card"
@@ -403,8 +431,8 @@ export default function SearchPage() {
                 ))}
               </div>
             ) : (
-              <div className="hit-list">
-                {hits.slice(0, 20).map((hit) => (
+              <div className="hit-list" id={listId}>
+                {shown.map((hit) => (
                   <div className="hit-item" key={hit.url}>
                     <span className="name" title={hit.name}>
                       {hit.name}
@@ -416,6 +444,17 @@ export default function SearchPage() {
                 ))}
               </div>
             ))}
+            {!pending && shown.length < hits.length && (
+              <button
+                className="btn btn-secondary btn-sm"
+                aria-label={`${name}：显示更多结果`}
+                aria-controls={listId}
+                style={{ marginTop: 10 }}
+                onClick={() => showMore(name)}
+              >
+                显示更多（{shown.length} / {hits.length}）
+              </button>
+            )}
           </div>
         )
       })}

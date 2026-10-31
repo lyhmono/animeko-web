@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 端到端冒烟：登录门控 → 服务端个人数据 → 聚合订阅预览/导入 → 注销 → 限速 → 文件名字符集自检
-set -u
+set -uo pipefail
 cd "$(dirname "$0")/.."
+declare -a PIDS=()
 
 BIN=backend/build/install/animeko-web/bin/animeko-web
 DIST=$PWD/frontend/dist
@@ -35,7 +36,8 @@ start() { # dataDir port [nolang] [extraEnv...]
     ANIMEKO_PORT=$p ANIMEKO_HOST=127.0.0.1 ANIMEKO_FRONTEND_DIR=$DIST \
     ANIMEKO_SUBSCRIPTION_AUTO_IMPORT='' ANIMEKO_SEED_SUBSCRIPTION_URL='' \
     $pre $extra $BIN ) > "$d/server.log" 2>&1 &
-  echo $! > "$d/pid"
+  PIDS+=("$!")
+  printf '%s\n' "${PIDS[-1]}" > "$d/pid"
   for _ in $(seq 1 80); do
     curl -fsS -m 2 "http://127.0.0.1:$p/api/health" >/dev/null 2>&1 && break
     kill -0 "$(cat "$d/pid")" 2>/dev/null || break
@@ -49,7 +51,30 @@ start() { # dataDir port [nolang] [extraEnv...]
     echo "服务没起来：$p"; tail -20 "$d/server.log"; return 1; }
   return 0
 }
-stop() { kill "$(cat "$1/pid" 2>/dev/null)" 2>/dev/null; }
+stop() {
+  local pid owned=0
+  local -a keep=()
+  [ -f "$1/pid" ] || return 0
+  read -r pid < "$1/pid"
+  for active in "${PIDS[@]}"; do
+    if [ "$active" = "$pid" ]; then owned=1; else keep+=("$active"); fi
+  done
+  PIDS=("${keep[@]}")
+  if [ "$owned" = "1" ]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+}
+cleanup() {
+  for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
+  for pid in "${PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+  PIDS=()
+  if [ "${SMOKE_KEEP_LOGS:-0}" = "1" ]; then
+    printf '冒烟日志保留：%s\n' "$WORK"
+  else
+    rm -rf -- "$WORK"
+  fi
+}
 
 port_free() { # bash 的 /dev/tcp：连不上才是空的。
   # 不能用 curl /api/health 判 —— 别的 HTTP 服务回 404 时 curl 也失败，
@@ -93,14 +118,18 @@ require_fresh_build() {
   return 0
 }
 
-A=/tmp/animeko-live-a; B=/tmp/animeko-live-b
-rm -rf $A $B; mkdir -p $A $B
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/animeko-live.XXXXXX")
+A="$WORK/a"; B="$WORK/b"; C="$WORK/c"; E="$WORK/e"
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+mkdir -p "$A" "$B"
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 [ -x "$BIN" ] || { echo "没有 $BIN，先 gradle installDist"; exit 1; }
 require_fresh_build || exit 1
-start $A 18099 || exit 1
+start "$A" 18099 || exit 1
 JAR=$A/cookies.txt; BASE=http://127.0.0.1:18099
-trap "stop $A; stop $B" EXIT
+
 
 echo "== 1. 门控"
 H=$(curl -sS -m 5 "$BASE/api/health")
@@ -216,7 +245,7 @@ check "旧会话号不能当 Bearer 复用" "401" "$(curl -sS -o /dev/null -w '%
 check "Basic 口令依旧可用（给命令行/播放器）" "200" "$(curl -sS -o /dev/null -w '%{http_code}' -m 5 -u me:s3cret-pass "$BASE/api/selector/sources")"
 contains "会话号不进日志" 'NOLEAK' "$(grep -c "$SID" "$A/server.log" | sed 's/^0$/NOLEAK/')"
 
-echo "== 7. 限速：猜错的人要挡住，猜对的人不能被锁在门外"
+echo "== 7. 限速：超限后所有候选都不得继续验密"
 for _ in $(seq 1 8); do
   curl -sS -o /dev/null -m 5 -X POST "$BASE/api/session/login" -d '{"username":"me","password":"bad"}'
 done
@@ -224,14 +253,10 @@ done
 RESP=$(curl -sS -D "$A/429.txt" -o /dev/null -w '%{http_code}' -m 5 -X POST "$BASE/api/session/login" -d '{"username":"me","password":"bad"}')
 check "连错 8 次后再猜错是 429 而不是 401" "429" "$RESP"
 contains "429 带 Retry-After" 'Retry-After' "$(tr -d '\r' < "$A/429.txt")"
-# 超限期间**猜对**必须登录成功。原先这一格也是 429，那是能把机主永久锁在自己家门外：
-# 会话只存内存，容器一重启就只能重新走登录页，而反代没申报 ANIMEKO_TRUSTED_PROXY_HOPS 时
-# 全站共用同一个限速键，任何匿名访客都能反复占住这条路。拦猜测靠的是「猜错不计入窗口」
-# 那一格（上面刚验过），不是把对的人也一起挡掉。
-check "超限期间正确口令仍可登录" "200" "$(curl -sS -o /dev/null -w '%{http_code}' -m 5 -X POST "$BASE/api/session/login" -d '{"username":"me","password":"s3cret-pass"}')"
-# 能重置计数器的只有「确实知道口令」的人：这次成功登录把账清了，
-# 于是再猜错回到 401，而不是继续吃 429（那是第 10 节在保护接口上验的同一件事）
-check "成功登录后重新计数：再猜错回到 401" "401" "$(curl -sS -o /dev/null -w '%{http_code}' -m 5 -X POST "$BASE/api/session/login" -d '{"username":"me","password":"bad"}')"
+# 不因候选真假改变超限响应，否则 429/200 仍是可连续查询的口令预言机。
+# 已登录随机会话另有豁免；正确的代理来源配置用于避免共享限流桶。
+check "超限期间正确候选也不被验证" "429" "$(curl -sS -o /dev/null -w '%{http_code}' -m 5 -X POST "$BASE/api/session/login" -d '{"username":"me","password":"s3cret-pass"}')"
+check "超限期间再次猜测仍被拒" "429" "$(curl -sS -o /dev/null -w '%{http_code}' -m 5 -X POST "$BASE/api/session/login" -d '{"username":"me","password":"bad"}')"
 
 echo "== 8. 文件名字符集自检（LANG 被拿掉的第二个实例）"
 start $B 18098 nolang || exit 1
@@ -244,8 +269,7 @@ check "坏字符集下列表接口仍可用" "200" "$(curl -sS -b $JB -o /dev/nu
 stop $B
 
 echo "== 9. 门控与预言机（用一个干净的实例：限速表是进程内存，前面章节已经把 A 打到限速了）"
-C=/tmp/animeko-live-c
-rm -rf $C; mkdir -p $C
+mkdir -p "$C"
 start $C 18095 || exit 1
 CB=http://127.0.0.1:18095
 
@@ -269,10 +293,8 @@ contains "错误口令：健康检查说不" '"authenticated":false' "$(curl -sS
 contains "正确口令：健康检查也说不（只看会话 Cookie）" '"authenticated":false' "$(curl -sS -m5 -u me:s3cret-pass "$CB/api/health")"
 for i in $(seq 1 8); do curl -sS -o /dev/null -m5 -u me:guess$i "$CB/api/selector/sources"; done
 check "保护接口上的凭据猜测同样计入限速" "429" "$(curl -sS -o /dev/null -w '%{http_code}' -m5 -u me:guess9 "$CB/api/selector/sources")"
-# 超限期间**正确凭据必须还能用**。早先的顺序是先查 blocked() 再验证，于是连正确口令
-# 也吃 429：那挡不住攻击者（他没有正确口令），却能锁死合法用户 —— 限速键是来源 IP，
-# 反代没配 hops 时全站共用一把，任何人发 8 个错口令就能反复把整站挡在门外。
-check "超限期间正确凭据仍可访问（不被用来锁站）" "200" "$(curl -sS -o /dev/null -w '%{http_code}' -m5 -u me:s3cret-pass "$CB/api/selector/sources")"
+# Basic/Bearer 与登录接口共享原子验密预算，不能成为限流旁路。
+check "超限期间 Basic 候选也被拒绝验密" "429" "$(curl -sS -o /dev/null -w '%{http_code}' -m5 -u me:s3cret-pass "$CB/api/selector/sources")"
 check "限速期间会话 Cookie 照常可用" "200" "$(curl -sS -b "$C/j.txt" -o /dev/null -w '%{http_code}' -m5 "$CB/api/data")"
 
 echo "== 11. 质询弹窗只给用得上它的客户端"
@@ -289,7 +311,7 @@ contains "curl（无 Sec-Fetch-Mode）仍有质询" 'WWW-Authenticate' "$(printf
 
 echo "== 12. 个人数据是条件写，不是静默覆盖"
 ET=$(curl -sS -b "$C/j.txt" -D - -o /dev/null -m5 "$CB/api/data" | tr -d '\r' | grep -i '^etag' | sed 's/.*"\(.*\)".*/\1/')
-check "GET 给了 ETag" "32" "${#ET}"
+check "GET 给了 SHA-256 ETag" "64" "${#ET}"
 curl -sS -b "$C/j.txt" -o /dev/null -m5 -X PUT "$CB/api/data" -d '{"favorites":[{"id":1}]}'
 ET2=$(curl -sS -b "$C/j.txt" -D - -o /dev/null -m5 "$CB/api/data" | tr -d '\r' | grep -i '^etag' | sed 's/.*"\(.*\)".*/\1/')
 check "版本随写入前进" "1" "$([ "$ET" != "$ET2" ] && echo 1)"
@@ -300,8 +322,7 @@ stop $C
 
 echo "== 13. 开机自动导入订阅（compose 里默认打开的那条路径）"
 # 数据目录直接用一个全新子目录，重启时**不删**，这样才等价于「容器重启、卷还在」
-E=/tmp/animeko-live-e
-rm -rf $E; mkdir -p $E
+mkdir -p "$E"
 SUBENV="ANIMEKO_SUBSCRIPTION_AUTO_IMPORT=$SUB ANIMEKO_SUBSCRIPTION_AUTO_TIERS=0"
 start $E 18094 "" "$SUBENV" || exit 1
 EB=http://127.0.0.1:18094

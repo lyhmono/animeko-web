@@ -55,8 +55,20 @@ object SafeRegex {
         override fun toString(): String = text.toString()
     }
 
-    /** 编译失败（非法正则）返回 null：运行期与导入校验共用同一条路径 */
-    fun compile(pattern: String): Pattern? = runCatching { Pattern.compile(pattern) }.getOrNull()
+    private const val MAX_PATTERN_LENGTH = 500
+    private const val MAX_COMPILED_PATTERNS = 256
+    private val compiled = object : LinkedHashMap<String, Pattern?>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pattern?>): Boolean = size > MAX_COMPILED_PATTERNS
+    }
+
+    /** Only immutable Patterns are cached; each match still creates its own Matcher/Budget. */
+    fun compile(pattern: String): Pattern? {
+        if (pattern.length > MAX_PATTERN_LENGTH) return null
+        return synchronized(compiled) {
+            if (compiled.containsKey(pattern)) compiled[pattern]
+            else runCatching { Pattern.compile(pattern) }.getOrNull().also { compiled[pattern] = it }
+        }
+    }
 
     /** 等价于 `pattern.matcher(text).find()`，但回溯超出预算时按「没命中」返回 */
     fun contains(

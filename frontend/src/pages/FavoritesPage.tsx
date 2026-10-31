@@ -16,6 +16,14 @@ import Poster from '../components/Poster'
 import { IconHeart, IconSearch, IconTrash } from '../lib/icons'
 
 const STATUS_ORDER: FavStatus[] = ['watching', 'wish', 'onhold', 'done']
+const PAGE_SIZE = 24
+type FavoriteFilter = FavStatus | 'all'
+// 只保留浏览位置，不缓存收藏数据；返回时仍从当前个人文档读取。
+let retainedView: {
+  filter: FavoriteFilter
+  limits: Partial<Record<FavoriteFilter, number>>
+  sourceLimit: number
+} | undefined
 
 /**
  * 追番收藏页。
@@ -27,9 +35,12 @@ const STATUS_ORDER: FavStatus[] = ['watching', 'wish', 'onhold', 'done']
 export default function FavoritesPage() {
   const [favorites, setFavorites] = useState<FavoriteSubject[]>(listFavorites)
   const [sourceFavs, setSourceFavs] = useState<SourceFavorite[]>(listSourceFavorites)
-  const [filter, setFilter] = useState<FavStatus | 'all'>(() =>
-    listFavorites().some((f) => f.status === 'watching') ? 'watching' : 'all',
+  const [filter, setFilter] = useState<FavoriteFilter>(() =>
+    retainedView?.filter ?? (listFavorites().some((f) => f.status === 'watching') ? 'watching' : 'all'),
   )
+  const [limits, setLimits] = useState<Partial<Record<FavoriteFilter, number>>>(() => retainedView?.limits ?? {})
+  const [sourceLimit, setSourceLimit] = useState(() => retainedView?.sourceLimit ?? PAGE_SIZE)
+  useEffect(() => { retainedView = { filter, limits, sourceLimit } }, [filter, limits, sourceLimit])
 
   useEffect(
     () =>
@@ -54,6 +65,7 @@ export default function FavoritesPage() {
     () => (filter === 'all' ? favorites : favorites.filter((f) => f.status === filter)),
     [favorites, filter],
   )
+  const visibleLimit = limits[filter] ?? PAGE_SIZE
 
   const removeSource = useCallback((item: SourceFavorite) => {
     toggleSourceFavorite(item)
@@ -90,12 +102,12 @@ export default function FavoritesPage() {
         </div>
       ) : (
         <>
-          <div className="fav-tabs" role="tablist" aria-label="按追番状态筛选" data-testid="fav-tabs">
+          <div className="fav-tabs" role="group" aria-label="按追番状态筛选" data-testid="fav-tabs">
             <button
               className={`fav-tab${filter === 'all' ? ' active' : ''}`}
               onClick={() => setFilter('all')}
-              role="tab"
-              aria-selected={filter === 'all'}
+              type="button"
+              aria-pressed={filter === 'all'}
             >
               全部 <span className="count">{favorites.length}</span>
             </button>
@@ -104,8 +116,8 @@ export default function FavoritesPage() {
                 key={s}
                 className={`fav-tab${filter === s ? ' active' : ''}${counts[s] === 0 ? ' empty' : ''}`}
                 onClick={() => setFilter(s)}
-                role="tab"
-                aria-selected={filter === s}
+                type="button"
+                aria-pressed={filter === s}
               >
                 {FAV_STATUS_LABEL[s]} <span className="count">{counts[s]}</span>
               </button>
@@ -118,7 +130,7 @@ export default function FavoritesPage() {
             </div>
           ) : (
             <div className="fav-grid">
-              {visible.map((f) => (
+              {visible.slice(0, visibleLimit).map((f) => (
                 <div className="fav-card" key={f.id}>
                   <Link to={`/subject/${f.id}`} aria-label={f.name_cn || f.name}>
                     <Poster className="cover" src={f.cover} alt={f.name_cn || f.name} />
@@ -161,6 +173,22 @@ export default function FavoritesPage() {
               ))}
             </div>
           )}
+          {visible.length > 0 && (
+            <div className="fav-pagination">
+              <span>已显示 {Math.min(visibleLimit, visible.length)} / {visible.length}</span>
+              {visibleLimit < visible.length && (
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  aria-label="加载更多追番收藏"
+                  onClick={() => setLimits((previous) => ({
+                    ...previous,
+                    [filter]: Math.min(visible.length, (previous[filter] ?? PAGE_SIZE) + PAGE_SIZE),
+                  }))}
+                >加载更多</button>
+              )}
+            </div>
+          )}
         </>
       )}
 
@@ -181,36 +209,49 @@ export default function FavoritesPage() {
           在数据源搜索结果或剧集列表页点「收藏」，条目会记在这里（按 源 + 地址 计）。
         </div>
       ) : (
-        <div className="fav-grid">
-          {sourceFavs.map((f) => (
-            <div className="fav-card" key={`${f.source}|${f.url}`}>
-              <Link
-                to={`/source/${encodeURIComponent(f.source)}?url=${encodeURIComponent(f.url)}&title=${encodeURIComponent(f.name)}&cover=${encodeURIComponent(f.cover)}`}
-                aria-label={f.name}
-              >
-                <Poster className="cover" src={f.cover} alt={f.name} />
-              </Link>
-              <button
-                className="fav-remove"
-                onClick={() => removeSource(f)}
-                title="取消收藏"
-                aria-label="取消收藏"
-              >
-                <IconTrash size={14} />
-              </button>
-              <div className="info">
+        <>
+          <div className="fav-grid">
+            {sourceFavs.slice(0, sourceLimit).map((f) => (
+              <div className="fav-card" key={`${f.source}|${f.url}`}>
                 <Link
                   to={`/source/${encodeURIComponent(f.source)}?url=${encodeURIComponent(f.url)}&title=${encodeURIComponent(f.name)}&cover=${encodeURIComponent(f.cover)}`}
+                  aria-label={f.name}
                 >
-                  <div className="title">{f.name}</div>
+                  <Poster className="cover" src={f.cover} alt={f.name} />
                 </Link>
-                <div className="meta">
-                  <span className="count">{f.source}</span>
+                <button
+                  className="fav-remove"
+                  onClick={() => removeSource(f)}
+                  title="取消收藏"
+                  aria-label="取消收藏"
+                >
+                  <IconTrash size={14} />
+                </button>
+                <div className="info">
+                  <Link
+                    to={`/source/${encodeURIComponent(f.source)}?url=${encodeURIComponent(f.url)}&title=${encodeURIComponent(f.name)}&cover=${encodeURIComponent(f.cover)}`}
+                  >
+                    <div className="title">{f.name}</div>
+                  </Link>
+                  <div className="meta">
+                    <span className="count">{f.source}</span>
+                  </div>
                 </div>
               </div>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+          <div className="fav-pagination">
+            <span>已显示 {Math.min(sourceLimit, sourceFavs.length)} / {sourceFavs.length}</span>
+            {sourceLimit < sourceFavs.length && (
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                aria-label="加载更多数据源收藏"
+                onClick={() => setSourceLimit((previous) => Math.min(sourceFavs.length, previous + PAGE_SIZE))}
+              >加载更多</button>
+            )}
+          </div>
+        </>
       )}
     </div>
   )

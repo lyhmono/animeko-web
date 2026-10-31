@@ -7,6 +7,10 @@ import com.animeko.web.http.JsonGuard
 import com.animeko.web.http.UrlGuard
 import com.animeko.web.http.UpstreamException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -74,6 +78,7 @@ class SubscriptionService(
      * 允许直接贴正文：订阅站挂了 / 需要登录时，用户手上往往是一份导出的文件。
      */
     private suspend fun loadBody(url: String?, text: String?): String {
+        currentCoroutineContext().ensureActive()
         // U+FEFF 不是 isWhitespace：带 BOM 的导出文件会让 JSON 在 offset 0 直接失败，
         // 用户只看到「不是合法 JSON」。粘贴正文与 HTTP 响应两条分支都要剥掉它。
         val direct = text?.trim()?.removePrefix("\uFEFF").orEmpty()
@@ -85,7 +90,7 @@ class SubscriptionService(
         }
         var target = url?.trim().orEmpty()
         require(target.isNotEmpty()) { "需要提供订阅地址 url 或订阅正文 text" }
-        target = UrlGuard.requireAllowed(target, allowPrivateTargets)
+        target = withContext(REPOSITORY_IO) { UrlGuard.requireAllowed(target, allowPrivateTargets) }
 
         // 自己逐跳跟重定向：JdkFetcher 默认按 Redirect.NORMAL 自动跳，
         // 而 UrlGuard 只看得到第一跳 —— 302 指向 169.254.169.254 时
@@ -110,7 +115,9 @@ class SubscriptionService(
             if (location.isNullOrBlank()) throw UpstreamException("订阅返回 $result.status 但没有 Location")
             if (hops >= MAX_REDIRECTS) throw UpstreamException("订阅重定向次数过多")
             hops++
-            target = UrlGuard.requireAllowed(SelectorEngine.absUrl(target, location), allowPrivateTargets)
+            target = withContext(REPOSITORY_IO) {
+                UrlGuard.requireAllowed(SelectorEngine.absUrl(target, location), allowPrivateTargets)
+            }
         }
     }
 
@@ -139,18 +146,17 @@ class SubscriptionService(
                 appLog.warn("订阅 {} 没有匹配 tier={} 的数据源，跳过", SelectorEngine.urlForLog(url), tiers)
             }
             var ok = 0
-            val known = repo.list().associate { it.arguments.name to it.enabled }
             wanted.forEach { args ->
-                runCatching { repo.save(args, known[args.name] ?: true) }
-                    .onSuccess { ok++ }
-                    .onFailure {
-                        appLog.warn(
-                            "自动导入 {} 的「{}」失败：{}",
-                            SelectorEngine.urlForLog(url),
-                            args.name,
-                            it.message ?: it::class.simpleName,
-                        )
-                    }
+                currentCoroutineContext().ensureActive()
+                try {
+                    upsert(args)
+                    ok++
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    appLog.warn("自动导入 {} 的「{}」失败：{}", SelectorEngine.urlForLog(url), args.name,
+                        e.message ?: e::class.simpleName)
+                }
             }
             "$ok/${wanted.size}"
         } catch (e: CancellationException) {
@@ -170,7 +176,7 @@ class SubscriptionService(
     suspend fun preview(url: String?, text: String?, label: String = ""): PreviewResponse {
         val body = loadBody(url, text)
         val (items, rejected) = parse(body)
-        val known = repo.list().associateBy { it.arguments.name }
+        val known = withContext(REPOSITORY_IO) { repo.list().associateBy { it.arguments.name } }
         return PreviewResponse(
             // 订阅地址常把 token 放在查询串里；预览页会把它显示出来，截图/共享屏幕就是泄露。
             // urlForLog 只保留 scheme://host/path，足够让人认出是哪个订阅。
@@ -216,28 +222,32 @@ class SubscriptionService(
         val added = mutableListOf<String>()
         val updated = mutableListOf<String>()
         val failed = mutableListOf<String>()
-        for (name in names.map { it.trim() }.filter { it.isNotEmpty() }.distinct()) {
+        // Preview names are opaque identities. Trimming here could select a different entry.
+        for (name in names.filter { it.isNotEmpty() }.distinct()) {
+            currentCoroutineContext().ensureActive()
             val args = byName[name]
             if (args == null) {
                 failed += "$name（订阅里没有这一条）"
                 continue
             }
-            val existing = repo.find(name)
             try {
-                // 更新已有源时**沿用它的启停状态**：用户把某个源关掉，是明确判断过它不可用
-                // （死站，或者每个源都要等 20 秒超时的那个）。重新导入订阅是为了拿新内容/新源，
-                // 不该顺手把这个决定翻回去 —— 自动导入那条路径早就这样做了
-                // （autoImport 的 `known[args.name] ?: true`），手动挑源导入却漏了。
-                // 实测症状：停用 → 用订阅「更新」同一条 → 又变回启用，随后每次搜索都要
-                // 在那个死源上等超时，用户只看到「搜索变慢了」，联想不到是导入干的。
-                repo.save(args, existing?.enabled ?: true)
-                if (existing != null) updated += name else added += name
+                val result = upsert(args)
+                if (result.created) added += name else updated += name
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: IllegalArgumentException) {
                 failed += "$name（${e.message?.take(120) ?: "配置不合法"}）"
             }
         }
         return ImportResponse(added = added, updated = updated, failed = failed, rejected = rejected)
     }
+
+    /** Cancellation is checked between durable atomic commits; no per-entry directory scan. */
+    private suspend fun upsert(arguments: SelectorSourceArguments): SelectorRepository.UpsertResult =
+        withContext(REPOSITORY_IO) {
+            currentCoroutineContext().ensureActive()
+            repo.upsertPreservingEnabled(arguments)
+        }
 
     /**
      * 兼容三种形态：
@@ -246,7 +256,8 @@ class SubscriptionService(
      *  3. 单个源 / 裸 arguments（让「订阅」这一个入口也能导入单文件，前端不必分两条路）
      * 条目解析失败只丢那一条，整包不失败。
      */
-    private fun parse(body: String): Pair<List<SelectorSourceArguments>, List<String>> {
+    private suspend fun parse(body: String): Pair<List<SelectorSourceArguments>, List<String>> {
+        currentCoroutineContext().ensureActive()
         val root = try {
             // 订阅正文来自第三方：深度不检查的话，一份 `[[[[…` 会打穿栈，
             // 而 StackOverflowError 不是 Exception，下面这个 catch 接不住
@@ -278,11 +289,13 @@ class SubscriptionService(
         val overflow = elements.size - MAX_ENTRIES
         val considered = if (overflow > 0) elements.take(MAX_ENTRIES) else elements
         val items = mutableListOf<SelectorSourceArguments>()
+        val seenNames = mutableSetOf<String>()
         val rejected = mutableListOf<String>()
         if (overflow > 0) {
             rejected += "另有 $overflow 个数据源超出单次 ${MAX_ENTRIES} 个上限，未列出（可让订阅站拆分，或挑少量源单独导入）"
         }
         considered.forEachIndexed { index, el ->
+            if (index % 16 == 0) currentCoroutineContext().ensureActive()
             val args = decode(el)
             val label = args?.name?.takeIf { it.isNotBlank() } ?: "第 ${index + 1} 条（${shapeOf(el)}）"
             when {
@@ -291,7 +304,7 @@ class SubscriptionService(
                 // searchConfig 有默认值，所以「只有名字、没有搜索地址」的条目能解码成功，
                 // 但导进去就是一条永远搜不出东西的死源——在预览阶段就该被挑出来
                 args.searchConfig.searchUrl.isBlank() -> rejected += "$label：没有 searchUrl，无法搜索"
-                items.any { it.name == args.name } -> rejected += "${args.name}：订阅内重名，只保留先出现的那条"
+                !seenNames.add(args.name) -> rejected += "${args.name}：订阅内重名，只保留先出现的那条"
                 else -> items += args
             }
         }
@@ -343,6 +356,7 @@ class SubscriptionService(
     }
 
     private companion object {
+        private val REPOSITORY_IO = Dispatchers.IO.limitedParallelism(2)
         private const val MAX_SUBSCRIPTION_BYTES = 4L * 1024 * 1024
         private const val MAX_ENTRIES = 500
         private const val MAX_REDIRECTS = 5

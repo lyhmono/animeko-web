@@ -191,19 +191,18 @@ class GateHardeningTest {
             val r = client.get("/api/selector/sources") { header(HttpHeaders.Authorization, guess(i)) }
             assertEquals(HttpStatusCode.Unauthorized, r.status, "第 ${"$"}{i + 1} 次猜测")
         }
-        // 超出预算之后，错的猜测一律 429（不再回答对错，也就没有预言机）
+        // 契约更正（BAPP-01）：只有正确和错误候选统一 429 才真正消除 oracle。
         val blocked = client.get("/api/selector/sources") { header(HttpHeaders.Authorization, guess(9)) }
         assertEquals(HttpStatusCode.TooManyRequests, blocked.status)
         assertTrue(blocked.headers[HttpHeaders.RetryAfter]?.isNotBlank() == true, "429 要给 Retry-After")
-        // 但**正确的凭据必须照样能用**。原先的顺序是 blocked() 在验证之前，
-        // 于是超限期间连正确口令也吃 401/429：那挡不住攻击者（他没有正确口令），
-        // 却能让任何人凭 8 次错误尝试把合法用户锁在门外 —— 而限速键是来源 IP，
-        // 反代没配 hops 时全站共用一把，等于匿名可控地反复锁站。
+        // 尚无随机会话时，正确 Basic 也必须在比较前被拒绝。
         val legitimate = client.get("/api/selector/sources") { header(HttpHeaders.Authorization, basic) }
         assertEquals(
-            HttpStatusCode.OK, legitimate.status,
-            "超限期间把正确凭据也拒掉，就给了任何人一个锁站的开关：" + legitimate.bodyAsText(),
+            HttpStatusCode.TooManyRequests, legitimate.status,
+            "耗尽后继续回答正确 Basic 会保留字典判定入口：" + legitimate.bodyAsText(),
         )
+        assertEquals(blocked.bodyAsText(), legitimate.bodyAsText())
+        assertEquals(blocked.headers[HttpHeaders.RetryAfter], legitimate.headers[HttpHeaders.RetryAfter])
     }
 
     /**
@@ -271,10 +270,10 @@ class GateHardeningTest {
         // 受害者：带着缓存的 Basic 凭据正常访问一次，成功
         val victim = client.get("/api/selector/sources") { header(HttpHeaders.Authorization, basic) }
         assertEquals(HttpStatusCode.OK, victim.status)
-        // 攻击者继续猜。blocked() 是在验证凭据**之前**判的，所以第 8 次仍是 401、第 9 次才 429；
-        // 关键是这条曲线不能被一次成功认证重置回 0。
+        // 第八次许可用于成功 Basic；成功也消耗预算且不能清账。
+        // 下一个候选必须直接拒绝，不再进入验密。
         val eighth = client.get("/api/selector/sources") { header(HttpHeaders.Authorization, guess(8)) }
-        assertEquals(HttpStatusCode.Unauthorized, eighth.status, "第 8 次到界，但响应发生在记账之后")
+        assertEquals(HttpStatusCode.TooManyRequests, eighth.status, "成功验密也应占一个原子许可")
         val ninth = client.get("/api/selector/sources") { header(HttpHeaders.Authorization, guess(9)) }
         assertEquals(
             HttpStatusCode.TooManyRequests,

@@ -47,6 +47,8 @@ class UserDataStore(
      */
     class ReadFailed(message: String, cause: Throwable? = null) : Exception(message, cause)
 
+    private class StoredDocument(val bytes: ByteArray, val snapshot: Snapshot)
+
     /**
      * 一次读取。必须和写入共用同一把锁：坏文件在这里会被移走（*.bad），
      * 而并发的 write() 正在往同一个路径上 rename ——
@@ -54,22 +56,27 @@ class UserDataStore(
      */
     fun read(): Snapshot = synchronized(this) { readLocked() }
 
-    private fun readLocked(): Snapshot {
+    private fun readLocked(): Snapshot = readDocumentLocked()?.snapshot ?: EMPTY
+
+    private fun readDocumentLocked(): StoredDocument? {
         val bytes = readBytesStrict(file, "个人数据")
         if (bytes != null && bytes.isNotEmpty()) {
             val text = String(bytes, Charsets.UTF_8)
             val parsed = runCatching { json.parseToJsonElement(text) }.getOrNull()
-            if (parsed is JsonObject) return Snapshot(text, sha256Hex(bytes))
-            // 坏文件不能连带把整个页面打挂，也不能被下一次写入静默覆盖前先备份
+            if (parsed is JsonObject) return StoredDocument(bytes, Snapshot(text, sha256Hex(bytes)))
+            // 先保留损坏文件；隔离失败也不能发布一个伪造的空文档基准。
+            try {
+                Files.move(file, sib("bad"), StandardCopyOption.REPLACE_EXISTING)
+            } catch (e: IOException) {
+                throw ReadFailed("损坏的个人数据文件无法隔离：${ioReason(e)}（文件：$file）", e)
+            }
             appLog.error("个人数据文件不是合法 JSON，已备份为 *.bad")
-            runCatching { Files.move(file, sib("bad"), StandardCopyOption.REPLACE_EXISTING) }
         }
         // 主文件缺失、为空或已损坏：先试上一份备份。
         // 这一步不是锦上添花 —— .bak 一直在写却没人读，等于「备了份没人看的档案」：
         // 掉电/中断让主文件只剩半个，读侧就返回 {}，前端把它当空文档，
         // 用户下一次点收藏就把整份数据覆盖掉，而完好的一份就在同一个目录里。
-        restoreFromBackup()?.let { return it }
-        return EMPTY
+        return restoreFromBackup()
     }
 
     /**
@@ -95,14 +102,10 @@ class UserDataStore(
         }
     }
 
-    /** 备份存在且能解析成 JSON 对象时恢复它，否则 null。 */
-    private fun restoreFromBackup(): Snapshot? {
+    /** 缺失/损坏的备份可降级；存在但无法读取或提交的备份必须保留存储错误。 */
+    private fun restoreFromBackup(): StoredDocument? {
         val bak = sib("bak")
-        // .bak 是辅助资源：它自己读不出来（目录/锁定/权限）时降级为 warn，
-        // 不能把「主文件缺失 + 备份不可读」变成 API 永久 500。
-        val bytes = runCatching { readBytesStrict(bak, "个人数据备份") }
-            .onFailure { appLog.warn("个人数据备份读取失败，已忽略：{}", it.message ?: it::class.simpleName) }
-            .getOrNull()
+        val bytes = readBytesStrict(bak, "个人数据备份")
         if (bytes == null || bytes.isEmpty()) return null
         val text = String(bytes, Charsets.UTF_8)
         val parsed = runCatching { json.parseToJsonElement(text) }.getOrNull()
@@ -110,11 +113,30 @@ class UserDataStore(
             appLog.error("个人数据备份 *.bak 也不是合法 JSON，无法恢复")
             return null
         }
-        // 恢复回主文件用复制而不是移动：留着 .bak，恢复动作本身再被打断也还能再来一次
-        runCatching { Files.copy(bak, file, StandardCopyOption.REPLACE_EXISTING) }
-            .onFailure { appLog.warn("恢复 *.bak 到主文档失败，本次仍按空文档处理：{}", it.message) }
+        // 备份不挪走；先提交完整临时文件，成功后才能发布它的 ETag。
+        val tmp = sib("tmp")
+        try {
+            FileChannel.open(
+                tmp,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING,
+            ).use { ch ->
+                ch.writeFully(bytes)
+                ch.force(true)
+            }
+            try {
+                Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            } catch (e: AtomicMoveNotSupportedException) {
+                Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING)
+            }
+            syncDirOf(file)
+        } catch (e: IOException) {
+            runCatching { Files.deleteIfExists(tmp) }
+            throw ReadFailed("个人数据备份恢复失败：${ioReason(e)}（文件：$file）", e)
+        }
         appLog.warn("个人数据主文档不可用，已从 *.bak 恢复（{} 字节）", bytes.size)
-        return Snapshot(text, sha256Hex(bytes))
+        return StoredDocument(bytes, Snapshot(text, sha256Hex(bytes)))
     }
 
     /**
@@ -143,13 +165,15 @@ class UserDataStore(
             // 条件写必须和写入在同一个临界区里，否则「检查通过」和「覆盖落盘」
             // 之间还能挤进另一个写者，检查就只是装饰
             val current = try {
-                currentEtagLocked()
+                readDocumentLocked()
             } catch (e: ReadFailed) {
                 // 读取失败属于「这次写入无法建立版本基准」，映射为可诊断的 400 停止重试；
                 // 不能让它落到 500，否则前端会把它当瞬时故障每 5 秒重试下去。
-                throw IllegalArgumentException("个人数据无法读取，已停止写入：${e.message}", e)
+                throw IllegalArgumentException("个人数据无法写入：无法读取当前文档，已停止写入：${e.message}", e)
             }
-            if (!ifMatchAllows(ifMatch, current)) throw Stale()
+            if (!ifMatchAllows(ifMatch, current?.snapshot?.etag ?: EMPTY.etag)) throw Stale()
+            // 先验版本，再比较真实字节；不存在/空文件不能把首次 {} 创建短路掉。
+            if (current != null && current.bytes.contentEquals(bytes)) return current.snapshot
             val tmp = sib("tmp")
             try {
                 Files.createDirectories(file.parent)
@@ -207,12 +231,6 @@ class UserDataStore(
             .filterNot { it.startsWith("W/", ignoreCase = true) }
             .map { it.trim('"') }
             .any { it == currentEtag }
-    }
-
-    private fun currentEtagLocked(): String {
-        // 读取失败不能当成「空文档」：那会让一次条件写把读不出来的原文件覆盖掉。
-        val bytes = readBytesStrict(file, "个人数据")
-        return if (bytes == null || bytes.isEmpty()) EMPTY.etag else sha256Hex(bytes)
     }
 
 

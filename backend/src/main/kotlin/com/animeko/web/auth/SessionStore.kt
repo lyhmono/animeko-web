@@ -17,7 +17,7 @@ class SessionStore(
     private val now: () -> Long = { System.currentTimeMillis() },
 ) {
 
-    private class Entry(@Volatile var expiresAt: Long)
+    private class Entry(@Volatile var expiresAt: Long, var cookieRenewedAt: Long)
 
     private val sessions = ConcurrentHashMap<String, Entry>()
     private val random = SecureRandom()
@@ -25,7 +25,8 @@ class SessionStore(
     fun create(): String {
         purgeIfNeeded()
         val token = newToken()
-        sessions[token] = Entry(now() + ttlMs)
+        val nowMs = now()
+        sessions[token] = Entry(nowMs + ttlMs, nowMs)
         return token
     }
 
@@ -33,13 +34,28 @@ class SessionStore(
     fun isValid(token: String): Boolean {
         if (token.isEmpty()) return false
         val entry = sessions[token] ?: return false
-        val nowMs = now()
-        if (entry.expiresAt < nowMs) {
-            sessions.remove(token, entry)
-            return false
+        synchronized(entry) {
+            val nowMs = now()
+            if (entry.expiresAt <= nowMs) {
+                sessions.remove(token, entry)
+                return false
+            }
+            entry.expiresAt = maxOf(entry.expiresAt, nowMs + ttlMs)
+            return true
         }
-        entry.expiresAt = maxOf(entry.expiresAt, nowMs + ttlMs)
-        return true
+    }
+
+    /** 最多每日（短 TTL 时半个窗口）刷新一次浏览器 Cookie，而不是每个分片都发。 */
+    fun claimCookieRenewal(token: String): Boolean {
+        val entry = sessions[token] ?: return false
+        synchronized(entry) {
+            val nowMs = now()
+            if (entry.expiresAt <= nowMs) return false
+            val interval = minOf(ttlMs / 2, 24L * 60 * 60 * 1000).coerceAtLeast(1)
+            if (nowMs - entry.cookieRenewedAt < interval) return false
+            entry.cookieRenewedAt = nowMs
+            return true
+        }
     }
 
     fun invalidate(token: String) {
@@ -80,8 +96,8 @@ class SessionStore(
 }
 
 /**
- * 登录失败限速。公网 VPS 上扫描器几小时内就会来试口令，
- * 只靠口令强度不够，这里按客户端 IP 做固定窗口计数。
+ * 未验证的配置凭据限速：比较之前原子取得许可，成功/失败都消耗同一窗口预算。
+ * 已验证的随机会话由认证入口直接放行，不经过口令桶。
  */
 class LoginRateLimiter(
     private val maxAttempts: Int = DEFAULT_MAX_ATTEMPTS,
@@ -93,54 +109,58 @@ class LoginRateLimiter(
 
     private val buckets = ConcurrentHashMap<String, Bucket>()
 
+    /** 检查和记账是同一个临界区，不能用 blocked() + onFailure() 作许可。 */
+    @Synchronized
+    fun tryAcquire(key: String): Boolean {
+        val nowMs = now()
+        evictExpired(nowMs)
+        var bucket = buckets[key]
+        if (bucket != null && nowMs - bucket.windowStart >= windowMs) {
+            buckets.remove(key)
+            bucket = null
+        }
+        if (bucket == null) {
+            // 饱和时拒绝新来源，而不是淘汰仍受限的桶并重新开放其猜测预算。
+            if (buckets.size >= MAX_BUCKETS) return false
+            buckets[key] = Bucket(nowMs, 1)
+            return true
+        }
+        if (bucket.count >= maxAttempts) return false
+        bucket.count++
+        return true
+    }
+
     /** 该客户端当前是否被限流。 */
     fun blocked(key: String): Boolean {
         val nowMs = now()
         val bucket = buckets[key] ?: return false
-        if (bucket.windowStart + windowMs < nowMs) {
+        if (nowMs - bucket.windowStart >= windowMs) {
             buckets.remove(key, bucket)
             return false
         }
-        // 扫描器会轮换源 IP，每个 IP 留一个 Bucket：只在 onFailure 里清理
-        // 意味着这个 map 会随扫描流量单调增长，而 blocked() 才是被调用得最多的入口
         evictExpired(nowMs)
         return bucket.count >= maxAttempts
     }
 
     fun onFailure(key: String) {
-        val nowMs = now()
-        buckets.compute(key) { _, existing ->
-            if (existing == null || existing.windowStart + windowMs < nowMs) {
-                Bucket(nowMs, 1)
-            } else {
-                existing.count += 1
-                existing
-            }
-        }
-        evictExpired(nowMs)
+        // 兼容直接记账的调用者；生产认证只调用 tryAcquire，并在获准后验密。
+        tryAcquire(key)
     }
 
     private fun evictExpired(nowMs: Long) {
-        if (buckets.size <= MAX_BUCKETS) return
-        val cutoff = nowMs - windowMs
-        buckets.entries.removeIf { it.value.windowStart < cutoff }
-        if (buckets.size > MAX_BUCKETS) {
-            // 清理完还是超量（攻击仍在进行）：丢掉最老的一半，保证这个 map 有上界
-            buckets.entries
-                .sortedBy { it.value.windowStart }
-                .take(buckets.size - MAX_BUCKETS / 2)
-                .forEach { buckets.remove(it.key) }
-        }
+        if (buckets.size < MAX_BUCKETS) return
+        buckets.entries.removeIf { nowMs - it.value.windowStart >= windowMs }
     }
 
+    @Synchronized
     fun onSuccess(key: String) {
         buckets.remove(key)
     }
 
-    /** 当前窗口内已失败几次，供日志排查（不做凭据探测反馈）。 */
+    /** 当前窗口内获得许可的尝试数（不对客户端反馈候选真假）。 */
     fun attempts(key: String): Int {
         val bucket = buckets[key] ?: return 0
-        if (bucket.windowStart + windowMs < now()) return 0
+        if (now() - bucket.windowStart >= windowMs) return 0
         return bucket.count
     }
 

@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import sys
 
+from fixtures import install_api_fixtures
 from playwright.sync_api import Page, sync_playwright, expect
 
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18080"
+LIVE = '--live' in sys.argv[2:]
 
 failures: list[str] = []
 
@@ -69,6 +71,9 @@ def main() -> int:
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 1280, "height": 800})
+        if not LIVE:
+            install_api_fixtures(page.context)
+        print('mode: live read-only probes' if LIVE else 'mode: deterministic API fixtures')
 
         # ---------- 桌面 ----------
         print("desktop 1280x800")
@@ -112,8 +117,7 @@ def main() -> int:
                 "async () => { const r = await fetch('/api/bangumi/calendar'); return r.status; }"
             )
             if status >= 500:
-                print(f"    (上游不可用 HTTP {status}，组件按设计隐藏)")
-                return
+                raise AssertionError(f"每日放送接口 HTTP {status}，不能视作渲染成功")
             # 404 不是「上游挂了」：/api/bangumi/calendar 是我们自己定义的路由，
             # 它 404 只有两种可能——路由被改名/删掉，或者部署的是旧产物。
             # 原先把 404 一并归给上游，等于这条检查在路由消失时照样绿灯。
@@ -181,8 +185,10 @@ def main() -> int:
                 raise AssertionError(
                     f"排行榜接口回 {body['status']}，不是上游故障而是我们自己的门控/路由问题"
                 )
+            if body["status"] >= 500:
+                raise AssertionError(f"排行榜接口 HTTP {body['status']}，不能视作空榜通过")
             if body["count"] <= 0:
-                print(f"    (上游未返回数据：HTTP {body['status']}、{body['count']} 条，空榜属预期)")
+                print(f"    (接口返回空榜：HTTP {body['status']}、{body['count']} 条)")
                 return
             raise AssertionError(
                 f"接口返回 {body['count']} 条条目，但页面一张卡片都没渲染（真 bug）"
@@ -229,6 +235,8 @@ def main() -> int:
         # ---------- 中等宽度：顶栏不该挤在一起 ----------
         print("tablet 900x700")
         t = browser.new_page(viewport={"width": 900, "height": 700})
+        if not LIVE:
+            install_api_fixtures(t.context)
         t.goto(BASE, wait_until="networkidle")
 
         def no_overlap() -> None:
@@ -266,6 +274,8 @@ def main() -> int:
             has_touch=True,
             device_scale_factor=3,
         )
+        if not LIVE:
+            install_api_fixtures(m.context)
         m.goto(BASE, wait_until="networkidle")
 
         check(

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ---------- Stage 1: 构建前端 ----------
-FROM node:22-alpine AS frontend-build
+FROM node:22-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914 AS frontend-build
 WORKDIR /web
 COPY frontend/package.json frontend/package-lock.json ./
 # 锁文件里的 resolved 一律指向 https://registry.npmjs.org，不再绑死某个第三方镜像。
@@ -11,15 +11,22 @@ COPY frontend/package.json frontend/package-lock.json ./
 # （实测 npm ci 会把锁文件里指向默认源的地址替换成这里给的源）。
 # 再给 npm 加退避重试：一次网络抖动不该让整次部署失败。
 ARG NPM_REGISTRY=https://registry.npmjs.org
-RUN npm ci --no-audit --no-fund --registry=${NPM_REGISTRY} \
+RUN --mount=type=cache,target=/root/.npm npm ci --include=dev --no-audit --no-fund --registry=${NPM_REGISTRY} \
       --fetch-retries=5 --fetch-timeout=120000
 COPY frontend/ ./
-RUN npm run build
+RUN NODE_ENV=production npm run build
 
 # ---------- Stage 2: 构建后端 ----------
-FROM gradle:9.3.1-jdk21-jammy AS backend-build
+FROM gradle:9.3.1-jdk21-jammy@sha256:d1a13bc20e601e3750e2a46ef2a7c025324ab53f2a056f2281df5b3ef7273c97 AS backend-build
 WORKDIR /app
-COPY backend/ ./
+# 依赖层只由构建配置决定，可随 GHA layer cache 一起复用。
+# 不把唯一副本放 cache mount：远端 layer 命中时，空 mount 会遮住已下载依赖。
+COPY backend/build.gradle.kts backend/settings.gradle.kts backend/gradle.properties ./
+RUN gradle dependencies prefetchDependencies --no-daemon --console=plain \
+      -Dorg.gradle.jvmargs="-Xmx1g -XX:MaxMetaspaceSize=512m" \
+      -Pkotlin.compiler.execution.strategy=in-process \
+      -Dorg.gradle.parallel=false --max-workers=2
+COPY backend/src/ ./src/
 # 部署机上一次就死在这一步：等 25 分钟后报
 #   "Gradle build daemon disappeared unexpectedly (it may have been killed or may have crashed)"
 # 守护进程日志停在「daemon is running. Sleeping until state changes」—— 没有异常、没有栈，
@@ -42,7 +49,7 @@ RUN grep -E 'MemTotal|MemAvailable' /proc/meminfo || true; nproc || true; \
       -Dorg.gradle.parallel=false --max-workers=2
 
 # ---------- Stage 3: 运行 ----------
-FROM eclipse-temurin:21-jre-jammy
+FROM eclipse-temurin:21-jre-jammy@sha256:1eac8b8fee11ca7d6725a48bc5d41992ed1561504ebae25490d2d062847e8269
 LABEL org.opencontainers.image.title="Animeko Web" \
       org.opencontainers.image.description="animeko 的服务端化实现：登录门控 + Bangumi + Selector 数据源 + 个人数据 + HLS 代理" \
       org.opencontainers.image.licenses="AGPL-3.0"

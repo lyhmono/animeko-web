@@ -1,12 +1,15 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import Poster from '../components/Poster'
 import { api, errMsg } from '../api'
 import { favoriteIdSet, onDocChange } from '../lib/storage'
-import { IconHeartFilled, IconStar } from '../lib/icons'
+import { IconHeartFilled, IconRefresh, IconStar } from '../lib/icons'
+import { getSourceRevision, onSourcesChanged } from '../lib/sourceEvents'
 import type { BgmSubject } from '../types'
 
 const PAGE_SIZE = 24
+let rankingSnapshot: { items: BgmSubject[]; total: number; revision: number } | null = null
+const cachedRanking = (revision = getSourceRevision()) => rankingSnapshot?.revision === revision ? rankingSnapshot : null
 
 /**
  * 发现页：Bangumi 评分排行榜。
@@ -19,32 +22,67 @@ const PAGE_SIZE = 24
  * 逐段追加更省事，也不会因为滚动位置丢失而困惑。
  */
 export default function DiscoverPage() {
-  const [items, setItems] = useState<BgmSubject[]>([])
-  const [total, setTotal] = useState(0)
+  const [items, setItems] = useState<BgmSubject[]>(() => cachedRanking()?.items ?? [])
+  const [total, setTotal] = useState(() => cachedRanking()?.total ?? 0)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [favIds, setFavIds] = useState<Set<number>>(() => favoriteIdSet())
+  const [sourceRevision, setSourceRevision] = useState(getSourceRevision)
+  const itemsRef = useRef(items)
+  const requestRef = useRef<AbortController | null>(null)
+  const mountedRef = useRef(true)
 
-  const load = useCallback(async (offset: number, signal?: AbortSignal) => {
+  const load = useCallback(async (offset: number) => {
+    if (requestRef.current || !mountedRef.current) return
+    const ctrl = new AbortController()
+    requestRef.current = ctrl
+    const current = () => mountedRef.current && requestRef.current === ctrl && !ctrl.signal.aborted && sourceRevision === getSourceRevision()
     setLoading(true)
     setError('')
     try {
-      const page = await api.bangumiRanking(offset, PAGE_SIZE, signal)
-      if (signal?.aborted) return
+      const page = await api.bangumiRanking(offset, PAGE_SIZE, ctrl.signal)
+      if (!current()) return
+      const next = offset === 0 ? page.data : [...itemsRef.current, ...page.data]
+      itemsRef.current = next
+      rankingSnapshot = { items: next, total: page.total, revision: sourceRevision }
       setTotal(page.total)
-      setItems((prev) => (offset === 0 ? page.data : [...prev, ...page.data]))
+      setItems(next)
     } catch (e) {
-      if (!signal?.aborted) setError(errMsg(e))
+      if (current()) setError(errMsg(e))
     } finally {
-      if (!signal?.aborted) setLoading(false)
+      if (current()) {
+        requestRef.current = null
+        setLoading(false)
+      }
     }
-  }, [])
+  }, [sourceRevision])
 
   useEffect(() => {
-    const ctrl = new AbortController()
-    void load(0, ctrl.signal)
-    return () => ctrl.abort()
-  }, [load])
+    mountedRef.current = true
+    if (!cachedRanking(sourceRevision)) {
+      itemsRef.current = []
+      setItems([])
+      setTotal(0)
+      void load(0)
+    }
+    return () => {
+      mountedRef.current = false
+      requestRef.current?.abort()
+      requestRef.current = null
+    }
+  }, [load, sourceRevision])
+
+  useEffect(() => onSourcesChanged(setSourceRevision), [])
+
+  const refresh = () => {
+    rankingSnapshot = null
+    requestRef.current?.abort()
+    requestRef.current = null
+    itemsRef.current = []
+    setItems([])
+    setTotal(0)
+    void load(0)
+  }
 
   // 收藏变了要跟上：从条目页返回会重挂并重建初始值；整份文档被换掉
   // （启动读取失败后点「重新读取」）则靠这个订阅。
@@ -62,9 +100,12 @@ export default function DiscoverPage() {
         <IconStar size={17} />
         排行榜
         {total > 0 && <span className="count">Bangumi 动画评分榜 · 共 {total} 部</span>}
+        <button className="btn-icon" aria-label="刷新排行榜" title="刷新排行榜" onClick={refresh}>
+          <IconRefresh />
+        </button>
       </h2>
 
-      {error && <div className="error-box">排行榜加载失败：{error}</div>}
+      {error && <div className="error-box">排行榜加载失败：{error} <button className="btn btn-sm" onClick={() => void load(items.length)}>重试</button></div>}
 
       {items.length === 0 && loading && (
         <div className="result-grid">

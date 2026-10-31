@@ -1,11 +1,10 @@
 package com.animeko.web.http
 
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.supervisorScope
+
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
+
 import java.io.IOException
 import java.io.InputStream
 import java.net.URI
@@ -171,15 +170,18 @@ class JdkFetcher(
         url: String,
         headers: Map<String, String>,
         followRedirects: Boolean,
-    ): StreamResult = withContext(Dispatchers.IO) {
+    ): StreamResult {
+        // sendAsync is non-blocking. Do not return an InputStream across withContext(IO):
+        // prompt cancellation can discard that result before any caller acquires ownership.
         val request = buildRequest(url, headers, streamTimeoutMs)
         val cl = if (followRedirects) client else noRedirectClient
         val resp = cl.sendCancellable(request, HttpResponse.BodyHandlers.ofInputStream())
-        StreamResult(
-            status = resp.statusCode(),
-            headers = resp.headers().map().mapValues { it.value.toList() },
-            body = resp.body(),
-        )
+        return try {
+            StreamResult(resp.statusCode(), resp.headers().map().mapValues { it.value.toList() }, resp.body().closeOnce())
+        } catch (failure: Throwable) {
+            resp.body().closeQuietly()
+            throw failure
+        }
     }
 
     override suspend fun fetchBounded(
@@ -217,11 +219,14 @@ class JdkFetcher(
         val future = sendAsync(request, handler)
         cont.invokeOnCancellation { future.cancel(true) }
         future.whenComplete { response, error ->
-            // 取消之后 future 也会回调；此时 continuation 已取消，不能再 resume
-            if (!cont.isActive) return@whenComplete
+            // Cancelling an already completed future cannot close its unconsumed body.
+            if (!cont.isActive) {
+                response?.let(::closeResponseBody)
+                return@whenComplete
+            }
             when {
                 error != null -> cont.resumeWithException(error)
-                response != null -> cont.resume(response)
+                response != null -> cont.resume(response) { _, lostResponse, _ -> closeResponseBody(lostResponse) }
             }
         }
     }
@@ -230,40 +235,11 @@ class JdkFetcher(
      * 响应头到手后，请求超时就不再约束 body 读取了；这里给阻塞读加一个期限，
      * 超时主动关闭流，避免慢速镜像长期占住 IO 线程。
      */
-    private suspend fun readCappedTimed(input: InputStream, maxBytes: Long): ByteArray = supervisorScope {
-        val read = async(Dispatchers.IO) { readCapped(input, maxBytes) }
-        try {
-            // withTimeoutOrNull 只吃掉**本层**的超时；父协程的取消/超时要原样上抛，
-            // 否则 Bangumi calendar 的外层 withTimeoutOrNull 会被误转成 502。
-            val bytes = withTimeoutOrNull(streamTimeoutMs) { read.await() }
-            if (bytes == null) {
-                read.cancel()
-                throw UpstreamException("响应体读取超时（${streamTimeoutMs}ms）")
-            }
-            bytes
-        } catch (e: IOException) {
-            // 超时后主协程关闭流，阻塞中的 read 会抛 "closed"；统一映射成上游错误，
-            // 不能让子协程的 IOException 盖掉上面的超时异常。
-            throw UpstreamException("读取响应体失败：${e.message ?: e::class.simpleName}")
-        } finally {
-            runCatching { input.close() }
-        }
-    }
+    private suspend fun readCappedTimed(input: InputStream, maxBytes: Long): ByteArray =
+        readStreamBytes(input, maxBytes, streamTimeoutMs)
 
-    private fun readCapped(input: InputStream, maxBytes: Long): ByteArray {
-        val out = java.io.ByteArrayOutputStream()
-        val chunk = ByteArray(64 * 1024)
-        var total = 0L
-        while (true) {
-            val n = input.read(chunk)
-            if (n == -1) break
-            total += n
-            if (total > maxBytes) {
-                throw UpstreamException("响应体超过 ${maxBytes / 1024 / 1024}MB 上限（已读 $total 字节）")
-            }
-            out.write(chunk, 0, n)
-        }
-        return out.toByteArray()
+    private fun closeResponseBody(response: HttpResponse<*>) {
+        (response.body() as? InputStream)?.closeQuietly()
     }
 
     private fun buildRequest(

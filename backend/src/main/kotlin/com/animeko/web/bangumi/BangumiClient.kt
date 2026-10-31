@@ -7,10 +7,13 @@ import com.animeko.web.http.JsonGuard
 import com.animeko.web.http.UpstreamException
 import com.animeko.web.http.UrlGuard
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.onTimeout
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
@@ -150,6 +153,7 @@ class BangumiClient(
 
     @Volatile
     private var channel: BgmChannelConfig = channelStore?.load() ?: BgmChannelConfig()
+    private var channelGeneration: Long = 0
 
     init {
         // 配置文件能被手工改，绕过 setChannel 的校验。启动时再验一次：
@@ -190,7 +194,14 @@ class BangumiClient(
     fun effectiveBases(): List<String> = resolveBases(channel, enforce = false)
 
     /** 真正要发请求的地址列表：逐次校验（见 resolveBases 的注释） */
-    private fun requestBases(): List<String> = resolveBases(channel, enforce = true)
+    private fun requestBases(): List<String> = requestSnapshot().bases
+
+    private data class RequestSnapshot(val generation: Long, val bases: List<String>, val calendarSupported: Boolean)
+
+    private fun requestSnapshot(): RequestSnapshot {
+        val (config, generation) = synchronized(this) { channel to channelGeneration }
+        return RequestSnapshot(generation, resolveBases(config, enforce = true), config.channel != BgmChannel.MIRROR)
+    }
 
     /**
      * 把一个通道配置解析成候选地址。探测未保存的目标时走这里，与保存后走同一套规则。
@@ -251,7 +262,7 @@ class BangumiClient(
      * 校验放在写入前，非法直接拒绝（IllegalArgumentException → 400）。
      */
     fun setChannel(next: BgmChannelConfig): BgmChannelConfig {
-        if (next.channel == BgmChannel.CUSTOM) {
+        val saved = if (next.channel == BgmChannel.CUSTOM) {
             val urls = next.customUrls.map { it.trim().removeSuffix("/") }.filter { it.isNotBlank() }
             require(urls.isNotEmpty()) { "自定义通道至少需要一个 Bangumi API 地址" }
             // 每个地址都会做一次真实 DNS 校验；不封顶的话一个请求就能让调用线程
@@ -280,22 +291,19 @@ class BangumiClient(
                         throw IllegalArgumentException("地址不被允许：$url（仅支持公网 http/https 地址）")
                     }
             }
-            val saved = next.copy(customUrls = urls)
-            // 校验通过才清「记住的赢家」：被拒的配置不该有任何副作用 ——
-            // 否则填错一次地址就把当前通道的缓存赢家也清了，下一次请求白跑一轮竞速
-            preferredBase = null
-            channel = saved
-            channelStore?.save(saved)
-            return saved
+            next.copy(customUrls = urls)
+        } else {
+            // 非 CUSTOM 不保留无效的旧自定义地址。
+            next.copy(customUrls = emptyList())
         }
-        // 非 CUSTOM 时把 customUrls 清空存盘，避免留下「看起来还配着」的困惑
-        val saved = next.copy(customUrls = emptyList())
-        // 换通道 = 换一批候选，旧的赢家不再适用（withFallback 里还有 preferred in list
-        // 的兜底，这里显式清是为了不让一个已不属于任何通道的地址留在字段里）
-        preferredBase = null
-        channel = saved
-        channelStore?.save(saved)
-        return saved
+        return synchronized(this) {
+            // 持久化成功后才发布；同一把锁覆盖保存、发布和赢家失效，避免并发提交交错。
+            channelStore?.save(saved)
+            channelGeneration++
+            channel = saved
+            preferredBase = null
+            saved
+        }
     }
 
     /**
@@ -377,19 +385,27 @@ class BangumiClient(
     private var preferredBase: String? = null
 
     private val json = Json { ignoreUnknownKeys = true }
+    private data class MetadataKey(val snapshot: RequestSnapshot, val payload: String)
+    private val searchRequests = SingleFlight<MetadataKey, List<BgmSubject>>()
+    private val rankingRequests = SingleFlight<MetadataKey, BgmSearchResponse>()
+    private val calendarRequests = SingleFlight<MetadataKey, List<BgmCalendarResponse>>()
+    private val subjectRequests = SingleFlight<MetadataKey, BgmSubject>()
 
     /** 搜索番剧条目（type=2 动画） */
     suspend fun search(keywords: String, type: Int = TYPE_ANIME, limit: Int = 24): List<BgmSubject> {
         require(keywords.isNotBlank()) { "keywords must not be blank" }
         val body = """{"keyword":${json.encodeToString(keywords)},"filter":{"type":[$type]},"limit":$limit}"""
-        return withFallback { base ->
-            decode(
-                text("$base/v0/search/subjects") {
-                    fetcher.post("$base/v0/search/subjects", body, headers())
-                },
-                BgmSearchResponse.serializer(),
-                "Bangumi 搜索",
-            ).data
+        val snapshot = requestSnapshot()
+        return searchRequests.run(MetadataKey(snapshot, body)) {
+            withFallback(snapshot) { base ->
+                decode(
+                    text("$base/v0/search/subjects") {
+                        fetcher.post("$base/v0/search/subjects", body, headers())
+                    },
+                    BgmSearchResponse.serializer(),
+                    "Bangumi 搜索",
+                ).data
+            }
         }
     }
 
@@ -400,13 +416,18 @@ class BangumiClient(
      * 复用 [BgmSearchResponse] 作为响应模型：这个端点的返回结构与搜索完全一致
      * （total/data/limit/offset），没必要为同一形状再建一个类。
      */
-    suspend fun ranking(limit: Int = 24, offset: Int = 0): BgmSearchResponse = withFallback { base ->
+    suspend fun ranking(limit: Int = 24, offset: Int = 0): BgmSearchResponse {
+        val snapshot = requestSnapshot()
         val path = "/v0/subjects?type=$TYPE_ANIME&sort=rank&limit=$limit&offset=$offset"
-        decode(
-            text("$base$path") { fetcher.fetchBounded("$base$path", headers(), MAX_METADATA_BYTES) },
-            BgmSearchResponse.serializer(),
-            "Bangumi 排行榜",
-        )
+        return rankingRequests.run(MetadataKey(snapshot, path)) {
+            withFallback(snapshot) { base ->
+                decode(
+                    text("$base$path") { fetcher.fetchBounded("$base$path", headers(), MAX_METADATA_BYTES) },
+                    BgmSearchResponse.serializer(),
+                    "Bangumi 排行榜",
+                )
+            }
+        }
     }
 
     /**
@@ -423,15 +444,17 @@ class BangumiClient(
      * 所以这里把「不支持放送端点」的已知地址（镜像）排到最后，且不共享偏好。
      */
     suspend fun calendar(): List<BgmCalendarResponse> {
-        if (!calendarSupported) {
+        val snapshot = requestSnapshot()
+        if (!snapshot.calendarSupported) {
             throw UpstreamException("当前 Bangumi 通道（社区镜像）不提供每日放送端点，可在设置页切换通道")
         }
         // 官方优先：镜像确定没有这个端点，排后面只作为「万一它是中转」的兜底
-        val candidates = requestBases().sortedBy { if (it == MIRROR_BASE) 1 else 0 }
+        val candidates = snapshot.bases.sortedBy { if (it == MIRROR_BASE) 1 else 0 }
         // 首页附属内容不能让人等满 45 秒的 Bangumi 超时（官方在某些网络里是
         // 连接层静默丢包，实测 8 秒仍无响应）。给自己一个更短的预算：
         // 超时就放弃整块放送表 —— 首页的主体是搜索，不该被一个锦上添花的区块拖住。
-        return withTimeoutOrNull(CALENDAR_BUDGET_MS) {
+        return calendarRequests.run(MetadataKey(snapshot, "/v0/calendar")) {
+            withTimeoutOrNull(CALENDAR_BUDGET_MS) {
             // 注意不能写成 raceAll(candidates, rememberWinner = false) { … }：
             // 具名实参之后不能再跟尾随 lambda，Kotlin 会把它当成传给下一个
             // 形参的位置实参，于是报 "No value passed for parameter 'block'"。
@@ -449,25 +472,29 @@ class BangumiClient(
                     else ->
                         throw UpstreamException("每日放送请求返回 HTTP ${result.status}（$base）")
                 }
-            }, rememberWinner = false)
-        } ?: throw UpstreamException("每日放送获取超时（${CALENDAR_BUDGET_MS / 1000} 秒），可稍后刷新")
+            }, rememberWinner = false, generation = snapshot.generation)
+            } ?: throw UpstreamException("每日放送获取超时（${CALENDAR_BUDGET_MS / 1000} 秒），可稍后刷新")
+        }
     }
 
     /** 条目详情（含剧集列表） */
     suspend fun subject(id: Int): BgmSubject {
-        val subject = withFallback { base ->
-            decode(
-                text("$base/v0/subjects/$id") {
-                    fetcher.fetchBounded("$base/v0/subjects/$id?responseGroup=large", headers(), MAX_METADATA_BYTES)
-                },
-                BgmSubject.serializer(),
-                "Bangumi 条目",
+        val snapshot = requestSnapshot()
+        return subjectRequests.run(MetadataKey(snapshot, id.toString())) {
+            val subject = withFallback(snapshot) { base ->
+                decode(
+                    text("$base/v0/subjects/$id") {
+                        fetcher.fetchBounded("$base/v0/subjects/$id?responseGroup=large", headers(), MAX_METADATA_BYTES)
+                    },
+                    BgmSubject.serializer(),
+                    "Bangumi 条目",
+                )
+            }
+            val episodes = withFallback(snapshot) { base -> episodesOf(base, id) }
+            subject.copy(
+                eps = JsonArray(episodes.map { json.encodeToJsonElement(BgmEpisode.serializer(), it) }),
             )
         }
-        val episodes = withFallback { base -> episodesOf(base, id) }
-        return subject.copy(
-            eps = JsonArray(episodes.map { json.encodeToJsonElement(BgmEpisode.serializer(), it) }),
-        )
     }
 
     /**
@@ -484,6 +511,12 @@ class BangumiClient(
                 BgmEpisodesResponse.serializer(),
                 "Bangumi 剧集列表",
             )
+            if (resp.data.size > EPISODES_PAGE) {
+                throw UpstreamException("Bangumi 剧集列表单页超过 $EPISODES_PAGE 条上限")
+            }
+            if (resp.total > MAX_EPISODES || resp.data.size > MAX_EPISODES - collected.size) {
+                throw UpstreamException("Bangumi 剧集列表超过 $MAX_EPISODES 条总量上限")
+            }
             if (resp.data.isEmpty()) break
             collected.addAll(resp.data)
             // total 缺省为 0：镜像省略该字段时不能把首页 200 条当成「已经到结尾」。
@@ -492,6 +525,9 @@ class BangumiClient(
                 if (collected.size >= resp.total) break
             } else if (resp.data.size < EPISODES_PAGE) {
                 break
+            }
+            if (collected.size == MAX_EPISODES) {
+                throw UpstreamException("Bangumi 剧集列表已达 $MAX_EPISODES 条上限，无法确认列表完整")
             }
             offset += resp.data.size
         }
@@ -538,66 +574,34 @@ class BangumiClient(
             throw UpstreamException("$source 返回的不是预期 JSON")
         }
 
-    /**
-     * 按「记住的可用地址 → 全部地址并发竞速」的顺序取一个能用的结果。
-     *
-     * 以前是**串行**按顺序试。在「官方域名不可达 + 镜像要十几到二十几秒」这种真实部署上
-     * （实测就是用户那台 VPS），一次搜索要先白等官方满 20 秒超时，再轮到镜像，
-     * 42 秒之后两个都失败。而且只有**成功**才会被记住，所以只要镜像从没在超时内
-     * 回来过，每一次搜索都要重新把那个死域名等满一遍 —— 慢不是偶发，是常态。
-     *
-     * 现在：有记录就先只试它（稳态下不给已知死掉的域名开连接）；它失败就把记录清掉，
-     * 剩下所有候选**同时发**，第一个成功的赢、其余立刻取消。总耗时从「各超时之和」
-     * 变成「最慢的那个」，并且第一次成功之后就走快路径。
-     *
-     * 地址在本轮开始时取一次快照：站长可能在一次请求进行到一半时改通道，
-     * 拿同一份列表发完这一轮，比中途换地址撕裂一次请求更好解释。
-     */
-    private suspend fun <T> withFallback(block: suspend (base: String) -> T): T {
-        val list = requestBases()
-        val preferred = preferredBase
-        if (preferred != null && preferred in list) {
-            try {
-                // 有多个候选时给首选一个很短的独占窗口：它慢但能成功时，
-                // 不能把每次请求都拖到 13~45 秒。超时不清除首选，交给竞速选新的赢家。
-                val hedged = if (list.size > 1 && preferredHedgeMs > 0) {
-                    withTimeoutOrNull(preferredHedgeMs) { block(preferred) }
-                } else {
-                    block(preferred)
-                }
-                if (hedged != null) return hedged
-            } catch (e: SubjectNotFoundException) {
-                // 404 是确定性的「条目不存在」，不是地址坏了：不要清 preferred，
-                // 也不要让所有 base 再打一遍（同一台镜像会被请求两次）。
-                throw e
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                // 记下来的这个已经不好用了：清掉，别让它一直挡在真正能用的前面
-                preferredBase = null
-                if (list.size == 1) throw e
-            }
-        }
-        return raceAll(list, block)
+    /** 一轮只发一次每个候选；首选窗口结束只启动备选，不取消已发的请求。 */
+    private suspend fun <T> withFallback(
+        snapshot: RequestSnapshot,
+        block: suspend (base: String) -> T,
+    ): T {
+        val preferred = synchronized(this) { preferredBase.takeIf { snapshot.generation == channelGeneration } }
+        return raceAll(snapshot.bases, block, preferred = preferred, generation = snapshot.generation)
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     private suspend fun <T> raceAll(
         list: List<String>,
         block: suspend (base: String) -> T,
         /** 是否把赢家记为全局首选。放送表这条必须传 false（见 calendar 的注释） */
         rememberWinner: Boolean = true,
+        preferred: String? = null,
+        generation: Long,
     ): T = coroutineScope {
         // 空候选必须在这里拦：Channel(0) 是 rendezvous 通道，repeat(0) 不循环，
         // 最后会抛掉那句 IllegalStateException —— 那是 500，而真实原因是
         // 「这个通道一个地址都没有」（配置问题，应该是 502 级的可解释失败）。
         if (list.isEmpty()) throw UpstreamException("当前 Bangumi 通道没有任何可用地址")
         val results = Channel<Pair<String, Result<T>>>(list.size)
-        val jobs = list.map { base ->
-            launch {
+        val jobs = ArrayList<kotlinx.coroutines.Job>()
+        fun start(base: String) {
+            jobs += launch {
                 val outcome = try {
                     Result.success(block(base))
-                } catch (c: CancellationException) {
-                    throw c
                 } catch (t: Throwable) {
                     Result.failure(t)
                 }
@@ -605,16 +609,40 @@ class BangumiClient(
             }
         }
         try {
+            var firstResult: Pair<String, Result<T>>? = null
+            val primary = preferred?.takeIf { it in list }
+            if (primary == null) {
+                list.forEach { start(it) }
+            } else {
+                start(primary)
+                val alternatives = list.filterNot { it == primary }
+                if (alternatives.isNotEmpty()) {
+                    if (preferredHedgeMs > 0) {
+                        // select 不会像 withTimeout(receive) 那样在边界取消一个已取到结果的接收者。
+                        firstResult = select {
+                            results.onReceive { it }
+                            onTimeout(preferredHedgeMs) { null }
+                        }
+                    }
+                    if (firstResult?.second?.isSuccess != true) alternatives.forEach { start(it) }
+                }
+            }
             var lastError: Throwable? = null
             var firstNotFound: SubjectNotFoundException? = null
-            repeat(list.size) {
-                val (base, outcome) = results.receive()
+            repeat(jobs.size) { index ->
+                val (base, outcome) = if (index == 0 && firstResult != null) firstResult else results.receive()
                 if (outcome.isSuccess) {
-                    if (rememberWinner) preferredBase = base
+                    if (rememberWinner) synchronized(this@BangumiClient) {
+                        if (generation == channelGeneration) preferredBase = base
+                    }
                     return@coroutineScope outcome.getOrThrow()
                 }
                 val error = outcome.exceptionOrNull()
+                if (error is CancellationException) throw error
                 lastError = error
+                if (base == primary && error !is SubjectNotFoundException) synchronized(this@BangumiClient) {
+                    if (generation == channelGeneration && preferredBase == base) preferredBase = null
+                }
                 // 404 是确定性的结果：不能因为另一个 base 更晚回了一个 500
                 // 就把「条目不存在」变成 502。最终错误优先保留第一个 404。
                 if (error is SubjectNotFoundException && firstNotFound == null) firstNotFound = error
@@ -623,6 +651,7 @@ class BangumiClient(
         } finally {
             // 赢家出现后必须掐掉其余的：否则 coroutineScope 要等最慢那条（可能是 30 秒超时）
             jobs.forEach { it.cancel() }
+            results.close()
         }
     }
 

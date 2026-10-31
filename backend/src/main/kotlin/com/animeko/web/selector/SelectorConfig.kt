@@ -41,7 +41,7 @@ data class SelectorSearchConfig(
     // ---- Phase 1: 搜索 ----
     /** 搜索地址模板，{keyword} 为占位符 */
     val searchUrl: String = "",
-    /** 相对链接解析基址；为空时取请求 URL 的 origin */
+    /** 相对链接解析基址；为空时取最终重定向 URL 的 origin */
     val rawBaseUrl: String = "",
     /** 请求间隔（毫秒） */
     val requestInterval: Long = 3000,
@@ -215,11 +215,16 @@ data class SelectorAutoMatchConfig(
     fun processKeyword(keyword: String): String {
         var kw = keyword.trim()
         if (searchUseOnlyFirstWord) {
-            kw = kw.split(Regex("\\s+")).firstOrNull()?.takeIf { it.isNotBlank() } ?: kw
+            kw = kw.split(WORD_BREAK).firstOrNull()?.takeIf { it.isNotBlank() } ?: kw
         }
         if (searchRemoveSpecial) {
-            kw = kw.replace(Regex("[!-/:-@\\[-`{-~！？，。、；：「」『』（）【】《》…—]"), "")
+            kw = kw.replace(SPECIAL_CHARACTERS, "")
         }
         return kw
+    }
+
+    private companion object {
+        private val WORD_BREAK = Regex("\\s+")
+        private val SPECIAL_CHARACTERS = Regex("[!-/:-@\\[-`{-~！？，。、；：「」『』（）【】《》…—]")
     }
 }

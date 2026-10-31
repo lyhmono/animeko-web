@@ -3,7 +3,6 @@ package com.animeko.web.selector
 import com.animeko.web.appLog
 import com.animeko.web.ioReason
 import com.animeko.web.writeFully
-import java.nio.file.InvalidPathException
 import kotlinx.serialization.json.Json
 import java.io.IOException
 import java.nio.channels.FileChannel
@@ -16,9 +15,7 @@ import kotlin.io.path.createDirectories
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.exists
 import kotlin.io.path.extension
-import kotlin.io.path.nameWithoutExtension
 import kotlin.io.path.readText
-import kotlin.io.path.writeText
 
 /** 持久化的数据源（animeko 兼容 JSON + 启停标记） */
 @kotlinx.serialization.Serializable
@@ -41,10 +38,10 @@ class SelectorRepository(private val dir: Path) {
         encodeDefaults = true
     }
 
-    /** 解析缓存：数据源目录不常变，而 list()/find() 在每条采集请求的热路径上 */
-    private class Cached(val mtime: Long, val source: StoredSource)
-
-    private val cache = java.util.concurrent.ConcurrentHashMap<String, Cached>()
+    /** Cache reads, publication and writes all use the repository monitor. */
+    private data class Stamp(val mtime: java.nio.file.attribute.FileTime, val size: Long, val fileKey: Any?)
+    private data class Cached(val stamp: Stamp, val source: StoredSource)
+    private val cache = mutableMapOf<String, Cached>()
 
     init {
         // 数据目录可能是只读挂载（NAS/NFS root-squash、编排层挂错权限）。这时服务仍应能起来：
@@ -62,77 +59,100 @@ class SelectorRepository(private val dir: Path) {
         }
     }
 
-    fun list(): List<StoredSource> {
-        if (!dir.exists()) return emptyList()
-        return Files.list(dir).use { stream ->
-            stream.filter { it.extension == "json" }
-                .map { path -> loadCached(path) }
-                .toList()
-                .filterNotNull()
-                .sortedBy { it.arguments.name }
-        }
+    fun list(): List<StoredSource> = synchronized(this) {
+        if (!dir.exists()) return@synchronized emptyList()
+        val paths = Files.list(dir).use { stream -> stream.filter { it.extension == "json" }.toList() }
+        val present = paths.mapTo(mutableSetOf()) { it.fileName.toString() }
+        cache.keys.retainAll(present)
+        loggedCorrupt.retainAll(present)
+        paths.mapNotNull(::loadCached).sortedBy { it.arguments.name }
     }
 
-    /**
-     * 按 mtime 缓存解析结果。save/delete 会显式失效缓存条目 —— 不能只靠 mtime：
-     * getLastModifiedTime 截到毫秒，同一毫秒内的两次写入会被误判成「没变」。
-     *
-     * 坏文件必须**出声**。读侧对解析失败是跳过（这一步是对的：一个坏文件不该把
-     * 整个服务带走），但原先一声不吭，于是排查变成死胡同：用户看到的是
-     * 「这个源自己消失了」，列表里少一个，而没有任何地方说过为什么。
-     * 同一个文件名只记一次（修好之前不刷屏）：这条路径在每个采集请求上都会走。
-     */
+    /** External replacements use full FileTime/size/file identity, not millisecond timestamps. */
+    private fun stamp(path: Path): Stamp? = runCatching {
+        val attributes = Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes::class.java)
+        Stamp(attributes.lastModifiedTime(), attributes.size(), attributes.fileKey())
+    }.getOrNull()
+
     private fun loadCached(path: Path): StoredSource? {
         val key = path.fileName.toString()
-        val mtime = runCatching { Files.getLastModifiedTime(path).toMillis() }.getOrNull() ?: 0L
-        cache[key]?.let { if (it.mtime == mtime) return it.source }
-        val parsed = runCatching { json.decodeFromString<StoredSource>(path.readText()) }
-        val source = parsed.getOrElse { e ->
-            if (loggedCorrupt.add(key)) {
-                appLog.warn(
-                    "数据源文件解析失败，这个源不会出现在列表里：{}（{}）；改回合法 JSON 或重新导入即恢复",
-                    path, e.message ?: e::class.simpleName,
-                )
+        repeat(2) {
+            val before = stamp(path) ?: run { invalidate(path); return null }
+            cache[key]?.let { if (it.stamp == before) return it.source }
+            val source = runCatching { json.decodeFromString<StoredSource>(path.readText()) }.getOrElse { e ->
+                invalidate(path)
+                if (loggedCorrupt.add(key)) {
+                    appLog.warn("数据源文件解析失败，这个源不会出现在列表里：{}（{}）；改回合法 JSON 或重新导入即恢复",
+                        path, e.message ?: e::class.simpleName)
+                }
+                return null
             }
-            return null
+            loggedCorrupt.remove(key)
+            // A concurrent external edit may invalidate this read; never cache a mismatched stamp.
+            if (stamp(path) == before) {
+                cache[key] = Cached(before, source)
+                return source
+            }
         }
-        loggedCorrupt.remove(key)
-        cache[key] = Cached(mtime, source)
-        return source
+        invalidate(path)
+        return null
     }
 
-    private val loggedCorrupt = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val loggedCorrupt = mutableSetOf<String>()
 
     private fun invalidate(file: Path) {
         cache.remove(file.fileName.toString())
     }
 
-    /**
-     * 按名字找源。enabledOnly=true 时停用的源视为不存在 ——
-     * 「停用」必须在服务端生效，只靠前端过滤等于任何直接调 API 的人都能用。
-     */
-    fun find(name: String, enabledOnly: Boolean = false): StoredSource? =
-        list().firstOrNull { it.arguments.name == name && (!enabledOnly || it.enabled) }
+    /** Direct lookup still verifies the opaque name to reject sanitized filename collisions. */
+    fun find(name: String, enabledOnly: Boolean = false): StoredSource? = synchronized(this) {
+        findLocked(name)?.takeIf { !enabledOnly || it.enabled }
+    }
+
+    private fun findLocked(name: String): StoredSource? {
+        val target = runCatching { fileFor(name) }.getOrNull() ?: return null
+        return loadCached(target)?.takeIf { it.arguments.name == name }
+    }
 
     fun save(arguments: SelectorSourceArguments, enabled: Boolean = true): StoredSource = synchronized(this) {
+        validateArguments(arguments)
+        val target = fileFor(arguments.name)
+        commit(target, StoredSource(enabled = enabled, arguments = arguments), loadCached(target))
+    }
+
+    internal data class UpsertResult(val source: StoredSource, val created: Boolean)
+
+    /** Read the latest enabled flag and commit the subscription revision in one critical section. */
+    internal fun upsertPreservingEnabled(arguments: SelectorSourceArguments): UpsertResult = synchronized(this) {
+        validateArguments(arguments)
+        val target = fileFor(arguments.name)
+        val current = loadCached(target)
+        val stored = StoredSource(enabled = current?.enabled ?: true, arguments = arguments)
+        UpsertResult(commit(target, stored, current), created = current == null)
+    }
+
+    private fun validateArguments(arguments: SelectorSourceArguments) {
         require(arguments.name.isNotBlank()) { "数据源名称不能为空" }
         require(arguments.name.length <= MAX_NAME_LENGTH) { "数据源名称过长（上限 $MAX_NAME_LENGTH 字符）" }
-        // 订阅导入对空 searchUrl 是拒绝的；单源导入也必须一致，否则会存下一条
-        // 永远搜不出东西的死源，用户只会看到「导入成功但搜索没结果」。
         require(arguments.searchConfig.searchUrl.isNotBlank()) { "数据源缺少 searchUrl，无法搜索" }
-        validateRegexes(arguments.searchConfig)
-        val stored = StoredSource(enabled = enabled, arguments = arguments)
-        val target = fileFor(arguments.name)
-        // 文件名是名字的消毒结果（标点/空格统一压成 _），两个名字可能落到同一个文件，
-        // 例如「我的 源」与「我的_源」。不加这层校验就是静默覆盖别人已导入的数据源。
-        val existing = runCatching { json.decodeFromString<StoredSource>(target.readText()) }.getOrNull()
-        val conflict = existing?.takeIf { it.arguments.name != arguments.name }
-        require(conflict == null) {
-            "数据源名称「${arguments.name}」与已有「${existing?.arguments?.name}」会存到同一个文件，请改名后重试"
+        SelectorPolicy.validate(arguments.searchConfig)
+        require(arguments.searchConfig.selectorSubjectFormatJsonPathIndexed.selectNames.length <= JsonPathEval.MAX_PATH_LENGTH &&
+            arguments.searchConfig.selectorSubjectFormatJsonPathIndexed.selectLinks.length <= JsonPathEval.MAX_PATH_LENGTH) {
+            "JsonPath 选择器过长（上限 ${JsonPathEval.MAX_PATH_LENGTH} 字符）"
         }
+        validateRegexes(arguments.searchConfig)
+    }
+
+    private fun commit(target: Path, stored: StoredSource, existing: StoredSource?): StoredSource {
+        require(existing == null || existing.arguments.name == stored.arguments.name) {
+            "数据源名称「${stored.arguments.name}」与已有「${existing?.arguments?.name}」会存到同一个文件，请改名后重试"
+        }
+        // Do not serialize, fsync or rotate an identical committed source.
+        if (existing == stored) return stored
         writeAtomic(target, json.encodeToString(StoredSource.serializer(), stored))
         invalidate(target)
-        stored
+        loggedCorrupt.remove(target.fileName.toString())
+        return stored
     }
 
     /**
@@ -156,7 +176,7 @@ class SelectorRepository(private val dir: Path) {
                 ch.force(true)
             }
             try {
-                Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE)
+                Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
                 syncDirOf(target)
             } catch (e: AtomicMoveNotSupportedException) {
                 // NFS/CIFS 这类挂载不支持原子 rename（/data 挂网络盘并不罕见）。
@@ -177,19 +197,20 @@ class SelectorRepository(private val dir: Path) {
         }
     }
 
-    fun setEnabled(name: String, enabled: Boolean): Boolean {
-        val current = find(name) ?: return false
-        save(current.arguments, enabled)
-        return true
+    fun setEnabled(name: String, enabled: Boolean): Boolean = synchronized(this) {
+        val current = findLocked(name) ?: return@synchronized false
+        commit(fileFor(name), current.copy(enabled = enabled), current)
+        true
     }
 
     fun delete(name: String): Boolean = synchronized(this) {
         val target = fileFor(name)
-        val stored = runCatching { json.decodeFromString<StoredSource>(target.readText()) }.getOrNull()
+        val stored = loadCached(target)
             ?: return false
         // 只有内容里的名字确实是目标名字才删，否则会删掉同名消毒后落到同一文件的另一条源
         val removed = stored.arguments.name == name && target.deleteIfExists()
         invalidate(target)
+        if (removed) loggedCorrupt.remove(target.fileName.toString())
         return removed
     }
 
@@ -244,7 +265,7 @@ class SelectorRepository(private val dir: Path) {
         )
         patterns.forEach { p ->
             require(p.length <= MAX_PATTERN_LENGTH) { "正则过长（${p.length} 字符，上限 $MAX_PATTERN_LENGTH）" }
-            runCatching { Regex(p) }.onFailure { throw IllegalArgumentException("正则无效：$p") }
+            require(SafeRegex.compile(p) != null) { "正则无效：$p" }
         }
     }
 
