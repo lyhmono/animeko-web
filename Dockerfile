@@ -17,7 +17,7 @@ COPY frontend/ ./
 RUN NODE_ENV=production npm run build
 
 # ---------- Stage 2: 构建后端 ----------
-FROM gradle:9.3.1-jdk21-jammy@sha256:d1a13bc20e601e3750e2a46ef2a7c025324ab53f2a056f2281df5b3ef7273c97 AS backend-build
+FROM gradle:9.8.2-jdk21-jammy@sha256:1b52b76f30c8bfc6171098143e1fcf37b8d88437dfb4401bae18ba47eade5593 AS backend-build
 WORKDIR /app
 # 依赖层只由构建配置决定，可随 GHA layer cache 一起复用。
 # 不把唯一副本放 cache mount：远端 layer 命中时，空 mount 会遮住已下载依赖。
