@@ -49,7 +49,7 @@ RUN grep -E 'MemTotal|MemAvailable' /proc/meminfo || true; nproc || true; \
       -Dorg.gradle.parallel=false --max-workers=2
 
 # ---------- Stage 3: 运行 ----------
-FROM eclipse-temurin:21-jre-jammy@sha256:1eac8b8fee11ca7d6725a48bc5d41992ed1561504ebae25490d2d062847e8269
+FROM eclipse-temurin:25-jre-jammy@sha256:659b528cca74a0edc5c25315ec5819f35bce40bbcec645c4c534987e4c6be7c1
 LABEL org.opencontainers.image.title="Animeko Web" \
       org.opencontainers.image.description="animeko 的服务端化实现：登录门控 + Bangumi + Selector 数据源 + 个人数据 + HLS 代理" \
       org.opencontainers.image.licenses="AGPL-3.0"
