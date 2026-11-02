@@ -86,22 +86,23 @@ def main() -> int:
         )
         check("顶栏导航存在", lambda: expect(page.get_by_test_id("nav-tabs")).to_be_visible(), page)
         check("首页 tab 存在", lambda: expect(page.get_by_test_id("nav-home")).to_be_visible(), page)
-        def desktop_nav_at_top() -> None:
-            """桌面端导航必须在**视口顶部**，而不是底部。
+        def desktop_nav_in_sidebar() -> None:
+            """桌面端是 Plex 式左侧媒体库导航，不再贴顶栏。
 
-            不能再用「position != fixed」判断：桌面端现在也用 fixed
-            （为了与 sticky 顶栏同步，见 .nav-tabs 的注释）。
-            真正要验的是位置：rect.bottom 应该落在顶部 80px 以内。
+            断言两件事：侧栏本身固定在左上角；导航项确实在这根侧栏里。
             """
-            r = page.get_by_test_id("nav-tabs").evaluate(
-                "(el) => { const b = el.getBoundingClientRect(); return {top: b.top, bottom: b.bottom}; }"
+            side = page.get_by_test_id("sidebar").evaluate(
+                "(el) => { const b = el.getBoundingClientRect(); return {left: b.left, top: b.top, width: b.width, position: getComputedStyle(el).position}; }"
             )
-            if r["bottom"] > 80:
-                raise AssertionError(
-                    f"桌面端导航底边在 {r['bottom']:.0f}px，应贴在顶部（<80）"
-                )
+            if side["position"] != "fixed" or side["left"] != 0 or side["top"] != 0:
+                raise AssertionError(f"左侧栏位置不对: {side}")
+            r = page.get_by_test_id("nav-tabs").evaluate(
+                "(el) => { const b = el.getBoundingClientRect(); return {left: b.left, right: b.right}; }"
+            )
+            if r["left"] < side["left"] or r["right"] > side["left"] + side["width"] + 1:
+                raise AssertionError(f"导航项不在左侧栏内: {r} vs {side}")
 
-        check("桌面端导航在顶部", desktop_nav_at_top, page)
+        check("桌面端导航在左侧栏", desktop_nav_in_sidebar, page)
         def airing_ok() -> None:
             """每日放送要么渲染出来，要么明确因为上游不可用而隐藏 —— 两者都算对。
 
@@ -204,33 +205,33 @@ def main() -> int:
         # 否则首次部署（0 收藏）会得到一条假失败
         check("收藏页渲染", lambda: expect(page.get_by_test_id("main")).to_be_visible(), page)
 
-        def nav_follows_scroll() -> None:
-            """向下滚动后，导航项必须还贴在顶栏里。
+        def sidebar_follows_scroll() -> None:
+            """向下滚动后，左侧导航栏必须仍然固定在视口左侧。
 
-            这是真实存在过的缺陷：.nav 是 sticky（滚到顶就贴住视口），
-            而 .nav-tabs 当时是 absolute 相对 .app 定位 —— 页面一滚，
-            顶栏留下了、导航项却跟着内容滚走了。
-            断言方式：滚动 400px，再量导航的 rect.top，应该还在顶部附近。
+            旧的顶栏布局验证的是「导航别跟着内容滚走」；左侧栏同理：
+            fixed 定位下 rect.top 必须一直是 0，不能随滚动偏移。
             """
-            # 页面不够高时 window.scrollTo 不会产生滚动，下面的 rect 断言就会空跑。
             can_scroll = page.evaluate(
                 "() => document.documentElement.scrollHeight > window.innerHeight + 400"
             )
             if not can_scroll:
                 raise SkipCheck("当前页面不够高，无法验证滚动后的导航")
+            before = page.get_by_test_id("sidebar").evaluate(
+                "(el) => el.getBoundingClientRect().top"
+            )
             page.evaluate("() => window.scrollTo(0, 400)")
             page.wait_for_timeout(300)
             y = page.evaluate("() => window.scrollY")
             if y <= 0:
                 raise AssertionError("scrollTo(0,400) 后 window.scrollY 仍是 0，滚动断言无效")
-            r = page.get_by_test_id("nav-tabs").evaluate(
+            after = page.get_by_test_id("sidebar").evaluate(
                 "(el) => el.getBoundingClientRect().top"
             )
-            if r > 40:
-                raise AssertionError(f"滚动 400px 后导航跑到了 {r:.0f}px（顶栏还在，导航滚走了）")
+            if before != 0 or after != 0:
+                raise AssertionError(f"滚动后侧栏 top 从 {before} 变为 {after}，应为 0")
             page.evaluate("() => window.scrollTo(0, 0)")
 
-        check("滚动后导航仍贴顶", nav_follows_scroll, page)
+        check("滚动后左侧栏仍固定", sidebar_follows_scroll, page)
 
         # ---------- 中等宽度：顶栏不该挤在一起 ----------
         print("tablet 900x700")
@@ -240,31 +241,30 @@ def main() -> int:
         t.goto(BASE, wait_until="networkidle")
 
         def no_overlap() -> None:
-            """顶栏里各区块不能重叠。
+            """侧栏、顶栏、搜索框、同步状态之间不能重叠。
 
-            这条专门防「加了导航却没管中间宽度」：5 个文字链接约占 378px，
-            与 320px 的搜索框在 900px 视口下会叠在一起 —— 而原来的断点只有
-            720px 与 640px，721-1100px 这段完全没人管。
-            量法：拿每个区块的 rect，两两比较横向区间是否相交。
+            旧布局把 logo/搜索/导航/按钮都塞在顶栏里，需要逐个比横向区间；
+            新布局里导航在侧栏，搜索在顶栏，所以改成：
+            侧栏右边缘不能压过顶栏左边缘；搜索框右边缘不能压住同步状态。
             """
-            rects = {}
-            for tid in ("nav-logo", "nav-search", "nav-tabs", "nav-actions"):
-                loc = t.get_by_test_id(tid)
-                if loc.count() == 0:
-                    continue
-                r = loc.first.evaluate(
-                    "(el) => { const b = el.getBoundingClientRect(); return {l: b.left, r: b.right}; }"
-                )
-                rects[tid] = (r["l"], r["r"])
+            side = t.get_by_test_id("sidebar").evaluate(
+                "(el) => el.getBoundingClientRect().right"
+            )
+            topbar = t.locator(".topbar").evaluate(
+                "(el) => el.getBoundingClientRect().left"
+            )
+            if side > topbar + 1:
+                raise AssertionError(f"侧栏右边缘 {side:.0f} 压住了顶栏左边缘 {topbar:.0f}")
+            search = t.get_by_test_id("nav-search").evaluate(
+                "(el) => el.getBoundingClientRect().right"
+            )
+            sync = t.locator(".topbar .sync-pill").evaluate(
+                "(el) => el.getBoundingClientRect().left"
+            )
+            if search > sync + 1:
+                raise AssertionError(f"搜索框右边缘 {search:.0f} 压住了同步状态 {sync:.0f}")
 
-            order = [k for k in ("nav-logo", "nav-search", "nav-tabs", "nav-actions") if k in rects]
-            for a, b in zip(order, order[1:]):
-                if rects[a][1] > rects[b][0] + 1:
-                    raise AssertionError(
-                        f"{a} 右边缘 {rects[a][1]:.0f} 压住了 {b} 的左边缘 {rects[b][0]:.0f}"
-                    )
-
-        check("顶栏各区块不重叠", no_overlap, t)
+        check("顶栏与侧栏不重叠", no_overlap, t)
 
         # ---------- 手机 ----------
         print("mobile 390x844")
