@@ -344,7 +344,9 @@ export default function SubjectPage() {
 
   return (
     <div>
-      <div className="subject-header">
+      <div className="subject-hero">
+        <div className="subject-hero-bg" style={{ backgroundImage: `url(${cover})` }} />
+        <div className="subject-header">
         {/* 给 Poster 原始地址而不是代理地址：它自己会在直连失败时改走 /api/proxy。
             传代理地址进去等于双层代理 —— 直连失败时它会把「代理地址」再代理一次 */}
         <Poster
@@ -378,6 +380,7 @@ export default function SubjectPage() {
           </button>
           <div className="summary">{subject.summary}</div>
         </div>
+      </div>
       </div>
 
       <h2 className="section-title">剧集列表</h2>

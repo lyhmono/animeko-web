@@ -13,20 +13,20 @@
    ============================================================ */
 
 :root {
-  --bg: #0b0c0f;
-  --bg-elevated: #13151b;
+  --bg: #0b0c10;
+  --bg-elevated: #14161c;
   --bg-card: #16181f;
   --bg-hover: #1e212a;
   --border: #262a35;
   --border-strong: #333947;
-  --text: #eceef2;
-  --text-secondary: #9ba3b4;
+  --text: #f5f7fa;
+  --text-secondary: #9aa3af;
   /* 信息性小字在 bg/card/elevated/hover 四种纯色底上均达到 AA。 */
   --text-dim: #858d9f;
-  --accent: #e3b04e;
-  --accent-hover: #f2c266;
-  --accent-dim: rgba(227, 176, 78, 0.14);
-  --accent-solid: #c9942f;
+  --accent: #e5a00d;
+  --accent-hover: #f0b429;
+  --accent-dim: rgba(229, 160, 13, 0.14);
+  --accent-solid: #c98a06;
   --accent-on: #1a1508;
   --danger: #e5604f;
   --danger-dim: rgba(229, 96, 79, 0.13);
@@ -38,18 +38,20 @@
      做小字不够，而我们只用它画图标，压深一档是给 hover 文字兜底 */
   --fav: #ff7d99;
   --fav-dim: rgba(255, 125, 153, 0.13);
-  --nav-bg: rgba(11, 12, 15, 0.88);
-  --hero-glow-1: rgba(227, 176, 78, 0.1);
-  --hero-glow-2: rgba(120, 90, 200, 0.05);
-  --shadow-card: none;
-  --shadow-hover: 0 10px 28px rgba(0, 0, 0, 0.45);
-  --range-thumb-ring: #13151b;
+  --nav-bg: rgba(11, 12, 16, 0.82);
+  --hero-glow-1: rgba(229, 160, 13, 0.12);
+  --hero-glow-2: rgba(120, 90, 200, 0.06);
+  --shadow-card: 0 4px 16px rgba(0, 0, 0, 0.28);
+  --shadow-hover: 0 14px 34px rgba(0, 0, 0, 0.5);
+  --range-thumb-ring: #14161c;
   --skeleton-base: #1a1d25;
   --skeleton-shine: rgba(235, 240, 255, 0.045);
-  --radius: 6px;
-  --radius-sm: 4px;
-  --nav-height: 56px;
-  --font-display: 'Noto Serif SC', 'Source Han Serif SC', 'Songti SC', 'SimSun', serif;
+  --radius: 12px;
+  --radius-sm: 8px;
+  --nav-height: 64px;
+  --sidebar-width: 232px;
+  --font-display: 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Noto Sans SC', sans-serif;
   color-scheme: dark;
 }
 

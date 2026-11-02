@@ -297,23 +297,26 @@ export default function SearchPage() {
 
   return (
     <div>
-      <h2 className="section-title">
-        搜索「{q}」
-        {!!q && (
-          <button
-            className="btn-icon"
-            title="重新搜索（跳过记忆的结果）"
-            aria-label="重新搜索"
-            onClick={() => {
-              // 先删缓存再触发重跑：effect 重跑时查不到缓存，自然走完整搜索路径
-              searchCache.delete(q)
-              setRunId((n) => n + 1)
-            }}
-          >
-            <IconRefresh />
-          </button>
-        )}
-      </h2>
+      <div className="search-hero">
+        <h2 className="section-title">
+          搜索「{q}」
+          {!!q && (
+            <button
+              className="btn-icon"
+              title="重新搜索（跳过记忆的结果）"
+              aria-label="重新搜索"
+              onClick={() => {
+                // 先删缓存再触发重跑：effect 重跑时查不到缓存，自然走完整搜索路径
+                searchCache.delete(q)
+                setRunId((n) => n + 1)
+              }}
+            >
+              <IconRefresh />
+            </button>
+          )}
+        </h2>
+        <p className="search-hero-sub">同时检索 Bangumi 条目与已启用的数据源</p>
+      </div>
       {!q && <div className="empty">输入关键词后开始搜索</div>}
 
       <h3 className="section-title" style={{ fontSize: 15 }}>

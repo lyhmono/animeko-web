@@ -45,6 +45,7 @@ export default function Poster({
       sizes={sizes}
       alt={alt}
       loading={loading}
+      decoding="async"
       fetchPriority={fetchPriority}
       // 不发 Referer。默认行为会把**当前页的完整 URL**送给每家第三方图床
       // （Bangumi 的 CDN、各数据源自己的 img 域名），而搜索页的地址是

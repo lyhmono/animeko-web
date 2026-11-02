@@ -27,6 +27,7 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
+import io.ktor.server.application.ApplicationCallPipeline
 import io.ktor.server.application.install
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
@@ -37,6 +38,7 @@ import io.ktor.server.plugins.compression.matchContentType
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.request.path
+import io.ktor.server.response.header
 import io.ktor.server.response.respond
 import io.ktor.server.routing.routing
 import kotlinx.coroutines.CancellationException
@@ -61,6 +63,32 @@ fun Application.module(
     probeLimiter: LoginRateLimiter = LoginRateLimiter(maxAttempts = PROBE_MAX_ATTEMPTS, windowMs = PROBE_WINDOW_MS),
     credentialVerifier: CredentialVerifier = ConfiguredCredentialVerifier(cfg),
 ) {
+    // 每个请求一个短 ID：响应头带给客户端，访问日志用它把同一请求的多行日志串起来。
+    // 只记路径不记查询串（代理 sid、搜索词、媒体地址都不该进日志）。
+    intercept(ApplicationCallPipeline.Setup) {
+        // Ktor 3 的 intercept 接收者是 PipelineContext，ApplicationCall 从 context 取
+        val call = context
+        val requestId = java.util.UUID.randomUUID().toString().take(8)
+        call.response.header("X-Request-Id", requestId)
+        val startedAt = System.nanoTime()
+        try {
+            proceed()
+        } finally {
+            val path = call.request.path()
+            // 健康检查每 30 秒一次，记进访问日志只会淹没真正的故障
+            if (path != "/api/health") {
+                val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+                appLog.info(
+                    "{} {} -> {} ({}ms, id={})",
+                    call.request.local.method.value,
+                    path,
+                    call.response.status()?.value ?: 0,
+                    elapsedMs,
+                    requestId,
+                )
+            }
+        }
+    }
     install(ContentNegotiation) {
         json(Json { ignoreUnknownKeys = true; encodeDefaults = true })
     }

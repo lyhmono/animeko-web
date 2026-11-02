@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import Poster from '../components/Poster'
+import RailSection from '../components/RailSection'
 import { api, errMsg } from '../api'
-import { favoriteIdSet, onDocChange } from '../lib/storage'
+import { favoriteIdSet, listRecent, onDocChange, type RecentItem } from '../lib/storage'
 import { IconHeartFilled, IconRefresh, IconStar } from '../lib/icons'
 import { getSourceRevision, onSourcesChanged } from '../lib/sourceEvents'
 import type { BgmSubject } from '../types'
@@ -27,6 +28,8 @@ export default function DiscoverPage() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [favIds, setFavIds] = useState<Set<number>>(() => favoriteIdSet())
+  // 继续观看是本机/账号文档里的最近播放，不需要额外请求；没有记录时整个分区不渲染
+  const [recent] = useState<RecentItem[]>(() => listRecent(8))
   const [sourceRevision, setSourceRevision] = useState(getSourceRevision)
   const itemsRef = useRef(items)
   const requestRef = useRef<AbortController | null>(null)
@@ -94,8 +97,42 @@ export default function DiscoverPage() {
   const scoreOf = (s: BgmSubject) => s.rating?.score ?? s.score ?? null
   const rankOf = (s: BgmSubject) => s.rating?.rank ?? s.rank ?? null
 
+  const spotlight = items[0]
+
   return (
     <div className="fade-in">
+      {recent.length > 0 && (
+        <RailSection title="继续观看" subtitle={`${recent.length} 条`}>
+          {recent.map((r) => (
+            <Link
+              key={`${r.source}|${r.playUrl}`}
+              className="recent-card"
+              to={`/play?${new URLSearchParams({ source: r.source, url: r.playUrl, title: r.title, anime: r.anime, ep: r.ep }).toString()}`}
+            >
+              <div className="recent-card-title">{r.title || r.anime}</div>
+              <div className="recent-card-meta">
+                {r.ep && <span>第 {r.ep} 话</span>}
+                {r.source && <span>{r.source}</span>}
+              </div>
+            </Link>
+          ))}
+        </RailSection>
+      )}
+      {spotlight && (
+        <section className="discover-hero" aria-label="排行榜焦点">
+          <div className="discover-hero-bg" style={{ backgroundImage: `url(${coverOf(spotlight)})` }} />
+          <div className="discover-hero-content">
+            <span className="discover-hero-kicker">
+              Bangumi 评分榜{rankOf(spotlight) != null ? ` · 第 ${rankOf(spotlight)} 名` : ''}
+            </span>
+            <h1>{spotlight.name_cn || spotlight.name}</h1>
+            {spotlight.summary && <p>{spotlight.summary}</p>}
+            <div>
+              <Link className="btn" to={`/subject/${spotlight.id}`}>查看详情</Link>
+            </div>
+          </div>
+        </section>
+      )}
       <h2 className="section-title">
         <IconStar size={17} />
         排行榜

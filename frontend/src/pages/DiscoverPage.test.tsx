@@ -6,7 +6,7 @@ vi.mock('react', async (importOriginal) => ({
   ...await importOriginal<typeof import('react')>(),
   ...(await import('../test/uiHarness')).testHooks,
 }))
-vi.mock('../lib/storage', () => ({ favoriteIdSet: () => new Set<number>(), onDocChange: () => () => {} }))
+vi.mock('../lib/storage', () => ({ favoriteIdSet: () => new Set<number>(), listRecent: () => [], onDocChange: () => () => {} }))
 vi.mock('../api', async (importOriginal) => ({
   ...await importOriginal<typeof import('../api')>(), api: { bangumiRanking: vi.fn() },
 }))
@@ -37,12 +37,12 @@ describe('ranking return continuity', () => {
     button(first.tree, '加载更多').props.onClick()
     await settle()
     first.render(DiscoverPage)
-    expect(elements(first.tree).filter((element) => element.props.to?.startsWith('/subject/'))).toHaveLength(48)
+    expect(elements(first.tree).filter((element) => element.props.to?.startsWith('/subject/'))).toHaveLength(49)
     first.unmount()
     const returned = mount()
     await settle()
     returned.render(DiscoverPage)
-    expect(elements(returned.tree).filter((element) => element.props.to?.startsWith('/subject/'))).toHaveLength(48)
+    expect(elements(returned.tree).filter((element) => element.props.to?.startsWith('/subject/'))).toHaveLength(49)
     expect(api.bangumiRanking).toHaveBeenCalledTimes(2)
     returned.unmount()
   })
@@ -63,7 +63,7 @@ describe('ranking return continuity', () => {
     await settle()
     harness.render(DiscoverPage)
     expect(text(harness.tree)).not.toContain('offline')
-    expect(elements(harness.tree).filter((element) => element.props.to?.startsWith('/subject/'))).toHaveLength(24)
+    expect(elements(harness.tree).filter((element) => element.props.to?.startsWith('/subject/'))).toHaveLength(25)
     harness.unmount()
   })
 

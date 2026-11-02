@@ -4,6 +4,7 @@ import { BrowserRouter } from 'react-router-dom'
 import App from './App'
 import { getTheme, syncThemeColor } from './lib/storage'
 import './styles.css'
+import './styles-plex.css'
 
 // 渲染前应用已保存的主题，避免首屏闪烁
 const initialTheme = getTheme()
