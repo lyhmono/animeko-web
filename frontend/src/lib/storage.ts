@@ -49,7 +49,17 @@ const syncListeners = new Set<(s: SyncState) => void>()
 function setSync(next: SyncState): void {
   // note 为空时带上体积提醒：状态点每变一次都要重算，否则一次成功的保存
   // 就把「快满了」的提醒抹掉了，而那个提醒的意义正是「现在还能写，但快写不下了」
-  sync = next.note || !sizeNote ? next : { ...next, note: sizeNote }
+  const merged: SyncState = next.note || !sizeNote ? next : { ...next, note: sizeNote }
+  // 四个字段全同就不下发。scheduleFlush 每次写入都会发一遍 'pending'，播放中每几秒一轮，
+  // 而状态其实没变过：无条件下发等于每次都给订阅方一个新对象，React 无从 bail out，
+  // 于是 Layout 连着它 <Outlet/> 里的当前页面整棵重渲染。
+  if (
+    merged.status === sync.status && merged.kind === sync.kind &&
+    merged.error === sync.error && (merged.note ?? '') === (sync.note ?? '')
+  ) {
+    return
+  }
+  sync = merged
   syncListeners.forEach((l) => l(sync))
 }
 
@@ -146,6 +156,17 @@ async function loadOnce(epoch: number): Promise<void> {
 
 const DEBOUNCE_MS = 800
 const RETRY_MS = 5000
+/**
+ * 播放中只有进度在动时的推送间隔。
+ *
+ * 单独一档的理由：进度每 4 秒写一次（PlayerPage 的 |time-last|>=4），走的却是整份
+ * 文档的 PUT —— 服务端上限 512KB，每次都要把整份重新序列化再发一遍，只为改一个
+ * time 字段。文档越满，播放中的周期性卡顿越明显，而这份流量全是白付的。
+ * visibilitychange / pagehide 本来就会立即 flush（见本文件底部），拉长间隔不丢数据。
+ */
+const PLAYBACK_FLUSH_MS = 15000
+/** 播放期高频写入的键：只有待写的全是它们时才用上面那档间隔 */
+const PLAYBACK_TICK_KEYS = new Set(['progress', 'subjectProgress'])
 /** 单个剧集一条记录，看久了会无限增长直到撞上限，所以留最新的一部分即可 */
 const MAX_PROGRESS_ENTRIES = 400
 
@@ -170,6 +191,7 @@ function hasPendingWrites(): boolean {
 
 function clearPending(): void {
   historyClear = null
+  playbackTickSince = 0
   pendingKeys.clear()
   pendingProgressKeys.clear()
   pendingFavIds.clear()
@@ -179,6 +201,17 @@ function clearPending(): void {
 
 let timer: ReturnType<typeof setTimeout> | undefined
 let running: Promise<void> | null = null
+/** 播放进度这一轮窗口从何时开始记；0 表示当前没有待推的播放进度 */
+let playbackTickSince = 0
+
+/** 待写的全是播放进度。任何别的键在场都按常规间隔走，不能因为正在播放就压住收藏。 */
+function isPlaybackTickOnly(): boolean {
+  if (!hasPendingWrites()) return false
+  if (historyClear || pendingFavIds.size > 0 || pendingSourceFavKeys.size > 0) return false
+  if (pendingKeys.size === 0) return false
+  for (const key of pendingKeys) if (!PLAYBACK_TICK_KEYS.has(key)) return false
+  return true
+}
 
 function scheduleFlush(key?: string, progressEntry?: string): void {
   if (key) pendingKeys.add(key)
@@ -186,7 +219,16 @@ function scheduleFlush(key?: string, progressEntry?: string): void {
   if (!loaded) return // 见文件头第 1 条：没有服务端文档就没有可覆盖的基准
   setSync({  status: 'pending', kind: null, error: ''  })
   if (timer) clearTimeout(timer)
-  timer = setTimeout(() => void flushUserData(), DEBOUNCE_MS)
+  if (isPlaybackTickOnly()) {
+    // 这里必须是「最长等待」而不是「静默期」：进度每 4 秒来一次，纯去抖会让定时器
+    // 被无限重置，整场播放一次都不落盘，直到用户切走标签页才补上。
+    if (!playbackTickSince) playbackTickSince = Date.now()
+    const waited = Date.now() - playbackTickSince
+    timer = setTimeout(() => void flushUserData(), Math.max(0, PLAYBACK_FLUSH_MS - waited))
+  } else {
+    playbackTickSince = 0
+    timer = setTimeout(() => void flushUserData(), DEBOUNCE_MS)
+  }
 }
 
 /** 调用方不能把 Promise resolve 当成保存成功；会话变化同样不是成功确认。 */
@@ -230,6 +272,8 @@ export async function flushUserData(): Promise<FlushResult> {
     if (running === round) running = null
   })
   running = round
+  // 这一轮已经把进度发出去了，播放窗口重新计时
+  playbackTickSince = 0
   await round
   return flushResult(epoch)
 }

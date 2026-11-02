@@ -13,6 +13,7 @@ import type {
   SubscriptionImport,
   UserData,
 } from './types'
+import { toCalendarDays, toSubject, toSubjectPage, toSubjects } from './lib/bgm'
 
 /** 带 HTTP 状态的错误：数据层要区分 401（会话没了）/409（版本不符）/400（超限或格式错）。 */
 export class ApiError extends Error {
@@ -60,7 +61,9 @@ async function send<T>(path: string, consume: (resp: Response) => Promise<T>, in
     const resp = await fetch(path, {
       ...init,
       signal: controller.signal,
-      headers: { 'Content-Type': 'application/json', ...init?.headers },
+      // 没有正文就不要声明正文类型：GET/HEAD 带上 Content-Type 会让某些代理与
+      // 服务端把它当成有 body 的请求处理。调用方显式给的 headers 仍然优先。
+      headers: { ...(init?.body ? { 'Content-Type': 'application/json' } : null), ...init?.headers },
     })
     if (!resp.ok) {
       let message = `${resp.status} ${resp.statusText}`
@@ -95,6 +98,15 @@ async function send<T>(path: string, consume: (resp: Response) => Promise<T>, in
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return send(path, (resp) => resp.json() as Promise<T>, init)
+}
+
+/**
+ * 与 request 同一条路径，但把 JSON 先交给归一化函数再过类型边界。
+ * Bangumi 那几个端点走这条：响应要穿过官方 / 社区镜像 / 本机代理三层中的任意一层，
+ * 而 types.ts 里那些「必有」字段没有一层替我们保证。见 lib/bgm.ts。
+ */
+async function requestMapped<T>(path: string, map: (raw: unknown) => T, init?: RequestInit): Promise<T> {
+  return send(path, async (resp) => map(await (resp.json() as Promise<unknown>)), init)
 }
 
 /** ETag 在 HTTP 上是带引号的字符串，比较前先脱引号（弱标记 W/ 也一起去掉）。 */
@@ -176,14 +188,15 @@ export const api = {
 
   // ---- Bangumi ----
   searchBangumi: (q: string, signal?: AbortSignal) =>
-    request<BgmSubject[]>(`/api/bangumi/search?q=${encodeURIComponent(q)}`, { signal }),
-  bangumiSubject: (id: number, signal?: AbortSignal) => request<BgmSubject>(`/api/bangumi/subjects/${id}`, { signal }),
+    requestMapped<BgmSubject[]>(`/api/bangumi/search?q=${encodeURIComponent(q)}`, toSubjects, { signal }),
+  bangumiSubject: (id: number, signal?: AbortSignal) =>
+    requestMapped<BgmSubject>(`/api/bangumi/subjects/${id}`, toSubject, { signal }),
   /** 排行榜（发现页）。镜像同样支持该端点，因为它走的是 /v0/subjects */
   bangumiRanking: (offset: number, limit = 24, signal?: AbortSignal) =>
-    request<BgmSubjectPage>(`/api/bangumi/ranking?offset=${offset}&limit=${limit}`, { signal }),
+    requestMapped<BgmSubjectPage>(`/api/bangumi/ranking?offset=${offset}&limit=${limit}`, toSubjectPage, { signal }),
   /** 每日放送表。镜像部署下会上游 502，调用方按可选功能处理（拉不到就不显示） */
   bangumiCalendar: (signal?: AbortSignal) =>
-    request<BgmCalendarDay[]>(`/api/bangumi/calendar`, { signal }),
+    requestMapped<BgmCalendarDay[]>(`/api/bangumi/calendar`, toCalendarDays, { signal }),
   bangumiChannel: (signal?: AbortSignal) => request<BgmChannelInfo>('/api/bangumi/channel', { signal }),
   setBangumiChannel: (channel: BgmChannelKind, customUrls: string[], signal?: AbortSignal) =>
     request<BgmChannelInfo>('/api/bangumi/channel', {

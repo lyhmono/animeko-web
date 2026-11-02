@@ -1,12 +1,14 @@
 import { useEffect, useState } from 'react'
-import { Link, useParams, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { api, errMsg } from '../api'
 import type { EpisodeHit, EpisodesResult } from '../types'
 import { isSourceFavorite, onDocChange, toggleSourceFavorite, type SourceFavorite } from '../lib/storage'
 import { IconHeart, IconHeartFilled } from '../lib/icons'
+import { buildPlayUrl } from '../lib/playUrl'
 
 export default function SourceDetailPage() {
   const { name } = useParams<{ name: string }>()
+  const navigate = useNavigate()
   const [params] = useSearchParams()
   const subjectUrl = params.get('url') ?? ''
   const title = params.get('title') ?? ''
@@ -15,6 +17,8 @@ export default function SourceDetailPage() {
   const [result, setResult] = useState<EpisodesResult | null>(null)
   const [error, setError] = useState('')
   const [channel, setChannel] = useState<string | null>(null)
+  /** 剧集列表解析失败后的重试计数：终态错误页必须给出出口，不能只剩一行字 */
+  const [retry, setRetry] = useState(0)
 
   useEffect(() => {
     // cancelled 守卫：切换数据源/条目时旧请求的慢响应不能覆盖新结果
@@ -47,7 +51,7 @@ export default function SourceDetailPage() {
       cancelled = true
       controller.abort()
     }
-  }, [name, subjectUrl])
+  }, [name, subjectUrl, retry])
 
   // 整份文档换档时重抄收藏态（启动读取失败后重试、冲突合并）
   useEffect(() => {
@@ -56,33 +60,41 @@ export default function SourceDetailPage() {
   }, [name, subjectUrl])
 
   const goPlay = (playUrl: string, epName: string, epSort: string, nextEp?: EpisodeHit) => {
-    const q = new URLSearchParams({
-      source: name ?? '',
-      play: playUrl,
-      title: `${title} ${epName}`,
-      anime: title,
-      ep: epSort,
-    })
-    // 数据源详情页地址也要带过去：播放页的连播在 URL 里没带下一集时靠它重新取列表。
-    // 不带的话，从这条入口（数据源搜索结果 → 详情页）进去的连播只能连一集 ——
-    // 和条目页那条入口的行为不一致，而两处用的是同一个播放页。
-    q.set('surl', subjectUrl)
-    if (nextEp) {
-      q.set(
-        'next',
-        JSON.stringify({
-          source: name ?? '',
-          play: nextEp.playUrl,
-          title: `${title} ${nextEp.name}`,
-          anime: title,
-          ep: nextEp.sort,
-        }),
-      )
-    }
-    window.location.assign(`/play?${q.toString()}`)
+    navigate(
+      buildPlayUrl(
+        { source: name ?? '', play: playUrl, title: `${title} ${epName}`, anime: title, ep: epSort },
+        {
+          // 数据源详情页地址也要带过去：播放页的连播在 URL 里没带下一集时靠它重新取列表。
+          // 不带的话，从这条入口（数据源搜索结果 → 详情页）进去的连播只能连一集 ——
+          // 和条目页那条入口的行为不一致，而两处用的是同一个播放页。
+          subjectUrl,
+          next: nextEp
+            ? {
+                source: name ?? '',
+                play: nextEp.playUrl,
+                title: `${title} ${nextEp.name}`,
+                anime: title,
+                ep: nextEp.sort,
+              }
+            : null,
+        },
+      ),
+    )
   }
 
-  if (error) return <div className="error-box">{error}</div>
+  if (error) {
+    return (
+      <div className="error-box">
+        {error}{' '}
+        <button className="btn btn-sm" onClick={() => setRetry((n) => n + 1)}>
+          重试
+        </button>{' '}
+        <Link className="btn btn-secondary btn-sm" to={`/sources`}>
+          返回数据源
+        </Link>
+      </div>
+    )
+  }
   if (!result) return <div className="loading">正在解析剧集列表…</div>
 
   const groups = result.groups.length > 0 ? result.groups : null

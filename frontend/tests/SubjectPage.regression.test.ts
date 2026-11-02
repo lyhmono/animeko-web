@@ -3,6 +3,9 @@ import { isSpecialEpisodeName } from '../src/lib/titleMatch'
 import { confirmedBangumiEpisode, nextBangumiEpisode } from '../src/lib/episodeProgress'
 import { callback, jsxCallback, SUBJECT } from './playerTestHarness'
 import type { BgmEpisode, EpisodeHit } from '../src/types'
+// 必须是真实的生产函数：下面几条断言查的就是它拼出来的 bep/ep/subject/surl，
+// 换成替身等于把 FP-04 这条守卫掏空。
+import { buildPlayUrl } from '../src/lib/playUrl'
 
 function selected(name: string, sortNum: number | null, channel: string | null = '正片'): EpisodeHit {
   return { name, sortNum, sort: String(sortNum ?? name), channel, playUrl: 'https://source.test/' + encodeURIComponent(name) }
@@ -14,7 +17,7 @@ function manualSelection(ep: EpisodeHit, bangumi: BgmEpisode, next?: EpisodeHit)
     ep, flow: { episode: bangumi, matchedSource: 'fixture', sourceSubjectUrl: 'https://source.test/subject',
       pickingEpisodes: { episodes: next ? [ep, next] : [ep] } },
     subject: { name_cn: 'Show', name: 'Show' }, isSpecialEpisodeName, confirmedBangumiEpisode,
-    goPlay: callback(SUBJECT, 'goPlay', { subjectId: 77, window: { location: { assign: (url: string) => { destination = url } } } }),
+    goPlay: callback(SUBJECT, 'goPlay', { subjectId: 77, buildPlayUrl, navigate: (url: string) => { destination = url } }),
     nextOf: callback(SUBJECT, 'nextOf', { isSpecialEpisodeName, nextBangumiEpisode }),
   }
   jsxCallback<() => void>(SUBJECT, 'onClick', scope, 'flow.matchedSource')()

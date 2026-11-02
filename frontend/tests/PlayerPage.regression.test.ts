@@ -3,6 +3,8 @@ import { callback, deferred, effect, jsxCallback, PLAYER } from './playerTestHar
 import { isSpecialEpisodeName } from '../src/lib/titleMatch'
 import { nextBangumiEpisode, sourceEpisodeIsSpecial } from '../src/lib/episodeProgress'
 import type { EpisodeHit } from '../src/types'
+// 必须是真实的生产函数：下面断言查的就是它拼出来的 bep/next/subject。
+import { buildPlayUrl } from '../src/lib/playUrl'
 
 type MediaErrorHandler = (message: string, status?: number, context?: { code?: string }) => void | Promise<void>
 
@@ -145,8 +147,8 @@ describe('FP-05 special episodes stop the entire inferred Bangumi chain', () => 
     let assigned = ''
     callback<() => void>(PLAYER, 'navToNext', {
       target: autoNext, successorRef, subjectId: 77, subjectUrl: 'https://source.test/subject',
-      nextToParams: callback(PLAYER, 'nextToParams', {}),
-      window: { location: { assign: (url: string) => { assigned = url } } },
+      buildPlayUrl,
+      navigate: (url: string) => { assigned = url },
     })()
     const p = new URL(assigned, 'https://site.test').searchParams
     expect(p.has('bep')).toBe(false)

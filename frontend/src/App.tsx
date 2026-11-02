@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ComponentType } from 'react'
 import { lazy, Suspense } from 'react'
-import { Route, Routes } from 'react-router-dom'
+import { Route, Routes, useLocation } from 'react-router-dom'
 import Layout from './components/Layout'
 import ErrorBoundary from './components/ErrorBoundary'
 import LoginPage from './pages/LoginPage'
@@ -26,15 +26,53 @@ import {
 
 // 路由级代码分割：播放器（含 hls.js）等重依赖只随对应路由按需加载，
 // 首页首包不再携带 hls.js 与全部页面代码
-const SearchPage = lazy(() => import('./pages/SearchPage'))
-const SubjectPage = lazy(() => import('./pages/SubjectPage'))
-const SourceDetailPage = lazy(() => import('./pages/SourceDetailPage'))
-const PlayerPage = lazy(() => import('./pages/PlayerPage'))
-const SourcesPage = lazy(() => import('./pages/SourcesPage'))
-const FavoritesPage = lazy(() => import('./pages/FavoritesPage'))
-const DiscoverPage = lazy(() => import('./pages/DiscoverPage'))
-const SettingsPage = lazy(() => import('./pages/SettingsPage'))
-const NotFoundPage = lazy(() => import('./pages/NotFoundPage'))
+/**
+ * 懒加载 chunk 取不到时重载一次。
+ *
+ * 场景是老标签页遇上新部署：service worker 故意不 skipWaiting，已缓存的旧 chunk 还能用，
+ * 但「这个旧页面从没加载过的懒路由」在新部署里已经换掉了，点进去是一次 404 的 import，
+ * 然后落到 ErrorBoundary 上 —— 用户看到的是一张错误页，而真正需要的只是刷新一下。
+ *
+ * 用时间戳而不是布尔记账：布尔版被用掉一次就永远不再兜底（没人去清它），
+ * 而「10 秒内只重载一次」既能自愈，又不会在 chunk 真的坏了时进入重载死循环。
+ */
+function lazyWithReload(factory: () => Promise<{ default: ComponentType }>) {
+  return lazy(async () => {
+    try {
+      return await factory()
+    } catch (e) {
+      const KEY = 'animeko-chunk-reload-at'
+      const last = Number(sessionStorage.getItem(KEY) || 0)
+      if (Date.now() - last > 10_000) {
+        sessionStorage.setItem(KEY, String(Date.now()))
+        window.location.reload()
+        // reload 不会立刻中断脚本；挂在这里，免得先闪一帧错误页
+        return new Promise<{ default: ComponentType }>(() => {})
+      }
+      throw e
+    }
+  })
+}
+
+const SearchPage = lazyWithReload(() => import('./pages/SearchPage'))
+const SubjectPage = lazyWithReload(() => import('./pages/SubjectPage'))
+const SourceDetailPage = lazyWithReload(() => import('./pages/SourceDetailPage'))
+const PlayerPage = lazyWithReload(() => import('./pages/PlayerPage'))
+const SourcesPage = lazyWithReload(() => import('./pages/SourcesPage'))
+const FavoritesPage = lazyWithReload(() => import('./pages/FavoritesPage'))
+const DiscoverPage = lazyWithReload(() => import('./pages/DiscoverPage'))
+const SettingsPage = lazyWithReload(() => import('./pages/SettingsPage'))
+const NotFoundPage = lazyWithReload(() => import('./pages/NotFoundPage'))
+
+/**
+ * /play → /play（连播切集）只有 search 变化，React Router 不会重挂载组件，
+ * 于是上一集的播放器状态会跟着进下一集。用 search 当 key 换回重挂载。
+ * 「换集等于一份全新的播放器状态」这条不变量由这里保证，不在播放页自己身上。
+ */
+function PlayerPageRoute() {
+  const { search } = useLocation()
+  return <PlayerPage key={search} />
+}
 
 type Boot =
   | { stage: 'loading' }
@@ -293,7 +331,7 @@ export default function App() {
             <Route path="/search" element={<SearchPage />} />
             <Route path="/subject/:id" element={<SubjectPage />} />
             <Route path="/source/:name" element={<SourceDetailPage />} />
-            <Route path="/play" element={<PlayerPage />} />
+            <Route path="/play" element={<PlayerPageRoute />} />
             <Route path="/sources" element={<SourcesPage />} />
             <Route path="/discover" element={<DiscoverPage />} />
             <Route path="/favorites" element={<FavoritesPage />} />

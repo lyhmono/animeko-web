@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { api, errMsg, UNAUTHORIZED_EVENT } from '../api'
 import VideoPlayer from '../components/VideoPlayer'
 import { nextBangumiEpisode, sourceEpisodeIsSpecial } from '../lib/episodeProgress'
@@ -13,45 +13,17 @@ import {
   setSubjectProgress,
 } from '../lib/storage'
 import { IconCheck, IconClock, IconKeyboard, IconNext } from '../lib/icons'
+import { buildPlayUrl, type PlayEpisode } from '../lib/playUrl'
 
-/** 下一集信息（连播用），通过 URL 参数传递 */
-interface NextEpisode {
-  source: string
-  play: string
-  title: string
-  anime: string
-  ep: string
-  /** 条目侧 Bangumi 集号：条目进度只能写这个，不能写数据源集号 */
-  bep?: string
-}
-
-function parseNext(raw: string | null): NextEpisode | null {
+function parseNext(raw: string | null): PlayEpisode | null {
   if (!raw) return null
   try {
     const obj = JSON.parse(raw)
-    if (obj && typeof obj.play === 'string' && obj.play.startsWith('http')) return obj as NextEpisode
+    if (obj && typeof obj.play === 'string' && obj.play.startsWith('http')) return obj as PlayEpisode
   } catch {
     /* ignore */
   }
   return null
-}
-
-function nextToParams(next: NextEpisode, subjectId = 0, subjectUrl = ''): URLSearchParams {
-  const p = new URLSearchParams({
-    source: next.source,
-    play: next.play,
-    title: next.title,
-    anime: next.anime,
-    ep: next.ep,
-  })
-  if (next.bep) p.set('bep', next.bep)
-  // 连播要把条目 id 一起带过去。原先 next 里只有五个字段（没有 subject），
-  // 于是自动切到下一话后 subjectId=0，那一句 `if (subjectId > 0) setSubjectProgress(...)`
-  // 再也不执行 —— 条目页的「看到第几话」永久停在上一话，而且没有任何报错。
-  if (subjectId > 0) p.set('subject', String(subjectId))
-  // 数据源详情页地址也要带过去：它是连播链条「手里没有下一集时」唯一的续命凭据
-  if (subjectUrl) p.set('surl', subjectUrl)
-  return p
 }
 
 /** 媒体地址能不能交给浏览器直连：https 页面里不许直连 http 媒体（浏览器会按混合内容拦掉）。 */
@@ -75,6 +47,7 @@ function fmtTime(seconds: number): string {
 
 export default function PlayerPage() {
   const [params, setSearchParams] = useSearchParams()
+  const navigate = useNavigate()
   const source = params.get('source') ?? ''
   const playUrl = params.get('play') ?? ''
   const title = params.get('title') ?? ''
@@ -110,9 +83,9 @@ export default function PlayerPage() {
    * 「即将播放下一集」再也不出现，用户唯一的办法是回条目页重新点一次。
    * 一个号称「自动连播」的功能只会连一集，这不是降级，是功能不成立。
    */
-  const [autoNext, setAutoNext] = useState<NextEpisode | null>(null)
+  const [autoNext, setAutoNext] = useState<PlayEpisode | null>(null)
   /** 顺带多算出来的一集：带进下一跳的 URL，让下一页仍能走零成本的旧路径 */
-  const successorRef = useRef<NextEpisode | null>(null)
+  const successorRef = useRef<PlayEpisode | null>(null)
   const chainSeqRef = useRef(0)
   const chainAbortRef = useRef<AbortController | null>(null)
   const target = nextInfo ?? autoNext
@@ -229,11 +202,12 @@ export default function PlayerPage() {
   const navToNext = () => {
     const ep = target
     if (!ep) return
-    const p = nextToParams(ep, subjectId, subjectUrl)
     // 只有 resolveChain 顺手多算出来的那一集才写进 URL；从条目页来的旧路径
     // 手里只有 next 这一条，下一跳会自己去取列表（那时 surl 已经带上了）
-    if (successorRef.current) p.set('next', JSON.stringify(successorRef.current))
-    window.location.assign(`/play?${p.toString()}`)
+    //
+    // 走 SPA 导航：整页重载的代价（重跑启动健康检查、重拉个人数据文档、重挂 Layout）
+    // 是连播每一集都要付的。重挂载由 App.tsx 的 PlayerPageRoute 那个 key 负责。
+    navigate(buildPlayUrl(ep, { subjectId, subjectUrl, next: successorRef.current }))
   }
 
   /**
@@ -263,7 +237,7 @@ export default function PlayerPage() {
       if (i < 0) return
       const current = list[i]
       const currentBep = Number(bep)
-      const mk = (e: (typeof list)[number], nextBep?: string): NextEpisode => ({
+      const mk = (e: (typeof list)[number], nextBep?: string): PlayEpisode => ({
         source,
         play: e.playUrl,
         title: `${animeName || title} ${e.name}`,
@@ -461,7 +435,7 @@ export default function PlayerPage() {
       </div>
 
       {resumeTime != null && (
-        <div className="resume-bar fade-in">
+        <div className="resume-bar fade-in" aria-live="polite">
           <IconClock size={15} />
           <span className="resume-text">
             上次播放到 <b>{fmtTime(resumeTime)}</b>，是否继续？
@@ -477,12 +451,14 @@ export default function PlayerPage() {
       )}
 
       {nextCountdown != null && (
-        <div className="next-bar fade-in">
+        <div className="next-bar fade-in" aria-live="polite">
           <IconNext size={15} />
           <span className="next-text">
             即将播放下一集：<b>{target?.title ?? ''}</b>
           </span>
-          <span className="next-count">{nextCountdown}s</span>
+          {/* 倒计时每秒都在变，放进 live region 会让读屏每秒播报一次；
+              要播的是「即将播放下一集」这件事，不是秒数 */}
+          <span className="next-count" aria-hidden="true">{nextCountdown}s</span>
           <button className="btn btn-sm" onClick={gotoNext}>
             立即播放
           </button>

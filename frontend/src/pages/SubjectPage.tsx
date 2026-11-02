@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import Poster from '../components/Poster'
 import { api, errMsg } from '../api'
 import { pickBestHit, pickEpisode } from '../lib/titleMatch'
@@ -8,6 +8,7 @@ import { useModalFocus } from '../lib/useModalFocus'
 import type { BgmEpisode, BgmSubject, EpisodesResult, StoredSource } from '../types'
 import { getSubjectProgress, isFavorite, onDocChange, toggleFavorite } from '../lib/storage'
 import { IconHeart, IconHeartFilled } from '../lib/icons'
+import { buildPlayUrl, type PlayEpisode } from '../lib/playUrl'
 
 /** Bangumi 剧集 type：0 本篇，1 SP，2 OP，3 ED，4 预告，5 MAD，6 其他 */
 const EP_TYPE_TAG: Record<number, string> = { 1: 'SP', 2: 'OP', 3: 'ED', 4: 'CM', 5: 'MAD', 6: '其他' }
@@ -34,6 +35,7 @@ interface PlayFlow {
 
 export default function SubjectPage() {
   const { id } = useParams<{ id: string }>()
+  const navigate = useNavigate()
   const idNum = Number(id)
   // Number('abc') 为 NaN、Number('') 为 0：必须显式校验正整数，否则无效 ID 会让页面卡在「加载中…」
   const subjectId = Number.isInteger(idNum) && idNum > 0 ? idNum : 0
@@ -114,7 +116,7 @@ export default function SubjectPage() {
     return () => {
       cancelled = true
       controller.abort()
-      // 卸载后那条在飞的匹配同样不许再跳转（它做的是整页 location.assign）
+      // 卸载后那条在飞的匹配同样不许再跳转（它会 navigate 到播放页）
       matchGenRef.current++
       matchAbortRef.current?.abort()
       matchAbortRef.current = null
@@ -154,28 +156,28 @@ export default function SubjectPage() {
       animeName: string,
       epSort: number | string,
       epLabel: string,
-      next?: { source: string; play: string; title: string; anime: string; ep: string; bep?: string } | null,
+      next?: PlayEpisode | null,
       subjectUrl?: string,
       /** 经过源剧集身份校验的本篇集号，与源侧 epSort 分开。 */
       bangumiEp?: number,
     ) => {
-      const params = new URLSearchParams({
-        source: sourceName,
-        play: playUrl,
-        title: `${animeName} ${epLabel}`,
-        anime: animeName,
-        ep: String(epSort),
-        // 带上条目 id：播放页据此回写「看到第几话」，条目页才能标出进度
-        subject: String(subjectId),
-      })
-      // ep 是数据源侧集号（连播时会变），bep 才是条目侧的 Bangumi 集号
-      if (bangumiEp != null) params.set('bep', String(bangumiEp))
-      if (next) params.set('next', JSON.stringify(next))
-      // 数据源详情页地址：连播链条在「URL 里没带下一集」时靠它重新取列表
-      if (subjectUrl) params.set('surl', subjectUrl)
-      window.location.assign(`/play?${params.toString()}`)
+      navigate(
+        buildPlayUrl(
+          {
+            source: sourceName,
+            play: playUrl,
+            title: `${animeName} ${epLabel}`,
+            anime: animeName,
+            ep: String(epSort),
+            // ep 是数据源侧集号（连播时会变），bep 才是条目侧的 Bangumi 集号
+            bep: bangumiEp != null ? String(bangumiEp) : undefined,
+          },
+          // 带上条目 id：播放页据此回写「看到第几话」，条目页才能标出进度
+          { subjectId, subjectUrl, next },
+        ),
+      )
     },
-    [subjectId],
+    [subjectId, navigate],
   )
 
   /** 由数据源剧集列表构造「下一集」连播参数 */
@@ -307,7 +309,22 @@ export default function SubjectPage() {
     [subject, goPlay, nextOf],
   )
 
-  if (error) return <div className="error-box">{error}</div>
+  if (error) {
+    // 终态错误页必须有出口：只留一行字的话，用户除了手动改地址栏无路可走。
+    // sourcesRetry 同时驱动条目与数据源两个请求（见上面那个 effect 的依赖），
+    // 所以这里复用它就是「整页重试」。
+    return (
+      <div className="error-box">
+        {error}{' '}
+        <button className="btn btn-sm" onClick={() => setSourcesRetry((n) => n + 1)}>
+          重试
+        </button>{' '}
+        <Link className="btn btn-secondary btn-sm" to="/">
+          回首页
+        </Link>
+      </div>
+    )
+  }
   if (!subject) return <div className="loading">加载中…</div>
 
   const cover = subject.images?.large ?? subject.images?.common ?? ''

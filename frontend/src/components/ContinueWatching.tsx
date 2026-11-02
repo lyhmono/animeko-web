@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { getProgress, listRecent, onDocChange, type ProgressEntry, type RecentItem } from '../lib/storage'
 import { IconPlay } from '../lib/icons'
+import { buildPlayUrl } from '../lib/playUrl'
 
 /**
  * 首页「继续观看」。
@@ -57,13 +58,13 @@ export default function ContinueWatching() {
             <Link
               key={`${it.source}:${it.playUrl}`}
               className="continue-card"
-              to={`/play?${new URLSearchParams({
+              to={buildPlayUrl({
                 source: it.source,
                 play: it.playUrl,
                 title: it.title,
                 anime: it.anime,
                 ep: it.ep,
-              }).toString()}`}
+              })}
             >
               <span className="continue-play">
                 <IconPlay size={15} />

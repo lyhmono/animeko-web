@@ -6,7 +6,7 @@ vi.mock('react', async (importOriginal) => ({
   ...await importOriginal<typeof import('react')>(),
   ...(await import('../src/test/uiHarness')).testHooks,
 }))
-vi.mock('react-router-dom', () => ({ useParams: () => ({ id: '77' }), Link: 'a' }))
+vi.mock('react-router-dom', () => ({ useParams: () => ({ id: '77' }), useNavigate: () => () => {}, Link: 'a' }))
 vi.mock('../src/api', () => ({
   errMsg: (error: unknown) => String(error),
   api: {

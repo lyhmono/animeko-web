@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite'
+import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 
 // 前端与后端同源部署（后端托管 dist 并代理 /api）
@@ -11,6 +11,13 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     chunkSizeWarningLimit: 1600,
+  },
+  test: {
+    // 默认 5s 在慢机器上会把负载误判成失败：FavoritesPage 那条在 28 个 worker 并行时
+    // 实测 4.9s（超时判红），单独跑 3.4s（绿）—— 同一份代码两种结论。放宽到 20s，
+    // 让红绿只由断言决定，不由机器当时多忙决定。
+    testTimeout: 20000,
+    hookTimeout: 20000,
   },
   server: {
     port: 5173,
