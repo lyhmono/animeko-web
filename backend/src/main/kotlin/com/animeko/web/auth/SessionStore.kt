@@ -15,9 +15,10 @@ class SessionStore(
     private val ttlMs: Long = DEFAULT_TTL_MS,
     private val maxEntries: Int = DEFAULT_MAX_ENTRIES,
     private val now: () -> Long = { System.currentTimeMillis() },
+    private val absoluteTtlMs: Long = DEFAULT_ABSOLUTE_TTL_MS,
 ) {
 
-    private class Entry(@Volatile var expiresAt: Long, var cookieRenewedAt: Long)
+    private class Entry(@Volatile var expiresAt: Long, var cookieRenewedAt: Long, val createdAt: Long)
 
     private val sessions = ConcurrentHashMap<String, Entry>()
     private val random = SecureRandom()
@@ -26,7 +27,7 @@ class SessionStore(
         purgeIfNeeded()
         val token = newToken()
         val nowMs = now()
-        sessions[token] = Entry(nowMs + ttlMs, nowMs)
+        sessions[token] = Entry(nowMs + ttlMs, nowMs, nowMs)
         return token
     }
 
@@ -40,7 +41,14 @@ class SessionStore(
                 sessions.remove(token, entry)
                 return false
             }
-            entry.expiresAt = maxOf(entry.expiresAt, nowMs + ttlMs)
+            // 滑动续期必须有绝对上限：只按「不活动才失效」续期的话，一个被窃取的 Cookie
+            // 只要持续使用就永不过期，那句 30 天实际等于无限期。
+            val ceiling = entry.createdAt + absoluteTtlMs
+            if (nowMs >= ceiling) {
+                sessions.remove(token, entry)
+                return false
+            }
+            entry.expiresAt = minOf(maxOf(entry.expiresAt, nowMs + ttlMs), ceiling)
             return true
         }
     }
@@ -91,6 +99,8 @@ class SessionStore(
     private companion object {
         /** 30 天不活动才失效；每次请求都会滑动续期 */
         private const val DEFAULT_TTL_MS = 30L * 24 * 60 * 60 * 1000
+        /** 滑动续期的天花板：不论多活跃，会话从创建起最多活这么久 */
+        private const val DEFAULT_ABSOLUTE_TTL_MS = 90L * 24 * 60 * 60 * 1000
         private const val DEFAULT_MAX_ENTRIES = 1024
     }
 }

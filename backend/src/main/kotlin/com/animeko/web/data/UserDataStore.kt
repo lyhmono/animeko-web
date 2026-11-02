@@ -71,6 +71,19 @@ class UserDataStore(
                 throw ReadFailed("损坏的个人数据文件无法隔离：${ioReason(e)}（文件：$file）", e)
             }
             appLog.error("个人数据文件不是合法 JSON，已备份为 *.bad")
+            val restored = restoreFromBackup()
+            if (restored == null) {
+                // 这是整条链路上唯一能告诉站长「数据已经没了」的地方。
+                // 主文档损坏 + 备份不可用时，读侧只能发布一份带稳定 etag 的空文档，
+                // 于是客户端的下一次条件写会**合法地**把服务器上的数据覆盖成空 ——
+                // HTTP 层、数据层、前端都不会报错，症状只是「收藏全没了」。
+                appLog.error(
+                    "个人数据备份 *.bak 也不可用，将以空文档对外提供。" +
+                        "客户端的下一次条件写会把服务器数据合法地覆盖为空；" +
+                        "要抢救请立刻停止写入，手工检查数据目录里的 *.bad 与 *.bak",
+                )
+            }
+            return restored
         }
         // 主文件缺失、为空或已损坏：先试上一份备份。
         // 这一步不是锦上添花 —— .bak 一直在写却没人读，等于「备了份没人看的档案」：
@@ -191,8 +204,26 @@ class UserDataStore(
                 // 备份必须是「复制」而不是「挪走」：原来是先 move 走旧文件再 rename 新的，
                 // 两次操作之间进程被 kill，userdata.json 就不存在了（只剩 .bak）。
                 // 现在读的一侧会认这份 .bak（见 restoreFromBackup），两头合起来才真的不丢数据。
+                //
+                // .bak 自己也得原子落盘。它是整个恢复叙事的最后一道：裸 Files.copy 复制到一半
+                // 被 kill 会留下半份 JSON，那时若主文档也损坏，读侧判备份非法 → 发布空文档 →
+                // 客户端下一次条件写就「合法地」覆盖掉一切，正是这套机制要防的那个结局。
                 if (Files.isRegularFile(file)) {
-                    runCatching { Files.copy(file, sib("bak"), StandardCopyOption.REPLACE_EXISTING) }
+                    val bakTmp = sib("bak.tmp")
+                    try {
+                        Files.copy(file, bakTmp, StandardCopyOption.REPLACE_EXISTING)
+                        FileChannel.open(bakTmp, StandardOpenOption.WRITE).use { ch -> ch.force(true) }
+                        try {
+                            Files.move(bakTmp, sib("bak"), StandardCopyOption.ATOMIC_MOVE)
+                        } catch (e: AtomicMoveNotSupportedException) {
+                            Files.move(bakTmp, sib("bak"), StandardCopyOption.REPLACE_EXISTING)
+                        }
+                    } catch (e: IOException) {
+                        // 备份写不进去不让这次写入失败（主文档已经原子落盘了），但也不能一声不响：
+                        // 静默等于悄悄撤掉唯一的恢复凭据，而没人会在「收藏丢了」时想到是这里。
+                        runCatching { Files.deleteIfExists(bakTmp) }
+                        appLog.warn("个人数据 *.bak 更新失败，本次写入已落盘但没有新备份：{}", ioReason(e))
+                    }
                 }
                 // 先写临时文件再 rename：写入中途被 kill 也不会留下半个文件
                 try {
