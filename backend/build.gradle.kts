@@ -2,6 +2,7 @@ plugins {
     kotlin("jvm") version "2.4.10"
     kotlin("plugin.serialization") version "2.4.10"
     application
+    jacoco
 }
 
 group = "com.animeko"
@@ -86,5 +87,16 @@ tasks.test {
     testLogging {
         events("passed", "failed", "skipped")
         showStandardStreams = false
+    }
+    // 覆盖率报告不设门槛（Kotlin 内联/协程的统计口径会误导），
+    // 只作为 CI 产物保留，方便判断某次改动有没有把整块代码变成「没测过」。
+    finalizedBy(tasks.jacocoTestReport)
+}
+
+tasks.jacocoTestReport {
+    dependsOn(tasks.test)
+    reports {
+        xml.required.set(true)
+        html.required.set(true)
     }
 }

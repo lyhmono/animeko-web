@@ -101,7 +101,16 @@ internal fun ApplicationCall.isCrossSiteWrite(cfg: AppConfig): Boolean {
     if (pathSegments().firstOrNull() != "api") return false
     val method = request.local.method
     if (method == HttpMethod.Get || method == HttpMethod.Head || method == HttpMethod.Options) return false
-    val origin = request.headers[HttpHeaders.Origin] ?: return false
+    val origin = request.headers[HttpHeaders.Origin]
+    if (origin == null) {
+        // 没有 Origin 的现代浏览器请求仍会带 Sec-Fetch-Site；cross-site / same-site
+        // 都意味着「这个写请求不是本页面发起的」（SameSite 不区分同站不同源）。
+        // curl/脚本没有该头，继续放行 —— 它们本来就拿不到会话 Cookie。
+        return when (request.headers["Sec-Fetch-Site"]?.trim()?.lowercase()) {
+            "cross-site", "same-site" -> true
+            else -> false
+        }
+    }
     val originHost = runCatching { URI(origin).host }
         .getOrNull()?.lowercase()?.trim('[', ']')?.takeIf { it.isNotBlank() }
         ?: return true // Origin 为 "null"（沙箱 iframe / file:// 页面）按跨站处理

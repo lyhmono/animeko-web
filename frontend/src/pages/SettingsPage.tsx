@@ -176,7 +176,7 @@ export default function SettingsPage() {
               ) : (
                 '有改动待写入服务器'
               )}
-              {rememberedUser() && `　·　已登录：${rememberedUser()}`}
+              {rememberedUser() && ` · 已登录：${rememberedUser()}`}
             </div>
           </div>
           <button

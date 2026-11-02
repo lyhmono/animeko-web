@@ -191,7 +191,7 @@ export default function BangumiChannelCard() {
       <div style={{ fontSize: 12, color: 'var(--text-dim)', margin: '8px 0 12px' }}>
         当前生效地址：{info.effectiveBases.join('、')}
         {!info.calendarSupported && info.channel === 'MIRROR' && (
-          <span style={{ color: 'var(--warn)' }}>　·　此通道不含每日放送</span>
+          <span style={{ color: 'var(--warn)' }}> · 此通道不含每日放送</span>
         )}
       </div>
 

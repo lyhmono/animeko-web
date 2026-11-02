@@ -141,6 +141,7 @@ class LoginRateLimiter(
     }
 
     /** 该客户端当前是否被限流。 */
+    @Synchronized
     fun blocked(key: String): Boolean {
         val nowMs = now()
         val bucket = buckets[key] ?: return false

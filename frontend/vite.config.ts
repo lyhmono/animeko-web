@@ -18,6 +18,21 @@ export default defineConfig({
     // 让红绿只由断言决定，不由机器当时多忙决定。
     testTimeout: 20000,
     hookTimeout: 20000,
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'lcov'],
+      include: ['src/**/*.{ts,tsx}'],
+      exclude: ['src/**/*.test.{ts,tsx}', 'src/test/**', 'src/main.tsx'],
+      // 当前实测（include 全部 src，含尚未覆盖的页面）：
+      // 语句 57.3 / 分支 46.1 / 函数 53.3 / 行 60.6。
+      // 阈值取略低于现状，只用来拦「新代码完全没测试」的回退，不追求数字好看。
+      thresholds: {
+        statements: 55,
+        branches: 44,
+        functions: 51,
+        lines: 58,
+      },
+    },
   },
   server: {
     port: 5173,

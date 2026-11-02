@@ -148,6 +148,30 @@ class GateHardeningTest {
     }
 
     @Test
+    fun `origin-less browser write is refused when sec-fetch-site says cross-site`() = testApplication {
+        application { module(config()) }
+        // 严格隐私设置/旧浏览器可能省略 Origin，但 Sec-Fetch-Site 仍在。
+        // same-site 也要拒绝：SameSite 对「同站不同源/端口」不设防。
+        for (site in listOf("cross-site", "same-site")) {
+            val resp = client.put("/api/data") {
+                header(HttpHeaders.Authorization, basic)
+                header("Sec-Fetch-Site", site)
+                setBody("""{"favorites":[]}""")
+            }
+            assertEquals(HttpStatusCode.Forbidden, resp.status, "Sec-Fetch-Site=$site 应拒绝")
+        }
+        // 用户直接导航（none）与同源页面继续放行；没有该头的 curl/脚本也不受影响。
+        for (site in listOf("same-origin", "none")) {
+            val resp = client.put("/api/data") {
+                header(HttpHeaders.Authorization, basic)
+                header("Sec-Fetch-Site", site)
+                setBody("""{"favorites":[]}""")
+            }
+            assertEquals(HttpStatusCode.OK, resp.status, "Sec-Fetch-Site=$site 应放行：${resp.bodyAsText()}")
+        }
+    }
+
+    @Test
     fun `login is csrf protected too`() = testApplication {
         // 登录接口在鉴权子树之外（它本来就是要给未登录者用的），CSRF 检查必须自己做
         application { module(config()) }

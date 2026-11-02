@@ -3,6 +3,7 @@ node_modules/
 
 # 构建产物
 dist/
+coverage/
 backend/build/
 backend/.gradle/
 backend/.kotlin/

@@ -46,6 +46,13 @@ jobs:
             backend/build/test-results/
             backend/build/reports/tests/
           if-no-files-found: warn
+      - name: 上传后端覆盖率报告
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: backend-coverage
+          path: backend/build/reports/jacoco/
+          if-no-files-found: warn
 
   frontend:
     runs-on: ubuntu-latest
@@ -54,6 +61,8 @@ jobs:
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
       - name: Lockfile must not pin a third-party registry
         working-directory: frontend
         run: |
@@ -66,12 +75,20 @@ jobs:
             echo "::error::package-lock.json 绑定了第三方 registry：${hosts:-<空>}（镜像抖动会直接让部署失败）"
             exit 1
           fi
-      - name: Frontend typecheck + build + unit tests
+      - name: Frontend lint + typecheck + build + unit tests
         working-directory: frontend
         run: |
           npm ci
+          npm run lint
           npm run build
-          npm run test
+          npm run test:coverage
+      - name: Upload frontend coverage
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: frontend-coverage
+          path: frontend/coverage/
+          if-no-files-found: warn
 
   # 镜像能构建 + 能启动，才算「部署没问题」。
   # 单独加这一步的理由：backend/frontend 两个 job 验的是源码，而用户真正跑的是

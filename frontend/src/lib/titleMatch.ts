@@ -51,7 +51,7 @@ export function normalizeTitle(raw: string): string {
     .normalize('NFKC')
     .toLowerCase()
     .replace(/[\s\u3000]+/g, '')
-    .replace(/[!-/:-@[-`{-~。、，<《》「」『』（）()【】\[\]·:：;；!?！？…—－]/g, '')
+    .replace(/[!-/:-@[-`{-~。、，<《》「」『』（）()【】[\]·:：;；!?！？…—－]/g, '')
 }
 
 export function parseTitleInfo(raw: string): TitleInfo {

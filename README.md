@@ -488,7 +488,7 @@ cd frontend && NODE_ENV=development npm install && npm run dev   # http://localh
   而 `npm install` 本身是成功退出 0 的。
 - **起服务要带 UTF-8 locale**（原因见上面「社区数据源哪里找」）。
 
-单元测试：`cd backend && ./gradlew test` —— 用例数以 `grep -rho '@Test' backend/src/test | wc -l` 为准（写死一个数字必然过期，这里就曾经写着 178 而实际早已 260+）；前端纯函数用 Vitest：`cd frontend && npm run test`。覆盖 JsonPath / Selector 引擎与数据源仓库 /
+单元测试：`cd backend && ./gradlew test` —— 用例数以 `grep -rho '@Test' backend/src/test | wc -l` 为准（写死一个数字必然过期，这里就曾经写着 178 而实际早已 260+）；前端用 Vitest + ESLint：`cd frontend && npm run lint && npm run test`；覆盖率用 `npm run test:coverage`（阈值写在 `vite.config.ts`，只防「新代码完全没测试」的回退，不追求数字好看）。覆盖 JsonPath / Selector 引擎与数据源仓库 /
 聚合订阅（含逐跳重定向、订阅内重名、坏条目单独失败、预览指纹防内容漂移、自动导入沿用已关闭的源、
 一个订阅挂了不连带其它订阅）/ HLS 重写 /
 代理会话绑定与过期（含主机名解析不出来时不得放行凭据）/ HLS 上游非 2xx 不得伪装成合法清单 / 个人数据从 .bak 恢复与读写同锁 / 登录会话与限速（含 XFF 伪造与可信代理层数）/ 凭据预言机 /
@@ -497,8 +497,8 @@ cd frontend && NODE_ENV=development npm install && npm run dev   # http://localh
 配置正则过期时的通用后缀兜底（且配置命中优先）/
 停用源服务端拒绝 / API 路由与静态托管缓存策略 / Bangumi 客户端。
 编译会有告警但**不会因此失败**（没开 `-Werror`/`allWarningsAsErrors`）——与其写一句没人执行的「要求 0 警告」，不如把它写成现状：一个不生效的承诺比没有承诺更坏。
-GitHub Actions（`.github/workflows/ci.yml`）在 push/PR 上自动跑后端测试、前端 `tsc + vite build` +
-Vitest、容器健康/降权检查、HTTP 门禁（401、`If-Match`/409、注销后旧 Cookie 不可复用、缺失静态资源 404）
+GitHub Actions（`.github/workflows/ci.yml`）在 push/PR 上自动跑后端测试（含 JaCoCo 报告）、
+前端 ESLint + `tsc + vite build` + Vitest（含覆盖率阈值）、容器健康/降权检查、HTTP 门禁（401、`If-Match`/409、注销后旧 Cookie 不可复用、缺失静态资源 404）
 和 Playwright 浏览器冒烟。完整的 `live-smoke.sh` 依赖真实社区订阅站，仍作为本地/手工检查，
 不作为 CI 门禁。
 
@@ -541,13 +541,13 @@ animeko-web/
 
 ## 本地回归与构建
 
-后端使用 JDK 21 与仓库 Gradle wrapper：`cd backend && ./gradlew test installDist`。前端运行 `cd frontend && npm ci --include=dev && npm run test && NODE_ENV=production npm run build`。
+后端使用 JDK 21 与仓库 Gradle wrapper：`cd backend && ./gradlew test installDist`。前端运行 `cd frontend && npm ci --include=dev && npm run lint && npm run test && NODE_ENV=production npm run build`。
 
 构建完成后，在仓库根目录执行 `python3 scripts/local-http-smoke.py`。它只启动本机回环测试实例，以独立目录和测试账号检查登录预算、Cookie/Bearer 撤销、条件保存、CSRF、私网拒绝与静态产物，不请求真实视频源，也不修改现有实例的数据。JDK 不在 PATH 时可传 `--java-home <JDK目录>`；临时目录遵循 `TMPDIR`，日志留在输出显示的测试目录。
 
 浏览器冒烟执行 `python3 e2e/smoke.py <本机测试地址>`，默认使用明确标记的固定 API 夹具，不把第三方网络故障混进渲染验收。`--live` 仅用于另外的真实上游探活；5xx 不能再当作渲染通过。先安装 `e2e/requirements.txt` 和匹配的 Playwright 浏览器，再运行；未安装浏览器时不能声称这项通过。
 
-构建防退化检查是 `python3 -m unittest discover -s scripts -p 'test_build_contracts.py'` 与 `python3 -m unittest discover -s e2e -p 'test_smoke.py'`，CI 的 `contracts` job 会跑这两条（`docker` job 依赖它）。CI 也会保留失败的后端 JUnit/HTML 报告。Gradle 分发、Actions、Docker 基础镜像与 Playwright 版本均已锁定；更新这些摘要时需重新执行回归。
+构建防退化检查是 `python3 -m unittest discover -s scripts -p 'test_build_contracts.py'` 与 `python3 -m unittest discover -s e2e -p 'test_smoke.py'`，CI 的 `contracts` job 会跑这两条（`docker` job 依赖它）。CI 也会保留失败的后端 JUnit/HTML 报告与前后端覆盖率报告。Gradle 分发、Actions、Docker 基础镜像与 Playwright 版本均已锁定；更新这些摘要时需重新执行回归。
 
 ## 路线图
 
