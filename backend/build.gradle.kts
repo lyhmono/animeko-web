@@ -15,12 +15,29 @@ java {
 kotlin {
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        // jvmTarget 只决定字节码版本，不决定编译时链接的是哪个 JDK 的类库。
+        // 跑在 JDK 21 上编 17 字节码时，误用 JDK 18-21 才有的 API 能顺利通过编译，
+        // 然后在 17 的 JRE 上抛 NoSuchMethodError。这里把 API 面也钉到 17。
+        freeCompilerArgs.add("-Xjdk-release=17")
     }
 }
 
 application {
     mainClass.set("com.animeko.web.MainKt")
     applicationName = "animeko-web"
+    // 不给堆上限就是把决定权交给 JVM 的容器默认值（MaxRAMPercentage=25%）：
+    // 2GB 的机器上只有 512MB 堆，而这份服务要用 Jsoup 解析远端页面、缓冲 HLS 清单。
+    // 取 50% 而不是更高：Netty 的直接内存、元空间与线程栈都在堆外，
+    // compose 又没有 mem_limit，把堆开到 60-75% 等于请内核 OOM killer 来收尾。
+    // 生成的启动脚本本来就认 JAVA_OPTS，需要调的部署直接用它覆盖。
+    applicationDefaultJvmArgs = listOf(
+        "-XX:MaxRAMPercentage=50.0",
+        "-XX:InitialRAMPercentage=25.0",
+        // 堆耗尽后继续跑的服务只会给出无法解释的半截响应；容器有 restart 策略，
+        // 干脆利落地退出并被拉起来比带病运行好。
+        "-XX:+ExitOnOutOfMemoryError",
+        "-Dfile.encoding=UTF-8",
+    )
 }
 
 dependencies {

@@ -4,13 +4,19 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 REPO=$PWD
-TOOLS=$HOME/.hermes/cache/scratch/animeko-toolchain
-FIX=$PWD/../animeko-web-fixes-eb3c84b
+# 工具链目录是可选的：给了就用它下面的 jdk 与 gradle 缓存（复现某台机器的固定工具链），
+# 没给就用环境里的 JDK。这两行原先写死了 ~/.hermes/cache/scratch/... 和一个按 commit
+# 命名的兄弟目录，于是脚本除了作者那台机器之外在哪儿都跑不起来 —— 而它偏偏是用来
+# 证明「干净检出也能绿」的。
+TOOLS=${ANIMEKO_TOOLCHAIN:-}
 REF=${1:?用法: clean-room-test.sh <git-ref|WORKTREE> <日志路径> [FAKE_HOME]}
 LOG=${2:?给个日志名}
 # 第三个参数模拟「CI runner 上不存在兜底路径」：把 HOME 指向一个空目录
 FAKE_HOME=${3:-}
 WORK=$(mktemp -d "/tmp/animeko-cleanroom.XXXXXX")
+# 构建锁默认放在这次的一次性副本里；需要和别的构建跨副本互斥时，用 ANIMEKO_LOCK_DIR
+# 指到一个共享目录（原先它写死指向一个兄弟工作树，目录不存在就 exec 失败）。
+LOCK_DIR=${ANIMEKO_LOCK_DIR:-$WORK}
 PIDS=''
 cleanup() {
   for pid in $PIDS; do kill "$pid" 2>/dev/null || true; done
@@ -41,24 +47,29 @@ else
   echo "== 干净副本 $WORK（ref $(git -C "$REPO" rev-parse --short "$REF")）：无 TMPDIR、无 build 残留"
 fi
 
-# 与主审的后端构建串行，避免抢同一份 Gradle 缓存写
-exec 9>"$FIX/backend-build.lock"
+# 与别的后端构建串行，避免抢同一份 Gradle 缓存写
+mkdir -p -- "$LOCK_DIR"
+exec 9>"$LOCK_DIR/backend-build.lock"
 flock 9
 
 (
   cd "$WORK/backend" || exit 1
   unset TMPDIR
-  export JAVA_HOME="$TOOLS/jdk"
-  export PATH="$TOOLS/jdk/bin:$PATH"
-  export GRADLE_USER_HOME="$TOOLS/gradle-cache"
-  # CI runner 上没有 ~/.hermes：user.home 在 Linux 取自 passwd，不跟 HOME 走，
+  if [ -n "$TOOLS" ]; then
+    export JAVA_HOME="$TOOLS/jdk"
+    export PATH="$TOOLS/jdk/bin:$PATH"
+    export GRADLE_USER_HOME="$TOOLS/gradle-cache"
+  fi
+  # CI runner 上没有本机缓存兜底：user.home 在 Linux 取自 passwd，不跟 HOME 走，
   # 所以必须用 JAVA_TOOL_OPTIONS 把 user.home 指到空目录，才等价于 runner 的真实形状
   if [ -n "$FAKE_HOME" ]; then
     export HOME="$FAKE_HOME"
     export JAVA_TOOL_OPTIONS="-Duser.home=$FAKE_HOME"
-    echo "   HOME=$FAKE_HOME + -Duser.home=$FAKE_HOME（模拟 CI runner 上没有 ~/.hermes）"
+    echo "   HOME=$FAKE_HOME + -Duser.home=$FAKE_HOME（模拟 runner 上没有本机缓存兜底）"
   fi
-  exec "$TOOLS/gradle-9.3.1/bin/gradle" test --no-daemon --console=plain \
+  # 一律走仓库 wrapper：它带 distributionSha256Sum，比写死某个 gradle-<版本> 目录可靠，
+  # 也不会和 gradle-wrapper.properties 各钉一个版本号
+  exec "${ANIMEKO_GRADLE:-./gradlew}" test --no-daemon --console=plain \
     --no-build-cache --rerun-tasks \
     -Dorg.gradle.jvmargs="-Xmx1g -XX:MaxMetaspaceSize=512m -Djava.io.tmpdir=$WORK/tmp" \
     -Dorg.gradle.parallel=false --max-workers=2 \

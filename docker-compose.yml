@@ -4,6 +4,17 @@ services:
     image: animeko-web:latest
     container_name: animeko-web
     restart: unless-stopped
+    # 服务本体已经用 gosu 降到 app 用户，这一条是兜住「降权失效」的最后一格：
+    # 即便进程被某种方式拿到 root，也不允许它再通过 setuid/exec 提权。
+    security_opt:
+      - no-new-privileges:true
+    # json-file 默认不限大小：这是一个长期运行的自托管服务，日志会一直写到把盘填满，
+    # 而症状是「某天起收藏保存失败」——没人会先想到是日志。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       # 默认只绑本机回环，访问时用 SSH 隧道：
       #   ssh -N -L 8080:127.0.0.1:8080 user@your-vps
@@ -17,6 +28,9 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - ANIMEKO_PORT=8080
+      # 堆上限默认是容器内存的 50%（镜像里 applicationDefaultJvmArgs 定的）。
+      # 内存紧的机器要往下压，或者想让 Jsoup/HLS 有更多堆，都在这里覆盖：
+      # - JAVA_OPTS=-XX:MaxRAMPercentage=40.0
       # ---- 登录：配了凭据就自动开启登录页（不配则站点打开即用）----
       # 建议单账号自用；口令请换成足够长的随机串
       # 注意：USER 与 PASSWORD 必须成对打开，只开一个会在启动时报错退出

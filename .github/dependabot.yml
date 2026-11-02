@@ -1,0 +1,31 @@
+# 这个项目把 Actions、Docker 基础镜像、Gradle 分发和 Playwright 全部按 SHA/摘要钉死
+# （scripts/test_build_contracts.py 会在 CI 里断言这一点）。钉死而没有自动更新器，
+# 结果就是钉子静默过期：半年后一次构建才发现基础镜像已经有 CVE、Action 落后三个大版本。
+# Dependabot 是这套策略的另一半——由它来提「更新摘要」的 PR，人只负责合并。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+    groups:
+      # vite/vitest/typescript/@types 总是一起动，拆成四个 PR 只是噪音
+      build-tooling:
+        patterns:
+          - vite
+          - vitest
+          - typescript
+          - "@types/*"
+          - "@vitejs/*"
+  - package-ecosystem: gradle
+    directory: /backend
+    schedule:
+      interval: weekly

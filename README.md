@@ -508,7 +508,7 @@ animeko-web/
 ├── docker-entrypoint.sh     # 入口：root 起来只为给 /data 改属主，随后 gosu 降权到 app 用户
 ├── docker-compose.yml      # 凭据与两个安全开关都有注释
 ├── .gitattributes           # 锁 LF：*.sh / Dockerfile / *.yml（否则 autocrlf 会把它们转成 CRLF，容器与 build 全挂）
-├── .github/workflows/ci.yml # push/PR 自动跑后端测试 + 前端 tsc/build
+├── .github/workflows/ci.yml # push/PR：构建契约自检 + 后端测试 + 前端 tsc/build/vitest + 镜像构建与容器冒烟 + Playwright
 ├── scripts/live-smoke.sh   # 端到端冒烟（真实进程 + 真实订阅站 + 攻击探针）
 ├── backend/                # Kotlin + Ktor
 │   └── src/main/kotlin/com/animeko/web/
@@ -538,7 +538,7 @@ animeko-web/
 
 浏览器冒烟执行 `python3 e2e/smoke.py <本机测试地址>`，默认使用明确标记的固定 API 夹具，不把第三方网络故障混进渲染验收。`--live` 仅用于另外的真实上游探活；5xx 不能再当作渲染通过。先安装 `e2e/requirements.txt` 和匹配的 Playwright 浏览器，再运行；未安装浏览器时不能声称这项通过。
 
-构建防退化检查是 `python3 -m unittest discover -s scripts -p 'test_build_contracts.py'` 与 `python3 -m unittest discover -s e2e -p 'test_smoke.py'`。CI 会保留失败的后端 JUnit/HTML 报告。Gradle 分发、Actions、Docker 基础镜像与 Playwright 版本均已锁定；更新这些摘要时需重新执行回归。
+构建防退化检查是 `python3 -m unittest discover -s scripts -p 'test_build_contracts.py'` 与 `python3 -m unittest discover -s e2e -p 'test_smoke.py'`，CI 的 `contracts` job 会跑这两条（`docker` job 依赖它）。CI 也会保留失败的后端 JUnit/HTML 报告。Gradle 分发、Actions、Docker 基础镜像与 Playwright 版本均已锁定；更新这些摘要时需重新执行回归。
 
 ## 路线图
 

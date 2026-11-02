@@ -5,7 +5,26 @@ on:
     branches: [main]
   pull_request:
 
+# 连续两次 push 不该让两套完整的多阶段 Docker 构建并排跑：
+# 前一次的结论已经被后一次取代了，跑完也只是白烧 runner 分钟数。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # README 把这两个 unittest 称为「构建防退化检查」，但此前 CI 从不运行它们 ——
+  # 于是它们守的那些约定（Actions/基础镜像按摘要钉死、Dockerfile 分层顺序、
+  # wrapper 校验和、live-smoke 的临时目录纪律）全靠人记得手跑，会静默失效。
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: 构建契约与冒烟断言自检
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s scripts -p 'test_build_contracts.py'
+          python3 -m unittest discover -s e2e -p 'test_smoke.py'
+
   backend:
     runs-on: ubuntu-latest
     steps:
@@ -62,7 +81,7 @@ jobs:
   # 这一步同时验证了 entrypoint 的 gosu 降权、/data 可写、前端产物落位。
   docker:
     runs-on: ubuntu-latest
-    needs: [backend, frontend]
+    needs: [contracts, backend, frontend]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
