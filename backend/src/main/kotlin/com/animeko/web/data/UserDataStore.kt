@@ -1,5 +1,6 @@
 package com.animeko.web.data
 
+import com.animeko.web.StorageFailure
 import com.animeko.web.appLog
 import com.animeko.web.ioReason
 import com.animeko.web.writeFully
@@ -180,16 +181,17 @@ class UserDataStore(
             val current = try {
                 readDocumentLocked()
             } catch (e: ReadFailed) {
-                // 读取失败属于「这次写入无法建立版本基准」，映射为可诊断的 400 停止重试；
-                // 不能让它落到 500，否则前端会把它当瞬时故障每 5 秒重试下去。
-                throw IllegalArgumentException("个人数据无法写入：无法读取当前文档，已停止写入：${e.message}", e)
+                // 读取失败建立不了版本基准，不能让前端把它当瞬时故障无限重试；
+                // 但消息里有文件路径，改用 StorageFailure 让对外只回通用 503。
+                appLog.error("个人数据写入前读取失败：{}", e.message, e)
+                throw StorageFailure("个人数据无法写入：无法读取当前文档", e)
             }
             if (!ifMatchAllows(ifMatch, current?.snapshot?.etag ?: EMPTY.etag)) throw Stale()
             // 先验版本，再比较真实字节；不存在/空文件不能把首次 {} 创建短路掉。
             if (current != null && current.bytes.contentEquals(bytes)) return current.snapshot
             val tmp = sib("tmp")
             try {
-                Files.createDirectories(file.parent)
+                file.toAbsolutePath().parent?.let { Files.createDirectories(it) }
                 // 先写临时文件、fsync、再 rename：写入中途被 kill 或被断电都不会留下半个文件。
                 // 少了 fsync，rename 只保证元数据进了目录项，掉电后文件可能存在但内容是旧的/全零。
                 FileChannel.open(
@@ -238,8 +240,8 @@ class UserDataStore(
                 // 前端把它当瞬时故障每 5 秒重试一次，永远重试下去；文案里也没有任何线索。
                 // 这里换成一条说得清的错误（→ 400），前端把它当不可重试的失败停下。
                 runCatching { Files.deleteIfExists(tmp) }
-                throw IllegalArgumentException(
-                    "个人数据无法写入：${ioReason(e)}（文件：$file）",
+                throw StorageFailure(
+                    "个人数据无法写入：${ioReason(e)}",
                     e,
                 )
             }

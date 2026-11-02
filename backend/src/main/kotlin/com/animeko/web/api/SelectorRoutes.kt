@@ -33,6 +33,9 @@ internal fun Route.selectorRoutes(deps: ApiDeps) {
             try {
                 val args = withContext(Dispatchers.IO) { repo.importJson(text).also { repo.save(it) } }
                 call.respond(HttpStatusCode.Created, args)
+            } catch (e: com.animeko.web.StorageFailure) {
+                // 磁盘/权限问题不能伪装成「配置不合法」的 400，也不能回显数据目录路径。
+                throw e
             } catch (e: IllegalArgumentException) {
                 call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "invalid config")))
             }

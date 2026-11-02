@@ -1,5 +1,6 @@
 package com.animeko.web.bangumi
 
+import com.animeko.web.StorageFailure
 import com.animeko.web.appLog
 import com.animeko.web.writeFully
 import java.nio.channels.FileChannel
@@ -83,7 +84,7 @@ class BgmChannelStore(private val file: Path) {
             }
             .onFailure {
                 runCatching { Files.deleteIfExists(tmp) }
-                throw IllegalArgumentException("保存 Bangumi 通道配置失败：${it.message ?: it::class.simpleName}")
+                throw StorageFailure("保存 Bangumi 通道配置失败：${it.message ?: it::class.simpleName}")
             }
     }
 }

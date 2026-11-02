@@ -40,6 +40,22 @@ class ApiRoutesTest {
     )
 
     @Test
+    fun `storage failures are 503 without leaking the data path`() = testApplication {
+        // 数据目录只读/被占成目录时，底层异常消息里带绝对路径。
+        // 这类消息只能进日志：对外必须是可重试的 503 + 通用文案。
+        val cfg = testConfig()
+        java.nio.file.Files.createDirectory(cfg.dataDir.resolve("userdata.json"))
+        application { module(cfg) }
+
+        val resp = client.put("/api/data") { setBody("""{"favorites":[]}""") }
+        assertEquals(HttpStatusCode.ServiceUnavailable, resp.status, resp.bodyAsText())
+        val body = resp.bodyAsText()
+        assertFalse(body.contains("userdata"), "响应不能回显数据文件名：$body")
+        assertFalse(body.contains(cfg.dataDir.toString()), "响应不能回显数据目录：$body")
+        assertTrue(body.contains("存储"), "要能看出是服务端存储问题：$body")
+    }
+
+    @Test
     fun `deep nesting is refused at the entry instead of blowing the stack`() = testApplication {
         // JsonGuardTest 只测了那个纯函数本身，**四个调用点一个都没测到**：
         // 把 requireShallow 那四行全删掉，整套测试仍然全绿。

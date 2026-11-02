@@ -143,4 +143,20 @@ class HlsRewriterTest {
             result,
         )
     }
+
+    @Test
+    fun `a comment carrying a URI attribute is not treated as a tag`() {
+        // 普通注释不是指令：它既不能被改写，也不能把 comment.example 加进会话白名单。
+        // 否则一份被篡改的清单就能把 UA/Referer 引到与这条流无关的主机。
+        val body = """
+            #EXTM3U
+            # 备注：URI="https://comment.example/x.bin" 不是标签
+            #EXT-X-KEY:METHOD=AES-128,URI="https://key.example.com/k.bin"
+        """.trimIndent()
+
+        val result = HlsRewriter.rewriteDetailed(body, "https://cdn.example.com/hls/index.m3u8")
+
+        assertTrue(result.body.contains("""# 备注：URI="https://comment.example/x.bin" 不是标签"""), result.body)
+        assertEquals(setOf("key.example.com"), result.hosts)
+    }
 }

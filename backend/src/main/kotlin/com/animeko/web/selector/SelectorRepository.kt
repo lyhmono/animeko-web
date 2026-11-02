@@ -1,5 +1,6 @@
 package com.animeko.web.selector
 
+import com.animeko.web.StorageFailure
 import com.animeko.web.appLog
 import com.animeko.web.ioReason
 import com.animeko.web.writeFully
@@ -188,12 +189,12 @@ class SelectorRepository(private val dir: Path) {
                     syncDirOf(target)
                 } catch (e2: IOException) {
                     runCatching { Files.deleteIfExists(tmp) }
-                    throw IllegalArgumentException("写入数据源文件失败：${ioReason(e2)}", e2)
+                    throw StorageFailure("写入数据源文件失败：${ioReason(e2)}", e2)
                 }
             }
         } catch (e: IOException) {
             runCatching { Files.deleteIfExists(tmp) }
-            throw IllegalArgumentException("写入数据源文件失败：${ioReason(e)}", e)
+            throw StorageFailure("写入数据源文件失败：${ioReason(e)}", e)
         }
     }
 

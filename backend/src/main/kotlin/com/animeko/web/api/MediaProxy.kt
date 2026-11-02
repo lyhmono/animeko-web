@@ -63,7 +63,8 @@ private suspend fun proxyVideoOwned(call: ApplicationCall, fetcher: Fetcher, cfg
     }
     var url = withContext(Dispatchers.IO) { UrlGuard.requireAllowed(requested, cfg.allowPrivateTargets) }
     val sid = call.request.queryParameters["sid"]?.trim().orEmpty()
-    val headers = LinkedHashMap<String, String>()
+    // 源站凭据只在 grant 明确授权的主机上出现；UA/Referer 跨主机也要带（防盗链需要）。
+    val sessionHeaders = LinkedHashMap<String, String>()
     if (sid.isNotEmpty()) {
         val grant = sessions.grant(sid, url)
         when (grant.kind) {
@@ -75,13 +76,26 @@ private suspend fun proxyVideoOwned(call: ApplicationCall, fetcher: Fetcher, cfg
                 call.respond(HttpStatusCode.Forbidden, mapOf("error" to "PROXY_SESSION_TARGET_MISMATCH"))
                 return
             }
-            ProxySessionStore.Kind.GRANTED -> headers.putAll(grant.headers)
+            ProxySessionStore.Kind.GRANTED -> sessionHeaders.putAll(grant.headers)
         }
     }
-    headers[HttpHeaders.AcceptEncoding] = "identity"
-    call.request.headers[HttpHeaders.Range]?.takeIf(String::isNotBlank)?.let { headers[HttpHeaders.Range] = it }
+    val rangeHeader = call.request.headers[HttpHeaders.Range]?.takeIf(String::isNotBlank)
+    fun requestHeaders(target: String): LinkedHashMap<String, String> {
+        // 每一跳都重新授权，而不是从初始 headers 里一次性删 Cookie：
+        // 跨主机时 Cookie 仍然不会带（HOST_NOT_ALLOWED 时 grant 只返回空表），
+        // 但 302 回到原主机时能恢复凭据 —— 固定删除会让这条链在回源那一步丢 Cookie。
+        val out = LinkedHashMap<String, String>()
+        sessionHeaders.forEach { (name, value) -> if (!name.equals("Cookie", true)) out[name] = value }
+        if (sid.isNotEmpty()) {
+            val grant = sessions.grant(sid, target)
+            if (grant.kind == ProxySessionStore.Kind.GRANTED) out.putAll(grant.headers)
+        }
+        out[HttpHeaders.AcceptEncoding] = "identity"
+        rangeHeader?.let { out[HttpHeaders.Range] = it }
+        return out
+    }
 
-    var result = fetchProxyStream(fetcher, url, headers)
+    var result = fetchProxyStream(fetcher, url, requestHeaders(url))
     try {
         var redirects = 0
         while (result.status in 301..399 && redirects < MAX_REDIRECTS) {
@@ -90,12 +104,9 @@ private suspend fun proxyVideoOwned(call: ApplicationCall, fetcher: Fetcher, cfg
             val next = withContext(Dispatchers.IO) {
                 UrlGuard.requireAllowed(SelectorEngine.absUrl(url, location), cfg.allowPrivateTargets)
             }
-            if (UrlGuard.hostOf(next) != UrlGuard.hostOf(url) || UrlGuard.isInsecureDowngrade(url, next)) {
-                headers.remove("Cookie")
-            }
             result.body.closeQuietly()
             url = next
-            result = fetchProxyStream(fetcher, url, headers)
+            result = fetchProxyStream(fetcher, url, requestHeaders(url))
             redirects++
         }
         if (result.status in 301..399 && !result.header("location").isNullOrBlank()) {

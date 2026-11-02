@@ -50,7 +50,15 @@ object HlsRewriter {
             val t = line.trim()
             when {
                 t.isEmpty() -> line
-                t.startsWith("#") -> rewriteTagAttributes(line, playlistUrl, proxyPath, sid, hosts)
+                // 只有规范里真正带 URI 属性的标签才改写。普通注释里写一个
+                // `URI="https://evil/…"` 不能被当成指令：它会扩大代理会话的主机白名单，
+                // 把 UA/Referer 送到与这条流无关的站点。
+                t.startsWith("#") ->
+                    if (carriesUriAttribute(t)) {
+                        rewriteTagAttributes(line, playlistUrl, proxyPath, sid, hosts)
+                    } else {
+                        line
+                    }
                 else -> {
                     val abs = if (t.startsWith("http://") || t.startsWith("https://")) {
                         t
@@ -73,6 +81,19 @@ object HlsRewriter {
         }
         return RewriteResult(rewritten, hosts)
     }
+
+    /**
+     * 规范中带 URI="..." 属性的标签。低延迟 HLS（PART/PRELOAD-HINT）与
+     * SESSION-DATA/RENDITION-REPORT 也在这里，避免只覆盖传统 VOD 清单。
+     */
+    private val uriAttrTags = setOf(
+        "#EXT-X-KEY", "#EXT-X-SESSION-KEY", "#EXT-X-MAP", "#EXT-X-MEDIA",
+        "#EXT-X-I-FRAME-STREAM-INF", "#EXT-X-PART", "#EXT-X-PRELOAD-HINT",
+        "#EXT-X-RENDITION-REPORT", "#EXT-X-SESSION-DATA", "#EXT-X-DATERANGE",
+    )
+
+    private fun carriesUriAttribute(line: String): Boolean =
+        line.substringBefore(':').trim().uppercase() in uriAttrTags
 
     /** #EXT-X-KEY:METHOD=AES-128,URI="https://..." 等标签中的地址改写 */
     private fun rewriteTagAttributes(

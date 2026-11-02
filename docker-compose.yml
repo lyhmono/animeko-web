@@ -28,6 +28,9 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - ANIMEKO_PORT=8080
+      # 端口只发布到 127.0.0.1（见上面的 ports），所以这里显式承认「无鉴权部署」。
+      # 改成 "8080:8080" 对外之前，请先取消下面 ANIMEKO_AUTH_* 的注释并配好口令。
+      - ANIMEKO_ALLOW_NO_AUTH=true
       # 堆上限默认是容器内存的 50%（镜像里 applicationDefaultJvmArgs 定的）。
       # 内存紧的机器要往下压，或者想让 Jsoup/HLS 有更多堆，都在这里覆盖：
       # - JAVA_OPTS=-XX:MaxRAMPercentage=40.0

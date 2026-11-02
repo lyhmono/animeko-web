@@ -4,6 +4,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /**
  * 配置解析的回归测试。
@@ -203,5 +204,38 @@ class AppConfigNumberTest {
             }
         }
         assertEquals(500L, AppConfig.parseLongStrict("ANIMEKO_REQUEST_TIMEOUT_MS", "500", 20000L, 600000L, 500L))
+    }
+}
+
+/**
+ * 裸跑 / 自定义监听地址的暴露面回归。
+ *
+ * 这类故障的特点同样是「服务起来了，只是门没锁」：没人会从启动日志里
+ * 意识到 0.0.0.0 + 无凭据意味着数据源、代理、个人数据全部可读写。
+ */
+class AppConfigExposureTest {
+    @Test
+    fun `loopback without auth may start`() {
+        AppConfig.requireSafeExposure("127.0.0.1", false, false)
+        AppConfig.requireSafeExposure("127.0.0.2", false, false)
+        AppConfig.requireSafeExposure("::1", false, false)
+        AppConfig.requireSafeExposure("localhost", false, false)
+    }
+
+    @Test
+    fun `non loopback without auth refuses to start`() {
+        val e = assertFailsWith<IllegalStateException> {
+            AppConfig.requireSafeExposure("0.0.0.0", false, false)
+        }
+        assertTrue(e.message?.contains("ANIMEKO_ALLOW_NO_AUTH") == true, e.message)
+        assertFailsWith<IllegalStateException> {
+            AppConfig.requireSafeExposure("::", false, false)
+        }
+    }
+
+    @Test
+    fun `auth or an explicit opt out allows non loopback`() {
+        AppConfig.requireSafeExposure("0.0.0.0", true, false)
+        AppConfig.requireSafeExposure("0.0.0.0", false, true)
     }
 }

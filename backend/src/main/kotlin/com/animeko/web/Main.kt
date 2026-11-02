@@ -45,6 +45,8 @@ import kotlinx.serialization.json.Json
 
 fun main() {
     val cfg = AppConfig()
+    // 无鉴权又监听对外地址时直接拒绝启动：这是「以为只在内网」最贵的一次事故。
+    AppConfig.requireSafeExposure(cfg.host, cfg.authEnabled, cfg.allowNoAuthExposure)
     embeddedServer(Netty, host = cfg.host, port = cfg.port) {
         module(cfg)
     }.start(wait = true)
@@ -109,6 +111,15 @@ fun Application.module(
         exception<UpstreamException> { call, cause ->
             appLog.warn("上游失败: {} <- {}", cause.message, call.request.path())
             call.respond(HttpStatusCode.BadGateway, mapOf("error" to (cause.message ?: "upstream error")))
+        }
+        // 本地存储故障（磁盘满、只读挂载、权限不对）只回一句可诊断的 503：
+        // 底层消息里有文件路径与挂载点，属于部署内部信息，只进日志。
+        exception<StorageFailure> { call, cause ->
+            appLog.error("本地存储不可用: {} <- {}", cause.message, call.request.path(), cause)
+            call.respond(
+                HttpStatusCode.ServiceUnavailable,
+                mapOf("error" to "服务端存储暂不可用，请检查数据目录后重试"),
+            )
         }
         exception<IllegalArgumentException> { call, cause ->
             call.respond(HttpStatusCode.BadRequest, mapOf("error" to (cause.message ?: "bad request")))

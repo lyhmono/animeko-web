@@ -105,6 +105,7 @@ jobs:
           docker run -d --name animeko-ci \
             -p 18080:8080 \
             --tmpfs /data:rw \
+            -e ANIMEKO_ALLOW_NO_AUTH=true \
             animeko-web:ci
 
           for i in $(seq 1 60); do

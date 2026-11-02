@@ -7,7 +7,7 @@ import java.nio.file.Paths
  * 全部通过环境变量配置，便于 Docker 部署。默认值面向内网自用（无鉴权）。
  */
 data class AppConfig(
-    val host: String = env("ANIMEKO_HOST", "0.0.0.0"),
+    val host: String = env("ANIMEKO_HOST", "127.0.0.1"),
     val port: Int = intEnv("ANIMEKO_PORT", 8080, min = 1, max = 65535),
     /** 数据目录：数据源配置、缓存等持久化内容 */
     val dataDir: Path = Paths.get(env("ANIMEKO_DATA_DIR", "./data")),
@@ -41,6 +41,16 @@ data class AppConfig(
      * 反代配好 HTTPS 之后请设为 true。
      */
     val cookieSecure: Boolean = boolEnvStrict("ANIMEKO_COOKIE_SECURE") ?: false,
+
+    /**
+     * 无鉴权 + 非回环监听是否被明确允许。
+     *
+     * 默认 false：没配凭据时服务只该监听 `127.0.0.1`。容器镜像显式监听 `0.0.0.0`，
+     * 由编排层决定端口是否发布；compose 默认只发布到 `127.0.0.1`，并已显式放行。
+     * 直接 `docker run -p 8080:8080` 或裸跑 jar 改为对外监听时，必须自己确认边界，
+     * 否则启动即失败——「站点打开即用」不该等于「整台机器对人敞开」。
+     */
+    val allowNoAuthExposure: Boolean = boolEnvStrict("ANIMEKO_ALLOW_NO_AUTH") ?: false,
 
     // ---- 第三方服务 ----
     /**
@@ -164,6 +174,30 @@ data class AppConfig(
                 )
             }
             return explicit ?: anyCreds
+        }
+
+        /**
+         * 启动前的暴露面检查：没有登录门禁时，只能监听回环地址。
+         *
+         * 这不是「多一条 warn」——裸跑 jar 的默认值已经改成 127.0.0.1，而镜像/自定义
+         * 配置把监听地址改成 0.0.0.0 时，必须由部署者明确表态（配凭据，或显式
+         * ANIMEKO_ALLOW_NO_AUTH=true 承认无鉴权暴露）。悄悄起在公网是历史事故里
+         * 最严重的一类：数据源、代理、个人数据全部无门槛。
+         */
+        fun requireSafeExposure(host: String, authEnabled: Boolean, allowNoAuthExposure: Boolean) {
+            if (authEnabled || allowNoAuthExposure || isLoopback(host)) return
+            throw IllegalStateException(
+                "服务监听 $host 但未启用登录鉴权：任何人都能读写个人数据、导入数据源并使用视频代理。" +
+                    "请配置 ANIMEKO_AUTH_USER + ANIMEKO_AUTH_PASSWORD（或 ANIMEKO_AUTH_TOKEN），" +
+                    "或改为只监听回环地址（ANIMEKO_HOST=127.0.0.1），" +
+                    "或在确认网络边界安全后显式设置 ANIMEKO_ALLOW_NO_AUTH=true。",
+            )
+        }
+
+        fun isLoopback(host: String): Boolean {
+            val text = host.trim().lowercase()
+            if (text == "localhost" || text == "::1" || text == "[::1]") return true
+            return runCatching { java.net.InetAddress.getByName(text).isLoopbackAddress }.getOrDefault(false)
         }
 
         fun env(key: String, default: String): String =

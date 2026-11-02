@@ -85,6 +85,10 @@ private fun resolveStaticFile(root: Path, relative: String): StaticFile {
 
 private suspend fun io.ktor.server.application.ApplicationCall.serveStaticFile(asset: StaticFile.Found) {
     val relative = asset.relative
+    // 登录后的界面不允许被任意站点放进 iframe：同源 iframe 会带着会话 Cookie，
+    // 「删除数据源」「注销」这类按钮的点击劫持靠 Origin 检查拦不住。
+    response.header("X-Frame-Options", "DENY")
+    response.header("Content-Security-Policy", "frame-ancestors 'none'")
     when {
         relative == "index.html" || relative == "sw.js" || relative == "manifest.webmanifest" ->
             response.header(HttpHeaders.CacheControl, "no-cache")

@@ -55,8 +55,11 @@ open http://localhost:8080
 
 ### 别把 8080 直接裸露在公网
 
-服务进程在容器内默认监听 `0.0.0.0`，而 compose **默认只把端口发布到 `127.0.0.1`**；
-「能不能读到你的收藏和内网拓扑」最终仍取决于网络边界。三种安全姿势，按推荐顺序：
+服务进程在容器内默认监听 `0.0.0.0`（裸跑 jar 默认只监听 `127.0.0.1`），而 compose
+**默认只把端口发布到 `127.0.0.1`**；「能不能读到你的收藏和内网拓扑」最终仍取决于网络边界。
+另外，**没有配任何登录凭据、又监听非回环地址时，服务会拒绝启动**：必须配
+`ANIMEKO_AUTH_*`，或显式设置 `ANIMEKO_ALLOW_NO_AUTH=true` 承认无鉴权暴露
+（compose 因为只绑回环，已经替你放行）。三种安全姿势，按推荐顺序：
 
 ```bash
 # A. 只绑本机，用 SSH 隧道看（默认就是这个姿势，口令都不用设）
@@ -86,7 +89,7 @@ ssh -N -L 8080:127.0.0.1:8080 user@your-vps      # 浏览器开 http://localhost
 > **想让它带登录页**（公网机器上应该这样）：编辑 `docker-compose.yml`，取消
 > `ANIMEKO_AUTH_USER` / `ANIMEKO_AUTH_PASSWORD` 的注释并改成自己的口令，再
 > `docker compose up -d`。配了凭据登录就自动开启，打开网站先进登录页；
-> 不配则站点打开即用（服务默认监听 0.0.0.0，请自己确认它不被不可信网络访问）。
+> 不配则 compose 靠 `ANIMEKO_ALLOW_NO_AUTH=true` + 只绑回环保持开箱即用。
 
 ### ARM64 构建
 
@@ -98,7 +101,9 @@ docker compose up -d --build
 
 # 或在 x86 机器上交叉构建（buildx）
 docker buildx build --platform linux/arm64 -t animeko-web:arm64 --load .
-docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
+docker run -d -p 127.0.0.1:8080:8080 -v ./data:/data animeko-web:arm64
+# 要让同网段其他机器访问，必须同时配 ANIMEKO_AUTH_*，或显式承认无鉴权暴露：
+# docker run -d -p 8080:8080 -e ANIMEKO_ALLOW_NO_AUTH=true -v ./data:/data animeko-web:arm64
 ```
 
 > 前端依赖默认从 `https://registry.npmjs.org` 装（锁文件里 124 条 `resolved` 都指向它）。
@@ -110,7 +115,8 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `ANIMEKO_HOST` | `0.0.0.0` | 监听地址 |
+| `ANIMEKO_HOST` | `127.0.0.1`（镜像内 `0.0.0.0`） | 监听地址。裸跑 jar 默认只本机可达；镜像为了让端口映射生效显式监听全部网卡 |
+| `ANIMEKO_ALLOW_NO_AUTH` | `false` | 无凭据又监听非回环地址时是否允许启动。默认拒绝；compose 因只发布到 `127.0.0.1` 已设为 `true`。公网暴露前请配凭据，而不是打开它 |
 | `ANIMEKO_PORT` | `8080` | 服务端口 |
 | `ANIMEKO_DATA_DIR` | `/data`（镜像内） | 数据目录：`selectors/` 数据源配置、`userdata.json` 个人数据 |
 | `ANIMEKO_FRONTEND_DIR` | `frontend/dist`（镜像用 ENV 设成 `/app/frontend/dist`） | 前端构建产物目录。**代码默认值与镜像里不一样**：裸跑 jar 时它找的是相对当前工作目录的 `frontend/dist`，找不到就只服务 API（首页 404）并留一条 warn 说清是哪个目录 |
@@ -147,6 +153,9 @@ docker run -d -p 8080:8080 -v ./data:/data animeko-web:arm64
 - `ANIMEKO_PORT` 不是 1–65535 的整数；各类 `*_TIMEOUT_MS` 不是正数或超过上限
   （抓取与元数据类 600000，视频代理 3600000——写成 1e15 的请求不是「永不超时」，是把连接钉死）
 - `ANIMEKO_TRUSTED_PROXY_HOPS` 不是 0–8 的整数（越界不再夹取：夹到 8 会让限速键取错位置）
+- **没有配置任何登录凭据，却监听非回环地址**（例如 `ANIMEKO_HOST=0.0.0.0`）：启动即失败。
+  请配 `ANIMEKO_AUTH_USER`+`ANIMEKO_AUTH_PASSWORD`（或 `ANIMEKO_AUTH_TOKEN`），
+  或显式设置 `ANIMEKO_ALLOW_NO_AUTH=true`。compose 因端口只发布到 `127.0.0.1`，已替你显式放行
 
 容器因此可能进入重启循环。看到 `IllegalStateException: ANIMEKO_...` 就是配置的问题，
 `docker logs` 第一行会直接写明是哪个变量、错在哪。

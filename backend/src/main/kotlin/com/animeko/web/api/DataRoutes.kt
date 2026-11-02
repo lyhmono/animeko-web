@@ -50,6 +50,9 @@ internal fun Route.dataRoutes(deps: ApiDeps) {
                 call.respond(DataSavedResponse(bytes = text.toByteArray(Charsets.UTF_8).size.toLong()))
             } catch (stale: UserDataStore.Stale) {
                 call.respond(HttpStatusCode.Conflict, mapOf("error" to "DATA_STALE"))
+            } catch (e: com.animeko.web.StorageFailure) {
+                // 存储故障的消息里有文件路径，交给 StatusPages 统一回 503 + 通用文案。
+                throw e
             } catch (e: IllegalArgumentException) {
                 call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "个人数据格式不正确")))
             }

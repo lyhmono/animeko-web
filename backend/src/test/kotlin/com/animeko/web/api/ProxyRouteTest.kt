@@ -361,6 +361,29 @@ class ProxyRouteTest {
         assertEquals(listOf(false, false), h.stub.redirectFlags, "每一跳都必须自己发起")
     }
 
+    @Test
+    fun `redirect back to the original host restores the cookie`() = testApplication {
+        // 跨主机那一跳不能带 Cookie，但 302 又回到原主机时必须恢复：
+        // 固定「从初始 headers 里删掉 Cookie」会让回源这一步永久失去凭据。
+        val h = Harness(
+            listOf(
+                redirect("https://other-host.example.com/step"),
+                redirect("https://cdn.example.com/hls/index.m3u8"),
+                hlsPlaylist("seg1.ts"),
+            ),
+        )
+        application { module(h.cfg, h.stub, h.sessions) }
+        val resp = client.get("/api/proxy") {
+            parameter("url", "https://cdn.example.com/hls/index.m3u8")
+            parameter("sid", h.sid)
+        }
+        assertEquals(HttpStatusCode.OK, resp.status)
+        assertEquals(3, h.stub.requests.size)
+        assertEquals(COOKIE, h.stub.requests[0].second["Cookie"])
+        assertFalse("Cookie" in h.stub.requests[1].second, "跨主机重定向不该继续携带源站 Cookie")
+        assertEquals(COOKIE, h.stub.requests[2].second["Cookie"], "回到原主机后应恢复凭据")
+    }
+
     /**
      * 3xx 但不带 Location —— 坏 CDN 和「会话过期的源站」都长这样。
      * 没得跟跳就该把这 3xx 如实透传给播放器。循环里原先在判 Location 之前

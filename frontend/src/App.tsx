@@ -350,7 +350,11 @@ function downloadBackup(text: string, name: string): void {
     const link = document.createElement('a')
     link.href = url
     link.download = name
+    link.rel = 'noopener'
+    // 部分浏览器（旧 Firefox / 内嵌 WebView）要求链接在文档里才会触发下载
+    document.body.appendChild(link)
     link.click()
+    link.remove()
   } finally {
     URL.revokeObjectURL(url)
   }

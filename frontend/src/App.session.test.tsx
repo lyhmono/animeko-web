@@ -260,8 +260,11 @@ describe('App logout transaction', () => {
     const blobs: Blob[] = []
     vi.spyOn(URL, 'createObjectURL').mockImplementation((blob) => { blobs.push(blob as Blob); return 'blob:partial' })
     const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
-    const link = { href: '', download: '', click: vi.fn() }
-    vi.stubGlobal('document', { createElement: vi.fn(() => link) })
+    const link = { href: '', download: '', rel: '', click: vi.fn(), remove: vi.fn() }
+    vi.stubGlobal('document', {
+      createElement: vi.fn(() => link),
+      body: { appendChild: vi.fn(), removeChild: vi.fn() },
+    })
     const tree = hooks.render(App)
     const action = buttons(tree).find((button) => button.name === '导出局部未同步副本')!
     expect(action).toBeDefined()
