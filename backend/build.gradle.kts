@@ -41,12 +41,12 @@ application {
 }
 
 dependencies {
-    implementation("io.ktor:ktor-server-core:3.1.3")
-    implementation("io.ktor:ktor-server-netty:3.1.3")
-    implementation("io.ktor:ktor-server-content-negotiation:3.1.3")
-    implementation("io.ktor:ktor-serialization-kotlinx-json:3.1.3")
-    implementation("io.ktor:ktor-server-status-pages:3.1.3")
-    implementation("io.ktor:ktor-server-compression:3.1.3")
+    implementation("io.ktor:ktor-server-core:3.6.1")
+    implementation("io.ktor:ktor-server-netty:3.6.1")
+    implementation("io.ktor:ktor-server-content-negotiation:3.6.1")
+    implementation("io.ktor:ktor-serialization-kotlinx-json:3.6.1")
+    implementation("io.ktor:ktor-server-status-pages:3.6.1")
+    implementation("io.ktor:ktor-server-compression:3.6.1")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
     implementation("org.jsoup:jsoup:1.23.2")
@@ -54,7 +54,7 @@ dependencies {
 
     testImplementation(kotlin("test"))
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
-    testImplementation("io.ktor:ktor-server-test-host:3.1.3")
+    testImplementation("io.ktor:ktor-server-test-host:3.6.1")
 }
 
 // 构建镜像的独立依赖层需要下载实际 JAR，而不仅是 dependency report 元数据。
