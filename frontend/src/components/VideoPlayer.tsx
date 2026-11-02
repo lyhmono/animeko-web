@@ -149,6 +149,9 @@ export default function VideoPlayer({
   /** 手势/双击的中央浮层提示，1.2 秒后自动消退 */
   const [gestureToast, setGestureToast] = useState<GestureToast | null>(null)
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  /** 手势节流的在途 rAF 句柄与待刷新的 toast：见 showToast */
+  const gestureRafRef = useRef<number | null>(null)
+  const pendingToastRef = useRef<GestureToast | null>(null)
   /** 等待双击窗口结束的单击动作（显隐控制条） */
   const tapTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   /** 控制条当前是否可见：单击动作要延迟 300ms 才执行，闭包里的 state 可能已过期 */
@@ -331,7 +334,18 @@ export default function VideoPlayer({
   // ---------- 影院化控制层 ----------
 
   const showToast = (toast: GestureToast) => {
-    setGestureToast(toast)
+    // 手势期间 pointermove 是 60-120Hz 的，每次都 setState 会让这个组件连同整棵控制层
+    // 每收到一个指针事件就重渲染一遍。合并到每帧最多刷新一次：拖动的手感不变
+    // （显示的仍是最新值），重渲染频率从「指针频率」降到「屏幕刷新率」。
+    pendingToastRef.current = toast
+    if (gestureRafRef.current == null) {
+      gestureRafRef.current = requestAnimationFrame(() => {
+        gestureRafRef.current = null
+        const next = pendingToastRef.current
+        pendingToastRef.current = null
+        if (next) setGestureToast(next)
+      })
+    }
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
     toastTimerRef.current = setTimeout(() => setGestureToast(null), 1200)
   }
@@ -352,6 +366,8 @@ export default function VideoPlayer({
       if (hideTimerRef.current) clearTimeout(hideTimerRef.current)
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
       if (tapTimerRef.current) clearTimeout(tapTimerRef.current)
+      // 卸载后 rAF 回调里不许再 setState
+      if (gestureRafRef.current != null) cancelAnimationFrame(gestureRafRef.current)
     }
   }, [revealControls])
 
@@ -831,6 +847,9 @@ export default function VideoPlayer({
       ref={containerRef}
       className={`video-shell${theater ? ' theater' : ''}${controlsVisible ? '' : ' hide-controls'}`}
       tabIndex={0}
+      // generic 容器上的 aria-label 会被部分读屏器忽略；给它一个 role，
+      // 「视频播放器」这个名字才真的能被念出来（也能被 Tab 进去后知道自己在哪）
+      role="group"
       aria-label="视频播放器"
       onFocusCapture={revealControls}
       onKeyDownCapture={revealControls}
@@ -851,7 +870,7 @@ export default function VideoPlayer({
         }}
       />
       {buffering && !error && (
-        <div className="video-buffering" aria-label="缓冲中">
+        <div className="video-buffering" role="status" aria-label="缓冲中">
           <span className="spinner" />
         </div>
       )}

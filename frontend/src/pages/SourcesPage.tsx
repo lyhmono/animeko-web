@@ -4,6 +4,7 @@ import type { StoredSource, SubscriptionCandidate, SubscriptionPreview } from '.
 import { IconLink } from '../lib/icons'
 import { notifySourcesChanged } from '../lib/sourceEvents'
 import { useModalFocus } from '../lib/useModalFocus'
+import { mapLimit } from '../lib/concurrency'
 
 /** 订阅来源：填地址（服务端去取）或贴正文（站点挂了/需要登录时自己导出） */
 function subSource(url: string, text: string): { url?: string; text?: string } | null {
@@ -255,19 +256,14 @@ export default function SourcesPage() {
       for (const n of targets) next[n] = '检查中…'
       return next
     })
-    let cursor = 0
-    const worker = async () => {
-      while (current() && cursor < targets.length) {
-        const name = targets[cursor++]
-        try {
-          const hits = await api.sourceSearch(name, '动画', ctrl.signal)
-          if (current()) setTestResult((r) => ({ ...r, [name]: `✓ 可用（${hits.length} 个结果）` }))
-        } catch (e) {
-          if (current()) setTestResult((r) => ({ ...r, [name]: `✗ 失败：${errMsg(e)}` }))
-        }
+    await mapLimit(targets, 3, current, async (name) => {
+      try {
+        const hits = await api.sourceSearch(name, '动画', ctrl.signal)
+        if (current()) setTestResult((r) => ({ ...r, [name]: `✓ 可用（${hits.length} 个结果）` }))
+      } catch (e) {
+        if (current()) setTestResult((r) => ({ ...r, [name]: `✗ 失败：${errMsg(e)}` }))
       }
-    }
-    await Promise.all(Array.from({ length: Math.min(3, targets.length) }, worker))
+    })
     if (current()) {
       checkRef.current = null
       setChecking(false)
@@ -364,6 +360,7 @@ export default function SourcesPage() {
           <div className="actions">
             <input
               placeholder="测试关键词"
+              aria-label={`测试关键词（${s.arguments.name}）`}
               value={testKeyword[s.arguments.name] ?? ''}
               onChange={(e) => {
                 const value = e.target.value
@@ -441,6 +438,7 @@ export default function SourcesPage() {
         <div className="sub-url-row">
           <input
             value={subUrl}
+            aria-label="订阅地址"
             placeholder="订阅地址，例如 https://sub.example.org/v1/css1.json"
             onChange={(e) => {
               setSubUrl(e.target.value)
@@ -462,6 +460,7 @@ export default function SourcesPage() {
         {showSubText && (
           <textarea
             className="sub-text"
+            aria-label="订阅 JSON 正文"
             placeholder='粘贴订阅 JSON，例如 {"exportedMediaSourceDataList":{"mediaSources":[…]}}'
             value={subText}
             onChange={(e) => {
@@ -549,6 +548,7 @@ export default function SourcesPage() {
       <h2 className="section-title">导入单个数据源</h2>
       <div className="card import-box">
         <textarea
+          aria-label="数据源 JSON"
           placeholder='粘贴 animeko 数据源 JSON，例如：{"factoryId":"web-selector","version":2,"arguments":{"name":"...","searchConfig":{...}}}'
           value={importText}
           onChange={(e) => setImportText(e.target.value)}

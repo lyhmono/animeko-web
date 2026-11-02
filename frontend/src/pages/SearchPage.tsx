@@ -6,6 +6,7 @@ import type { BgmSubject, SubjectHit } from '../types'
 import { addSearchHistory, favoriteIdSet, onDocChange } from '../lib/storage'
 import { IconHeartFilled, IconRefresh } from '../lib/icons'
 import { getSourceRevision, onSourcesChanged } from '../lib/sourceEvents'
+import { mapLimit } from '../lib/concurrency'
 
 /**
  * 同时向多少个数据源发搜索请求。浏览器对同一来源只有 6 条连接，
@@ -194,31 +195,22 @@ export default function SearchPage() {
         // 每个要等到超时才回来。攒齐再渲染的结果是「明明有结果的源
         // 也陪着死源一起空转」，用户看到满屏「0 个结果」以为功能坏了 —— 实测如此。
         //
-        // 并发必须设上限：浏览器对同一来源只有 6 条连接，全部源一起发会把它们占满，
-        // 于是 /api/health、/api/data 这类小请求排在超时后面 —— 实测表现为
-        // 重新打开标签页时整个应用卡在「正在连接服务器…」。
-        let next = 0
-        const worker = async () => {
-          while (current() && next < enabled.length) {
-            const s = enabled[next++]
-            const name = s.arguments.name
-            try {
-              const hits = await api.sourceSearch(name, q, ctrl.signal)
-              if (current()) {
-                hitsAcc = { ...hitsAcc, [name]: hits }
-                setSourceHits(hitsAcc)
-              }
-            } catch (e) {
-              if (current()) {
-                errorsAcc = { ...errorsAcc, [name]: errMsg(e) }
-                setSourceErrors(errorsAcc)
-              }
+        // 并发上限的理由见 lib/concurrency.ts
+        await mapLimit(enabled, SOURCE_SEARCH_CONCURRENCY, current, async (s) => {
+          const name = s.arguments.name
+          try {
+            const hits = await api.sourceSearch(name, q, ctrl.signal)
+            if (current()) {
+              hitsAcc = { ...hitsAcc, [name]: hits }
+              setSourceHits(hitsAcc)
+            }
+          } catch (e) {
+            if (current()) {
+              errorsAcc = { ...errorsAcc, [name]: errMsg(e) }
+              setSourceErrors(errorsAcc)
             }
           }
-        }
-        await Promise.all(
-          Array.from({ length: Math.min(SOURCE_SEARCH_CONCURRENCY, enabled.length) }, worker),
-        )
+        })
         if (current()) setSourcesLoading(false)
       })
       .catch((e) => {

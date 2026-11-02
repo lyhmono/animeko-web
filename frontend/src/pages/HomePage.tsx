@@ -26,25 +26,38 @@ export default function HomePage() {
   const navigate = useNavigate()
 
   useEffect(() => {
+    // 与其余每个页面一致的取消守卫：连点「重试」时慢的旧响应不能覆盖新结果，
+    // 卸载后也不该再 setState。
+    let cancelled = false
+    const controller = new AbortController()
     api
-      .health()
+      .health(controller.signal)
       .then((h) => {
+        if (cancelled) return
         setHealth(h)
         setApiReachable(true)
       })
       .catch(() => {
+        if (cancelled) return
         setHealth(null)
         setApiReachable(false)
       })
     setSourcesError('')
     api
-      .sources()
-      .then((list) => setSources(list))
+      .sources(controller.signal)
+      .then((list) => {
+        if (!cancelled) setSources(list)
+      })
       .catch((e) => {
+        if (cancelled) return
         setSources([])
         setSourcesError(errMsg(e))
       })
     setHistory(listSearchHistory())
+    return () => {
+      cancelled = true
+      controller.abort()
+    }
   }, [sourcesRetry])
 
   // 启动读取失败后「重新读取」成功会整份换档，历史 chips 要跟着刷新
