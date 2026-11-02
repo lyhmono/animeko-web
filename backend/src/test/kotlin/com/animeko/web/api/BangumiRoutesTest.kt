@@ -1,13 +1,16 @@
 package com.animeko.web.api
 
+import com.animeko.web.auth.LoginRateLimiter
 import com.animeko.web.bangumi.BangumiStubFetcher
 import com.animeko.web.config.AppConfig
 import com.animeko.web.module
 import io.ktor.client.request.get
+import io.ktor.client.request.post
 import io.ktor.client.request.put
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
@@ -41,6 +44,26 @@ class BangumiRoutesTest {
         [{"weekday":{"id":1,"en":"Mon","cn":"周一"},"items":[
         {"id":101,"name":"Test","name_cn":"测试番剧","eps":12,"rating":{"score":8.1}}]}]
     """.trimIndent()
+
+    @Test
+    fun `probe is rate limited so an unauthenticated visitor cannot use it as an amplifier`() = testApplication {
+        // 默认部署不配凭据 = 无鉴权，而这个接口每个目标地址都要做一次阻塞 DNS 加一次
+        // 带上限的 HTTP 探测。不限速时一份带 8 个慢解析域名的 body 就是现成的放大器。
+        val stub = BangumiStubFetcher()
+        application { module(config(), stub, probeLimiter = LoginRateLimiter(maxAttempts = 2, windowMs = 60_000)) }
+        suspend fun probe() = client.post("/api/bangumi/channel/probe") {
+            contentType(ContentType.Application.Json)
+            setBody("{}")
+        }
+        assertEquals(HttpStatusCode.OK, probe().status)
+        assertEquals(HttpStatusCode.OK, probe().status)
+        val throttled = probe()
+        assertEquals(HttpStatusCode.TooManyRequests, throttled.status)
+        assertTrue(
+            (throttled.headers[HttpHeaders.RetryAfter]?.toLongOrNull() ?: 0) > 0,
+            "429 必须带可用的 Retry-After，实际：${throttled.headers[HttpHeaders.RetryAfter]}",
+        )
+    }
 
     @Test
     fun `ranking returns paged subjects`() = testApplication {

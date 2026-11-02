@@ -16,7 +16,11 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
 import java.io.ByteArrayOutputStream
 
-private val prettyJson = Json { ignoreUnknownKeys = true }
+/**
+ * 宽松解析入站 JSON 的共用实例。此前 ApiRoutes.kt 里还有一份字面量完全相同的私有副本，
+ * 拆分路由后两份同时可见就会撞名 —— 这里作为唯一来源，开放到模块内。
+ */
+internal val prettyJson = Json { ignoreUnknownKeys = true }
 
 /**
  * 请求体上限。登录接口免鉴权也可达，不封顶等于让来访者决定这台机器的堆用量

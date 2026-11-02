@@ -196,5 +196,12 @@ class AppConfigNumberTest {
         assertFailsWith<IllegalStateException> {
             AppConfig.parseLongStrict("ANIMEKO_PROXY_TIMEOUT_MS", "1000000000000000", 120000L, 3600000L)
         }
+        // longEnv 走的是 500ms 下限：1ms 在旧口径里合法，却必然让每次出站请求超时
+        for (raw in listOf("1", "499")) {
+            assertFailsWith<IllegalStateException>("expected throw for [$raw]") {
+                AppConfig.parseLongStrict("ANIMEKO_REQUEST_TIMEOUT_MS", raw, 20000L, 600000L, 500L)
+            }
+        }
+        assertEquals(500L, AppConfig.parseLongStrict("ANIMEKO_REQUEST_TIMEOUT_MS", "500", 20000L, 600000L, 500L))
     }
 }

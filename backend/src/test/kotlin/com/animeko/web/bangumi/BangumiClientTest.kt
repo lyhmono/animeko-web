@@ -8,6 +8,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -22,13 +23,18 @@ class BangumiStubFetcher(
     // 模拟「镜像回了 302，目标是内网元数据地址」
     private val redirectPrefixes: Set<String> = emptySet(),
 ) : Fetcher {
-    val requests = mutableListOf<String>()
+    // 必须是并发安全的容器：raceAll 会同时向多个候选地址发请求，而路由把 bangumi 调用
+    // 放在 Dispatchers.IO 上，于是这些追加真的来自多个线程。普通 ArrayList 会丢更新
+    // （症状是「明明夹紧了的 limit/offset 在 requests 里找不到」），断言就成了抛硬币。
+    // 用 CopyOnWriteArrayList 而不是 synchronizedList：断言遍历时可能还有被放弃的
+    // 竞速分支在追加，快照迭代不会 ConcurrentModificationException。
+    val requests: MutableList<String> = CopyOnWriteArrayList()
 
     /** 元数据链路必须逐调用关掉自动跳转（这条链路没有 UrlGuard 兜着），记录实际传参 */
-    val getFollowFlags = mutableListOf<Boolean>()
+    val getFollowFlags: MutableList<Boolean> = CopyOnWriteArrayList()
 
     /** 带体积上限的读取走了哪些地址（探测接口的目标可以由任何访问者填写，必须有上限） */
-    val boundedGets = mutableListOf<Pair<String, Long>>()
+    val boundedGets: MutableList<Pair<String, Long>> = CopyOnWriteArrayList()
 
     override suspend fun fetch(
         url: String,
@@ -176,6 +182,23 @@ class BangumiClientTest {
         // 请求体包含关键词与动画类型过滤
         assertTrue(fetcher.requests.single().contains(""""keyword":"孤独摇滚""""))
         assertTrue(fetcher.requests.single().contains(""""type":[2]"""))
+    }
+
+    @Test
+    fun `calendar asks the official address first instead of racing the mirror on every call`() = runTest {
+        val official = BangumiClient.OFFICIAL_BASE
+        val mirror = BangumiClient.MIRROR_BASE
+        val fetcher = BangumiStubFetcher(getRoutes = mapOf("$official/v0/calendar" to "[]"))
+        val client = BangumiClient(fetcher, listOf(official, mirror))
+        client.calendar()
+        // raceAll 在 preferred == null 时走的是「全部候选同时开火」，于是每次首页加载都会
+        // 朝社区镜像打一发注定 404 的 /v0/calendar（镜像只镜像了搜索/条目/剧集）。
+        // 代码里那句「把镜像排到最后」的排序在没有 preferred 时根本不生效。
+        assertEquals(
+            listOf("GET $official/v0/calendar"),
+            fetcher.requests,
+            "官方能答就不该惊动镜像，实际请求：${fetcher.requests}",
+        )
     }
 
     @Test

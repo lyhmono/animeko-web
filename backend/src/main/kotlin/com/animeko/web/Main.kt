@@ -1,5 +1,7 @@
 package com.animeko.web
 
+import com.animeko.web.api.PROBE_MAX_ATTEMPTS
+import com.animeko.web.api.PROBE_WINDOW_MS
 import com.animeko.web.api.configureApiRoutes
 import com.animeko.web.api.configureStaticFrontend
 import com.animeko.web.auth.LoginRateLimiter
@@ -54,6 +56,7 @@ fun Application.module(
     proxySessions: ProxySessionStore = ProxySessionStore(),
     siteSessions: SessionStore = SessionStore(),
     loginLimiter: LoginRateLimiter = LoginRateLimiter(),
+    probeLimiter: LoginRateLimiter = LoginRateLimiter(maxAttempts = PROBE_MAX_ATTEMPTS, windowMs = PROBE_WINDOW_MS),
     credentialVerifier: CredentialVerifier = ConfiguredCredentialVerifier(cfg),
 ) {
     install(ContentNegotiation) {
@@ -173,7 +176,7 @@ fun Application.module(
 
     configureApiRoutes(
         cfg, bangumi, repo, engine, fetcher, sessions,
-        siteSessions, loginLimiter, userData, subscriptions, credentialVerifier,
+        siteSessions, loginLimiter, userData, subscriptions, credentialVerifier, probeLimiter,
     )
     configureStaticFrontend(cfg)
 

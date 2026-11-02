@@ -31,7 +31,12 @@ import kotlinx.coroutines.job
 import kotlinx.coroutines.withContext
 import java.net.URI
 
-private const val PROXY_PATH = "/api/proxy"
+/**
+ * 代理入口路径。此前 ApiRoutes.kt 里还有一份字面量完全相同的私有副本，
+ * 两处各写一遍意味着改了一处另一处会静默失配（前端拿到的 proxyPath 与
+ * 实际注册的路由对不上，症状是播放 404）。这里作为唯一来源，开放到模块内。
+ */
+internal const val PROXY_PATH = "/api/proxy"
 private const val MAX_REDIRECTS = 5
 private const val MAX_PLAYLIST_BYTES = 4L * 1024 * 1024
 

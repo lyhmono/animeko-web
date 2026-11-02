@@ -20,109 +20,6 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
-
-/** 条目在 Bangumi 上不存在/已删除（上游 404），映射为对客户端回 404。 */
-class SubjectNotFoundException(source: String) : Exception("Bangumi 条目不存在: $source")
-
-@Serializable
-data class BgmSearchResponse(
-    val total: Int = 0,
-    val data: List<BgmSubject> = emptyList(),
-    val limit: Int = 0,
-    val offset: Int = 0,
-)
-
-@Serializable
-data class BgmRating(
-    val rank: Int? = null,
-    val total: Int? = null,
-    val score: Double? = null,
-)
-
-@Serializable
-data class BgmSubject(
-    val id: Int,
-    val name: String = "",
-    val name_cn: String = "",
-    val summary: String = "",
-    val date: String? = null,
-    val platform: String? = null,
-    val type: Int? = null,
-    val rating: BgmRating? = null,
-    /**
-     * v0 搜索/详情结果在顶层也给了评分与排名（详情接口的 responseGroup=large 同样如此）。
-     * 之前没落到字段上被 ignoreUnknownKeys 丢掉，前端 `rating?.score ?? score` 的兜底于是恒为 undefined。
-     */
-    val score: Double? = null,
-    val rank: Int? = null,
-    val images: BgmImages? = null,
-    /**
-     * v0 API 中该字段类型不固定：搜索结果为 int（总集数），详情可能为数组。
-     * 剧集统一通过 /v0/episodes 获取，这里仅做容错解析。
-     */
-    val eps: JsonElement? = null,
-)
-
-@Serializable
-data class BgmImages(
-    val large: String? = null,
-    val common: String? = null,
-    val medium: String? = null,
-    val small: String? = null,
-    val grid: String? = null,
-)
-
-@Serializable
-data class BgmEpisodesResponse(
-    val total: Int = 0,
-    val data: List<BgmEpisode> = emptyList(),
-)
-
-@Serializable
-data class BgmCalendarResponse(
-    val weekday: BgmWeekday = BgmWeekday(),
-    val items: List<BgmCalendarItem> = emptyList(),
-)
-
-@Serializable
-data class BgmWeekday(
-    val id: Int = 0,
-    val en: String = "",
-    val cn: String = "",
-)
-
-/**
- * 每日放送的一项。与 [BgmSubject] 同构度很高但是两个结构：
- * calendar 的 item 没有 summary/date，而多一个 `collection`（当前用户收藏状态），
- * 且 eps 是纯整数（已放送集数思路）。另立模型而不是复用，是为了让两边的
- * 「字段一定存在」的假设各自成立，不会因为一边 API 变动影响另一边解析。
- */
-@Serializable
-data class BgmCalendarItem(
-    val id: Int,
-    val name: String = "",
-    val name_cn: String = "",
-    val rating: BgmRating? = null,
-    val score: Double? = null,
-    val images: BgmImages? = null,
-    /** 已放送/总集数（calendar 接口里是数字） */
-    val eps: Int? = null,
-    /** 当前用户是否已收藏（无鉴权的开放请求里通常为 null） */
-    val collection: JsonElement? = null,
-)
-
-@Serializable
-data class BgmEpisode(
-    val id: Int,
-    val name: String = "",
-    val name_cn: String = "",
-    val sort: Double? = null,
-    val duration: String? = null,
-    val airdate: String? = null,
-    /** 0=本篇 1=SP 2=OP 3=ED 4=预告 5=MAD 6=其他；前端据此区分非正片剧集 */
-    val type: Int = 0,
-)
 
 /**
  * Bangumi 开放 API 客户端（v0，https://github.com/bangumi/api）。
@@ -154,6 +51,9 @@ class BangumiClient(
     @Volatile
     private var channel: BgmChannelConfig = channelStore?.load() ?: BgmChannelConfig()
     private var channelGeneration: Long = 0
+
+    /** 通道提交的串行化锁：把 fsync 级磁盘 IO 挡在读路径的监视器锁之外（见 setChannel） */
+    private val submitLock = Any()
 
     init {
         // 配置文件能被手工改，绕过 setChannel 的校验。启动时再验一次：
@@ -188,7 +88,6 @@ class BangumiClient(
     private fun isAllowedChannelTarget(url: String): Boolean =
         runCatching { UrlGuard.requireAllowed("$url/v0/calendar", allowPrivateTargets) }.isSuccess
 
-    /** 当前通道实际生效的地址列表（公开给设置页展示）。每次调用重读，改完立即生效、不用重启。 */
     /** 给设置页展示用：不校验。这里若抛错，站长打开设置页就看到 403，
      *  反而**没法**把已经变成内网的那个地址改回来——把自己锁在门外了。 */
     fun effectiveBases(): List<String> = resolveBases(channel, enforce = false)
@@ -296,26 +195,22 @@ class BangumiClient(
             // 非 CUSTOM 不保留无效的旧自定义地址。
             next.copy(customUrls = emptyList())
         }
-        return synchronized(this) {
-            // 持久化成功后才发布；同一把锁覆盖保存、发布和赢家失效，避免并发提交交错。
+        // 先落盘、再发布，且落盘不在读路径的临界区里：channelStore.save 是 fsync 级的
+        // 磁盘 IO，而 synchronized(this) 这把锁是**每个**元数据请求都要进一次的
+        // （withFallback 读 preferredBase、requestSnapshot 读通道），共用一把锁等于
+        // 保存通道的那一瞬卡住所有在途请求的入口。并发提交由 submitLock 串行化，
+        // 「保存→发布」仍然不会被交错。
+        synchronized(submitLock) {
             channelStore?.save(saved)
-            channelGeneration++
-            channel = saved
-            preferredBase = null
-            saved
+            synchronized(this) {
+                channelGeneration++
+                channel = saved
+                preferredBase = null
+            }
         }
+        return saved
     }
 
-    /**
-     * 探测候选地址的连通性（拿 /v0/calendar 试，它响应体小）。
-     * 返回每个地址的成功与否、延迟与一句原因，供设置页展示 ——
-     * 让站长在保存之前就看见「这个镜像不支持每日放送」这类事实，
-     * 而不是保存完去猜。
-     *
-     * @param target 要探测的通道；为 null 时探测**当前已保存**的通道。
-     *   设置页的正确流程是「先探测目标、再保存」，所以探测必须能回答
-     *   「如果我切到镜像会怎样」—— 而不是只能看当前状态。
-     */
     /**
      * 探测候选地址的连通性，分**两件事**回答，因为它们对同一个地址经常是不同答案：
      *  - [BgmProbeResult.ok]：核心能力是否可用（搜索/条目/剧集，即 /v0/subjects 探针）
@@ -459,6 +354,13 @@ class BangumiClient(
             // 具名实参之后不能再跟尾随 lambda，Kotlin 会把它当成传给下一个
             // 形参的位置实参，于是报 "No value passed for parameter 'block'"。
             // 显式传 lambda 就没有歧义了。
+            //
+            // preferred 必须显式给：raceAll 在 preferred == null 时走的是
+            // `list.forEach { start(it) }`，全部候选同时开火 —— 上面那句「把镜像排到
+            // 最后」的排序根本不生效，于是每次首页加载都朝社区镜像打一发注定 404 的
+            // /v0/calendar。给了 preferred 才会先只试官方，超过对冲窗口再补备选。
+            // 用 firstOrNull：候选为空时要留给 raceAll 去抛那句可解释的错误，
+            // 而不是在这里先炸一个 NoSuchElementException（那是 500）。
             raceAll(candidates, block = { base ->
                 // 不能复用普通的 text()：它把 404 解释成「条目不存在」
                 // （那是 /v0/subjects/{id} 的语义）。放送表上的 404 只有一个含义 ——
@@ -472,7 +374,7 @@ class BangumiClient(
                     else ->
                         throw UpstreamException("每日放送请求返回 HTTP ${result.status}（$base）")
                 }
-            }, rememberWinner = false, generation = snapshot.generation)
+            }, rememberWinner = false, demotePreferred = false, preferred = candidates.firstOrNull(), generation = snapshot.generation)
             } ?: throw UpstreamException("每日放送获取超时（${CALENDAR_BUDGET_MS / 1000} 秒），可稍后刷新")
         }
     }
@@ -549,6 +451,13 @@ class BangumiClient(
                     "上游 $source 返回 ${result.status}（Bangumi 请求不自动跟随重定向："+
                         "请把 ANIMEKO_BANGUMI_BASE_URLS 配成重定向后的最终地址）",
                 )
+                // 429/503 是上游在说「慢一点」，不是「坏了」。混进通用的 502 文案里，
+                // 站长只会反复点重试把限速撞得更深；说清楚是限速，才知道该等一会儿。
+                // 这里刻意**不**自动重试：raceAll 已经会在候选地址之间故障转移，
+                // 再对一个正在限速的上游立刻补一发只会让情况更糟。
+                result.status == 429 || result.status == 503 -> throw UpstreamException(
+                    "上游 $source 返回 ${result.status}（Bangumi 限速或维护中），请稍后再试",
+                )
                 else -> throw UpstreamException("上游 $source 返回 ${result.status}")
             }
         } catch (e: SubjectNotFoundException) {
@@ -589,6 +498,11 @@ class BangumiClient(
         block: suspend (base: String) -> T,
         /** 是否把赢家记为全局首选。放送表这条必须传 false（见 calendar 的注释） */
         rememberWinner: Boolean = true,
+        /**
+         * 首选失败时是否把它从全局偏好里摘掉。放送表这条必须传 false：
+         * 它的 preferred 是每次现算的，摘掉的却会是搜索那条链路记着的赢家。
+         */
+        demotePreferred: Boolean = true,
         preferred: String? = null,
         generation: Long,
     ): T = coroutineScope {
@@ -640,7 +554,7 @@ class BangumiClient(
                 val error = outcome.exceptionOrNull()
                 if (error is CancellationException) throw error
                 lastError = error
-                if (base == primary && error !is SubjectNotFoundException) synchronized(this@BangumiClient) {
+                if (demotePreferred && base == primary && error !is SubjectNotFoundException) synchronized(this@BangumiClient) {
                     if (generation == channelGeneration && preferredBase == base) preferredBase = null
                 }
                 // 404 是确定性的结果：不能因为另一个 base 更晚回了一个 500

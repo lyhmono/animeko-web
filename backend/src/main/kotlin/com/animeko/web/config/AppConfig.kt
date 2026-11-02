@@ -55,7 +55,8 @@ data class AppConfig(
                     ?.takeIf { it.isNotBlank() }
                     ?.let { listOf(it.trim().removeSuffix("/")) }
                     ?: listOf("https://api.bgm.tv", "https://bgmapi.anibt.net")
-            },
+            }
+            .also { requireBangumiBases(it) },
     val requestTimeoutMs: Long = longEnv("ANIMEKO_REQUEST_TIMEOUT_MS", 20_000, max = 600_000),
     /**
      * Bangumi 元数据请求的超时，单独配。社区镜像（bgmapi.anibt.net）实测要
@@ -192,18 +193,49 @@ data class AppConfig(
             parseIntStrict(key, System.getenv(key), default, min, max)
 
         /** 毫秒类超时：同上，但必须为正数，且上限防呆（避免写成 1e15 让请求永久挂起） */
-        fun parseLongStrict(key: String, raw: String?, default: Long, max: Long): Long {
+        fun parseLongStrict(key: String, raw: String?, default: Long, max: Long, min: Long = 1): Long {
             val text = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return default
             val value = text.toLongOrNull()
                 ?: throw IllegalStateException("$key 的值「$text」不是整数。")
-            if (value !in 1..max) {
-                throw IllegalStateException("$key 必须在 1..$max 之间，当前为 $value。")
+            if (value !in min..max) {
+                throw IllegalStateException("$key 必须在 $min..$max 之间，当前为 $value。")
             }
             return value
         }
 
+        /**
+         * 超时类配置的下限。旧口径是 1..max，于是 1ms 属于「合法配置」——
+         * 而它必然让每一次出站请求都超时，症状和「上游镜像挂了」一模一样，
+         * 配置里那个数字看着却完全正常。下限存在的意义是让这种配置起不来，
+         * 而不是让它起来之后到处失败。
+         */
+        private const val MIN_TIMEOUT_MS = 500L
+
         fun longEnv(key: String, default: Long, max: Long): Long =
-            parseLongStrict(key, System.getenv(key), default, max)
+            parseLongStrict(key, System.getenv(key), default, max, MIN_TIMEOUT_MS)
+
+        /**
+         * raceAll 会对候选列表里的每个地址**同时**发请求，所以列表长度就是一次元数据
+         * 调用的并发放大倍数。CUSTOM 通道在 BangumiClient 里已经限了 8 个，而环境变量
+         * 这条路径此前既不设限也不校验 scheme —— 多写一个逗号就能让每次首页加载并发打
+         * 几十个地址。这里按同一个口径挡住，并且启动即失败：配置错误在启动时说清楚，
+         * 好过运行期到处 502 而没人知道为什么。
+         */
+        private const val MAX_BANGUMI_BASES = 8
+
+        fun requireBangumiBases(list: List<String>) {
+            if (list.size > MAX_BANGUMI_BASES) {
+                throw IllegalStateException(
+                    "ANIMEKO_BANGUMI_BASE_URLS 最多 $MAX_BANGUMI_BASES 个地址（当前 ${list.size} 个）：" +
+                        "每个地址都会被同时请求，列表长度就是并发放大倍数。",
+                )
+            }
+            list.forEach {
+                if (!it.startsWith("https://") && !it.startsWith("http://")) {
+                    throw IllegalStateException("ANIMEKO_BANGUMI_BASE_URLS 里有非 http(s) 地址：「$it」")
+                }
+            }
+        }
 
         /**
          * 解析一个布尔量：没配返回 null，交给调用方的默认值；配了但认不出来**直接报错**。
