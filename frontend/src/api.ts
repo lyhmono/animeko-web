@@ -134,6 +134,15 @@ export interface ServiceMetrics {
   uptimeSeconds: number
 }
 
+export interface SourceHealth {
+  success: number
+  failure: number
+  totalMs: number
+  lastError: string | null
+  lastAt: number
+  avgMs: number
+}
+
 export const api = {
   health: (signal?: AbortSignal) =>
     request<{ status: string; version: string; authEnabled: boolean; authenticated: boolean }>(
@@ -141,6 +150,7 @@ export const api = {
       { signal },
     ),
   metrics: (signal?: AbortSignal) => request<ServiceMetrics>('/api/metrics', { signal }),
+  selectorHealth: (signal?: AbortSignal) => request<Record<string, SourceHealth>>('/api/selector/health', { signal }),
 
   // ---- 登录会话 ----
   login: (username: string, password: string, signal?: AbortSignal) =>

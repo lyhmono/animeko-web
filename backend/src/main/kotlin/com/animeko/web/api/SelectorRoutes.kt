@@ -1,6 +1,7 @@
 package com.animeko.web.api
 
 import com.animeko.web.proxy.HlsRewriter
+import com.animeko.web.selector.SelectorHealth
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.call
 import io.ktor.server.response.respond
@@ -26,6 +27,11 @@ internal fun Route.selectorRoutes(deps: ApiDeps) {
         // ---- 数据源管理 ----
         get("/api/selector/sources") {
             call.respond(withContext(Dispatchers.IO) { repo.list() })
+        }
+
+        // 各数据源成功率/耗时/最近错误：只含健康指标，不含搜索词与播放地址
+        get("/api/selector/health") {
+            call.respond(SelectorHealth.snapshot())
         }
 
         post("/api/selector/sources") {
@@ -120,7 +126,7 @@ internal fun Route.selectorRoutes(deps: ApiDeps) {
                 if (keyword.isNullOrBlank()) {
                     call.respond(HttpStatusCode.BadRequest, mapOf("error" to "missing keyword"))
                 } else {
-                    call.respond(withContext(Dispatchers.IO) { engine.search(source.arguments.searchConfig, keyword) })
+                    call.respond(SelectorHealth.record(source.arguments.name) { withContext(Dispatchers.IO) { engine.search(source.arguments.searchConfig, keyword) } })
                 }
             }
         }
@@ -134,7 +140,7 @@ internal fun Route.selectorRoutes(deps: ApiDeps) {
                 if (subjectUrl.isNullOrBlank()) {
                     call.respond(HttpStatusCode.BadRequest, mapOf("error" to "missing subjectUrl"))
                 } else {
-                    call.respond(withContext(Dispatchers.IO) { engine.episodes(source.arguments.searchConfig, subjectUrl) })
+                    call.respond(SelectorHealth.record(source.arguments.name) { withContext(Dispatchers.IO) { engine.episodes(source.arguments.searchConfig, subjectUrl) } })
                 }
             }
         }
@@ -148,7 +154,7 @@ internal fun Route.selectorRoutes(deps: ApiDeps) {
                 if (playUrl.isNullOrBlank()) {
                     call.respond(HttpStatusCode.BadRequest, mapOf("error" to "missing playUrl"))
                 } else {
-                    val target = withContext(Dispatchers.IO) { engine.resolveVideo(source.arguments.searchConfig, playUrl) }
+                    val target = SelectorHealth.record(source.arguments.name) { withContext(Dispatchers.IO) { engine.resolveVideo(source.arguments.searchConfig, playUrl) } }
                     // 凭据换成服务端会话号后再交给前端：浏览器只需要一个能用的代理地址
                     val sid = sessions.put(
                         mediaUrl = target.url,

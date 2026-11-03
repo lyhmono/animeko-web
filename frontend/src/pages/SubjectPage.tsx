@@ -371,7 +371,13 @@ export default function SubjectPage() {
             {subject.date && <span>放送 {subject.date}</span>}
             <span>共 {episodes.length} 话</span>
             {watchedEp > 0 && (
-              <span style={{ color: 'var(--accent)' }}>看到第 {watchedEp} 话</span>
+              <button
+                className="btn btn-sm continue-watch"
+                onClick={() => document.querySelector('.episode-tabs')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+                aria-label={`继续观看第 ${watchedEp} 话`}
+              >
+                继续观看第 {watchedEp} 话
+              </button>
             )}
           </div>
           <button className={`fav-btn ${faved ? 'active' : ''}`} onClick={onToggleFav}>

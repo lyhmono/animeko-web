@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, errMsg } from '../api'
+import { api, errMsg, type SourceHealth } from '../api'
 import type { StoredSource, SubscriptionCandidate, SubscriptionPreview } from '../types'
 import { IconLink } from '../lib/icons'
 import { notifySourcesChanged } from '../lib/sourceEvents'
@@ -15,6 +15,7 @@ function subSource(url: string, text: string): { url?: string; text?: string } |
 
 export default function SourcesPage() {
   const [sources, setSources] = useState<StoredSource[]>([])
+  const [health, setHealth] = useState<Record<string, SourceHealth>>({})
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [importText, setImportText] = useState('')
@@ -90,6 +91,13 @@ export default function SourcesPage() {
   }, [])
 
   useEffect(() => { void reload() }, [reload])
+  // 健康指标与源列表分开拉：它失败不该影响数据源管理本身
+  useEffect(() => {
+    let alive = true
+    // mock/旧服务端没有这个方法时也不能让数据源页崩掉
+    Promise.resolve(api.selectorHealth?.() ?? {}).then((h) => { if (alive && h) setHealth(h) }).catch(() => {})
+    return () => { alive = false }
+  }, [])
 
 
   const doImport = async () => {
@@ -351,6 +359,22 @@ export default function SourcesPage() {
               {s.arguments.name} <span className="tag">{s.arguments.searchConfig.subjectFormatId}</span>
             </div>
             <div className="desc">{s.arguments.description || s.arguments.searchConfig.searchUrl}</div>
+            {health[s.arguments.name] && (
+              <div className="source-health">
+                {(() => {
+                  const h = health[s.arguments.name]
+                  const total = h.success + h.failure
+                  const rate = total > 0 ? Math.round((h.success / total) * 100) : 100
+                  return (
+                    <>
+                      <span className={rate >= 80 ? 'health-ok' : 'health-bad'}>成功率 {rate}%</span>
+                      <span>平均 {h.avgMs}ms</span>
+                      {h.lastError && <span className="health-bad" title={h.lastError}>最近失败：{h.lastError}</span>}
+                    </>
+                  )
+                })()}
+              </div>
+            )}
             {testResult[s.arguments.name] && (
               <div className="desc" style={{ marginTop: 4, color: 'var(--accent)' }}>
                 {testResult[s.arguments.name]}

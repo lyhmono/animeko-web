@@ -342,6 +342,33 @@
   box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
 }
 
+.source-health {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.health-ok {
+  color: var(--success);
+}
+
+.health-bad {
+  color: var(--danger);
+}
+
+.continue-watch {
+  background: var(--accent);
+  color: var(--accent-on);
+  border: none;
+}
+
+.continue-watch:hover {
+  background: var(--accent-hover);
+}
+
 /* ---------- 播放器：Plex 金进度条与毛玻璃控制条 ---------- */
 
 .player-controls {

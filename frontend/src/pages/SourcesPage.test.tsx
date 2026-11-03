@@ -12,6 +12,7 @@ vi.mock('../api', async (importOriginal) => ({
   api: {
     sources: vi.fn(), sourceSearch: vi.fn(), setSourceEnabled: vi.fn(),
     importSource: vi.fn(), deleteSource: vi.fn(), previewSubscription: vi.fn(), importSubscription: vi.fn(),
+    selectorHealth: vi.fn().mockResolvedValue({}),
   },
 }))
 
