@@ -61,26 +61,39 @@ export interface PlayerPrefs {
 
 const DEFAULT_PLAYER_PREFS: PlayerPrefs = { volume: 1, muted: false, rate: 1 }
 
-export function getPlayerPrefs(): PlayerPrefs {
+export function getPlayerPrefs(rateKey?: string): PlayerPrefs {
   const raw = localRead(PLAYER_PREFS_KEY)
-  if (!raw) return { ...DEFAULT_PLAYER_PREFS }
-  try {
-    const parsed = JSON.parse(raw) as Partial<PlayerPrefs>
-    const volume = typeof parsed.volume === 'number' && parsed.volume >= 0 && parsed.volume <= 1
-      ? parsed.volume
-      : DEFAULT_PLAYER_PREFS.volume
-    const rate = typeof parsed.rate === 'number' && parsed.rate >= 0.25 && parsed.rate <= 4
-      ? parsed.rate
-      : DEFAULT_PLAYER_PREFS.rate
-    return { volume, muted: parsed.muted === true, rate }
-  } catch {
-    // 坏值不该让播放器起不来：退回默认
-    return { ...DEFAULT_PLAYER_PREFS }
+  let base = { ...DEFAULT_PLAYER_PREFS }
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as Partial<PlayerPrefs>
+      base = {
+        volume: typeof parsed.volume === 'number' && parsed.volume >= 0 && parsed.volume <= 1
+          ? parsed.volume
+          : DEFAULT_PLAYER_PREFS.volume,
+        muted: parsed.muted === true,
+        rate: typeof parsed.rate === 'number' && parsed.rate >= 0.25 && parsed.rate <= 4
+          ? parsed.rate
+          : DEFAULT_PLAYER_PREFS.rate,
+      }
+    } catch {
+      base = { ...DEFAULT_PLAYER_PREFS }
+    }
   }
+  // 番剧级倍速覆盖全局默认：不同番的语速/OP 风格差异很大，不该全局一刀切
+  if (rateKey) {
+    const perShow = localRead(`${PLAYER_PREFS_KEY}:rate:${rateKey}`)
+    if (perShow) {
+      const rate = Number(perShow)
+      if (Number.isFinite(rate) && rate >= 0.25 && rate <= 4) base = { ...base, rate }
+    }
+  }
+  return base
 }
 
-export function savePlayerPrefs(prefs: PlayerPrefs): void {
+export function savePlayerPrefs(prefs: PlayerPrefs, rateKey?: string): void {
   localWrite(PLAYER_PREFS_KEY, JSON.stringify(prefs))
+  if (rateKey) localWrite(`${PLAYER_PREFS_KEY}:rate:${rateKey}`, String(prefs.rate))
 }
 
 /**
@@ -111,21 +124,22 @@ const PLAYBACK_SETTINGS_KEY = 'animeko-web:playback-settings'
 export interface PlaybackSettings {
   autoNext: boolean
   opSkipSeconds: number
+  edSkipSeconds: number
 }
 
-const DEFAULT_PLAYBACK_SETTINGS: PlaybackSettings = { autoNext: true, opSkipSeconds: 90 }
+const DEFAULT_PLAYBACK_SETTINGS: PlaybackSettings = { autoNext: true, opSkipSeconds: 90, edSkipSeconds: 0 }
 
 export function getPlaybackSettings(): PlaybackSettings {
   const raw = localRead(PLAYBACK_SETTINGS_KEY)
   if (!raw) return { ...DEFAULT_PLAYBACK_SETTINGS }
   try {
     const parsed = JSON.parse(raw) as Partial<PlaybackSettings>
-    const seconds = typeof parsed.opSkipSeconds === 'number' && parsed.opSkipSeconds >= 0 && parsed.opSkipSeconds <= 300
-      ? Math.round(parsed.opSkipSeconds)
-      : DEFAULT_PLAYBACK_SETTINGS.opSkipSeconds
+    const clamp = (value: unknown, fallback: number): number =>
+      typeof value === 'number' && value >= 0 && value <= 300 ? Math.round(value) : fallback
     return {
       autoNext: parsed.autoNext !== false,
-      opSkipSeconds: seconds,
+      opSkipSeconds: clamp(parsed.opSkipSeconds, DEFAULT_PLAYBACK_SETTINGS.opSkipSeconds),
+      edSkipSeconds: clamp(parsed.edSkipSeconds, DEFAULT_PLAYBACK_SETTINGS.edSkipSeconds),
     }
   } catch {
     return { ...DEFAULT_PLAYBACK_SETTINGS }

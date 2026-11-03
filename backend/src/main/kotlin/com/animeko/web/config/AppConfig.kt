@@ -74,6 +74,8 @@ data class AppConfig(
      * 表现是「搜索页永远没有 Bangumi 结果」，而镜像手动 curl 又是通的。
      */
     val bangumiTimeoutMs: Long = longEnv("ANIMEKO_BANGUMI_TIMEOUT_MS", 45_000, max = 600_000),
+    /** 订阅自动刷新间隔（毫秒）。默认 6 小时；设为 0 关闭。 */
+    val subscriptionRefreshMs: Long = longEnv("ANIMEKO_SUBSCRIPTION_REFRESH_MS", 6 * 60 * 60 * 1000, max = 7 * 24 * 60 * 60 * 1000),
     val proxyTimeoutMs: Long = longEnv("ANIMEKO_PROXY_TIMEOUT_MS", 120_000, max = 3_600_000),
 
     /**

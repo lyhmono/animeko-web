@@ -21,6 +21,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.nio.file.Path
 
 /**
  * 聚合订阅：一条 URL 背后是几十上百个数据源的集合（例如 css1.json 这种）。
@@ -32,6 +33,7 @@ class SubscriptionService(
     private val fetcher: Fetcher,
     private val repo: SelectorRepository,
     private val allowPrivateTargets: Boolean,
+    private val store: SubscriptionStore = SubscriptionStore(Path.of("data/subscriptions.json")),
 ) {
 
     private val json = Json { ignoreUnknownKeys = true }
@@ -173,6 +175,29 @@ class SubscriptionService(
         "${SelectorEngine.urlForLog(url)} → $label 个"
     }
 
+    suspend fun refreshAll(): Int {
+        var updated = 0
+        for (entry in store.list()) {
+            try {
+                val body = loadBody(entry.url, null)
+                val (items, _) = parse(body)
+                for (args in items) {
+                    currentCoroutineContext().ensureActive()
+                    upsert(args)
+                }
+                store.markResult(entry.url, null)
+                updated++
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // 单个订阅失败只标记它自己：旧配置继续可用，不能把整轮刷新拖垮
+                store.markResult(entry.url, e.message?.take(120))
+                appLog.warn("订阅自动更新失败 {}: {}", SelectorEngine.urlForLog(entry.url), e.message)
+            }
+        }
+        return updated
+    }
+
     suspend fun preview(url: String?, text: String?, label: String = ""): PreviewResponse {
         val body = loadBody(url, text)
         val (items, rejected) = parse(body)
@@ -240,6 +265,10 @@ class SubscriptionService(
             }
         }
         return ImportResponse(added = added, updated = updated, failed = failed, rejected = rejected)
+            .also {
+                // 只有 URL 导入的才登记自动刷新；直接贴正文的没有可刷新的地址
+                if (!url.isNullOrBlank() && (added.isNotEmpty() || updated.isNotEmpty())) store.register(url)
+            }
     }
 
     /** Cancellation is checked between durable atomic commits; no per-entry directory scan. */

@@ -3,6 +3,12 @@ plugins {
     kotlin("plugin.serialization") version "2.4.10"
     application
     jacoco
+    // 静态检查以报告形式接入：先让问题可见，不直接让 CI 变红
+    id("org.jlleitschuh.gradle.ktlint") version "13.1.0"
+}
+
+ktlint {
+    ignoreFailures.set(true)
 }
 
 group = "com.animeko"

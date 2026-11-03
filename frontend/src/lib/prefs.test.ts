@@ -15,23 +15,23 @@ beforeEach(() => {
 
 describe('playback settings', () => {
   it('defaults to auto-next and a 90s opening skip', () => {
-    expect(getPlaybackSettings()).toEqual({ autoNext: true, opSkipSeconds: 90 })
+    expect(getPlaybackSettings()).toEqual({ autoNext: true, opSkipSeconds: 90, edSkipSeconds: 0 })
   })
 
   it('persists partial updates and keeps unrelated fields', () => {
     savePlaybackSettings({ autoNext: false })
-    expect(getPlaybackSettings()).toEqual({ autoNext: false, opSkipSeconds: 90 })
+    expect(getPlaybackSettings()).toEqual({ autoNext: false, opSkipSeconds: 90, edSkipSeconds: 0 })
     savePlaybackSettings({ opSkipSeconds: 120 })
-    expect(getPlaybackSettings()).toEqual({ autoNext: false, opSkipSeconds: 120 })
+    expect(getPlaybackSettings()).toEqual({ autoNext: false, opSkipSeconds: 120, edSkipSeconds: 0 })
   })
 
   it('clamps invalid skip seconds but keeps the stored auto-next flag', () => {
     savePlaybackSettings({ autoNext: false, opSkipSeconds: 9999 })
-    expect(getPlaybackSettings()).toEqual({ autoNext: false, opSkipSeconds: 90 })
+    expect(getPlaybackSettings()).toEqual({ autoNext: false, opSkipSeconds: 90, edSkipSeconds: 0 })
   })
 
   it('falls back to defaults for broken payloads', () => {
     store.set('animeko-web:playback-settings', '{bad json')
-    expect(getPlaybackSettings()).toEqual({ autoNext: true, opSkipSeconds: 90 })
+    expect(getPlaybackSettings()).toEqual({ autoNext: true, opSkipSeconds: 90, edSkipSeconds: 0 })
   })
 })

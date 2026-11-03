@@ -352,6 +352,17 @@ export default function SourcesPage() {
       )}
 
       {loading && <div className="loading">数据源加载中…</div>}
+      {(() => {
+        const unhealthy = Object.entries(health).filter(([, h]) => {
+          const total = h.success + h.failure
+          return total >= 5 && h.success / total < 0.5
+        }).length
+        return unhealthy > 0 && (
+          <div className="error-box" role="alert">
+            {unhealthy} 个数据源持续失败，请检查配置或订阅地址；旧配置仍保留，可尝试手动更新订阅。
+          </div>
+        )
+      })()}
       {sources.map((s) => (
         <div className="source-item" key={s.arguments.name}>
           <div className="info">

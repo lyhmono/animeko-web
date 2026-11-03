@@ -440,6 +440,7 @@ export default function PlayerPage() {
             playRequest={playRequest}
             reloadRequest={reloadRequest}
             playKey={`${source}|${playUrl}`}
+            rateKey={animeName || source}
             fullscreenTarget={stageRef}
             theater
             onNextEpisode={target ? gotoNext : undefined}
@@ -549,6 +550,16 @@ export default function PlayerPage() {
             aria-label="片头跳过秒数"
           >
             {[60, 85, 90, 120].map((s) => <option key={s} value={s}>{s} 秒</option>)}
+          </select>
+        </label>
+        <label className="player-tool">
+          片尾跳过
+          <select
+            value={playback.edSkipSeconds}
+            onChange={(e) => setPlayback(savePlaybackSettings({ edSkipSeconds: Number(e.target.value) }))}
+            aria-label="片尾跳过秒数"
+          >
+            {[0, 60, 90, 120].map((s) => <option key={s} value={s}>{s === 0 ? '不跳过' : `${s} 秒`}</option>)}
           </select>
         </label>
       </div>

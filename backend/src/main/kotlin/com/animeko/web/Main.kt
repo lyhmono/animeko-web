@@ -42,6 +42,8 @@ import io.ktor.server.response.header
 import io.ktor.server.response.respond
 import io.ktor.server.routing.routing
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 
@@ -193,7 +195,12 @@ fun Application.module(
     val engine = SelectorEngine(fetcher, cfg.allowPrivateTargets)
     val sessions = proxySessions
     val userData = UserDataStore(cfg.userDataFile)
-    val subscriptions = SubscriptionService(fetcher, repo, cfg.allowPrivateTargets)
+    val subscriptions = SubscriptionService(
+        fetcher,
+        repo,
+        cfg.allowPrivateTargets,
+        com.animeko.web.selector.SubscriptionStore(cfg.dataDir.resolve("subscriptions.json")),
+    )
 
     // 默认订阅在后台协程里异步导入 —— 绝不在模块初始化里做网络 I/O：订阅站慢或挂了会把
     // 启动卡住，而端口还没监听时连健康检查都过不去。
@@ -211,6 +218,17 @@ fun Application.module(
                 emptyList()
             }
             appLog.info("订阅自动导入完成：{}", summaries.joinToString(" ; "))
+        }
+    }
+
+    // 订阅定时刷新：只更新已登记的订阅地址，失败保留旧配置（见 SubscriptionService.refreshAll）
+    if (cfg.subscriptionRefreshMs > 0) {
+        launch {
+            while (isActive) {
+                delay(cfg.subscriptionRefreshMs)
+                runCatching { subscriptions.refreshAll() }
+                    .onFailure { appLog.warn("订阅定时刷新失败：{}", it.message) }
+            }
         }
     }
 

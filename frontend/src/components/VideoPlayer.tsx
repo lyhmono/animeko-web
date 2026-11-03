@@ -37,6 +37,8 @@ interface Props {
    * 换手动地址或换集时变化 —— 只有前者需要沿用当前的播放位置。
    */
   playKey?: string
+  /** 倍速记忆的粒度（番剧名）。不传则只用全局默认倍速 */
+  rateKey?: string
   /** 全屏目标容器；播放页传入包含控制条的舞台，缺省时全屏本组件 */
   fullscreenTarget?: RefObject<HTMLElement | null>
   /** 影院模式：舞台外框压暗，让放映区成为唯一视觉焦点 */
@@ -114,6 +116,7 @@ export default function VideoPlayer({
   playRequest = 0,
   reloadRequest = 0,
   playKey = '',
+  rateKey,
   fullscreenTarget,
   theater = false,
   onPrevEpisode,
@@ -128,7 +131,7 @@ export default function VideoPlayer({
   const [current, setCurrent] = useState(0)
   const [duration, setDuration] = useState(0)
   // 偏好只读一次（三个 useState 各自调一次 getPlayerPrefs 会读三遍 localStorage + 解析三遍 JSON）
-  const [initialPrefs] = useState(getPlayerPrefs)
+  const [initialPrefs] = useState(() => getPlayerPrefs(rateKey))
   const [volume, setVolume] = useState(initialPrefs.volume)
   const [muted, setMuted] = useState(initialPrefs.muted)
   const [rate, setRate] = useState(() => snapRate(initialPrefs.rate))
@@ -138,6 +141,8 @@ export default function VideoPlayer({
   const [fullscreen, setFullscreen] = useState(false)
   const [autoplayBlocked, setAutoplayBlocked] = useState(false)
   const autoplayTriedRef = useRef(false)
+  /** 本集是否已经执行过片尾跳过，避免每个 timeupdate 都 seek 一次 */
+  const edSkippedRef = useRef(false)
 
   // ---- 影院化控制层的新增状态 ----
   /** 控制条是否可见：播放中 3 秒无操作自动隐藏，暂停/悬停时常驻 */
@@ -191,6 +196,7 @@ export default function VideoPlayer({
   const [useFallback, setUseFallback] = useState(false)
   const [lastLoad, setLastLoad] = useState({ src, reloadRequest, playKey })
   if (src !== lastLoad.src || reloadRequest !== lastLoad.reloadRequest || playKey !== lastLoad.playKey) {
+    edSkippedRef.current = false
     // render 阶段同步派生状态：用 effect 重置会让新 src 先带着旧的 useFallback 加载一帧
     setLastLoad({ src, reloadRequest, playKey })
     if (useFallback) setUseFallback(false)
@@ -404,6 +410,13 @@ export default function VideoPlayer({
         !video.currentSrc || video.readyState < 2 || video.seeking || video.error) return
       setCurrent(video.currentTime)
       const total = Number.isFinite(video.duration) ? video.duration : 0
+      // 片尾跳过：接近结尾且开了档位时直接跳到 ended（自动连播会接管下一集）
+      const edSkip = getPlaybackSettings().edSkipSeconds
+      if (edSkip > 0 && total > 0 && !edSkippedRef.current && total - video.currentTime <= edSkip && video.currentTime < total) {
+        edSkippedRef.current = true
+        seek(total)
+        return
+      }
       onProgressRef.current?.(video.currentTime, total)
     }
     const onMeta = () => setDuration(Number.isFinite(video.duration) ? video.duration : 0)
@@ -535,7 +548,7 @@ export default function VideoPlayer({
   // 虽然不慢，但没必要；而卸载时**不清**定时器，否则最后那一下调整会丢。
   useEffect(() => {
     if (prefsTimerRef.current) clearTimeout(prefsTimerRef.current)
-    prefsTimerRef.current = setTimeout(() => savePlayerPrefs({ volume, muted, rate }), 400)
+    prefsTimerRef.current = setTimeout(() => savePlayerPrefs({ volume, muted, rate }, rateKey), 400)
   }, [volume, muted, rate])
 
   const togglePlay = () => {

@@ -159,6 +159,8 @@ describe('FP-06 progress writes belong to a ready media generation', () => {
       resumeGateRef: { current: false }, resumeAtRef: { current: 0 },
       startAtRef: { current: 0 }, startAtAppliedRef: { current: true },
       mediaGenerationRef: { current: 1 }, readyGenerationRef: { current: 1 },
+      getPlaybackSettings: () => ({ autoNext: true, opSkipSeconds: 90, edSkipSeconds: 0 }),
+      edSkippedRef: { current: false }, seek: vi.fn(),
     }
   }
 
