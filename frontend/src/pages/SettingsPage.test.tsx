@@ -5,7 +5,7 @@ vi.mock('react', async (original) => ({
   ...await original<typeof import('react')>(),
   ...(await import('../test/uiHarness')).testHooks,
 }))
-vi.mock('../api', () => ({ api: { health: vi.fn().mockResolvedValue({}) }, errMsg: String }))
+vi.mock('../api', () => ({ api: { health: vi.fn().mockResolvedValue({}), metrics: vi.fn().mockResolvedValue({ requests: 0, proxyRequests: 0, uptimeSeconds: 0 }) }, errMsg: String }))
 vi.mock('../lib/auth', () => ({ rememberedUser: () => '' }))
 vi.mock('../lib/storage', () => ({
   exportUserData: vi.fn(), flushUserData: vi.fn().mockResolvedValue(undefined),

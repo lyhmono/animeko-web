@@ -3,7 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import Poster from '../components/Poster'
 import { api, errMsg } from '../api'
 import type { BgmSubject, SubjectHit } from '../types'
-import { addSearchHistory, favoriteIdSet, onDocChange } from '../lib/storage'
+import { addSearchHistory, favoriteIdSet, listSearchHistory, onDocChange } from '../lib/storage'
 import { IconHeartFilled, IconRefresh } from '../lib/icons'
 import { getSourceRevision, onSourcesChanged } from '../lib/sourceEvents'
 import { mapLimit } from '../lib/concurrency'
@@ -41,6 +41,7 @@ const CACHE_LIMIT = 10
 export default function SearchPage() {
   const [params] = useSearchParams()
   const q = params.get('q') ?? ''
+  const history = listSearchHistory()
   const [bgm, setBgm] = useState<BgmSubject[]>([])
   const [bgmLoading, setBgmLoading] = useState(!!q)
   const [bgmError, setBgmError] = useState('')
@@ -317,6 +318,14 @@ export default function SearchPage() {
         </h2>
         <p className="search-hero-sub">同时检索 Bangumi 条目与已启用的数据源</p>
       </div>
+      {!q && history.length > 0 && (
+        <div className="search-history">
+          <span className="search-history-label">最近搜索</span>
+          {history.map((h) => (
+            <Link key={h} className="chip" to={`/search?q=${encodeURIComponent(h)}`}>{h}</Link>
+          ))}
+        </div>
+      )}
       {!q && <div className="empty">输入关键词后开始搜索</div>}
 
       <h3 className="section-title" style={{ fontSize: 15 }}>

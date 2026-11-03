@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
 import { attachPlayback } from '../lib/playback'
 import { getPlayerPrefs, savePlayerPrefs } from '../lib/storage'
+import { getPlaybackSettings } from '../lib/prefs'
 import {
   IconBrightness,
   IconFullscreen,
@@ -935,6 +936,17 @@ export default function VideoPlayer({
               <IconNext size={16} />
             </button>
           )}
+          <button
+            className="player-btn skip-op"
+            onClick={() => {
+              const seconds = getPlaybackSettings().opSkipSeconds
+              if (seconds > 0) seek(Math.min(duration > 0 ? duration : current + seconds, current + seconds))
+            }}
+            aria-label="跳过片头"
+            title="跳过片头"
+          >
+            跳过片头
+          </button>
           <span className="time">{formatTime(current)}</span>
           <span className="time-sep">/</span>
           <span className="time total">{formatTime(duration)}</span>

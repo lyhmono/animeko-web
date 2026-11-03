@@ -14,6 +14,8 @@ import {
 } from '../lib/storage'
 import { IconCheck, IconClock, IconKeyboard, IconNext } from '../lib/icons'
 import { buildPlayUrl, type PlayEpisode } from '../lib/playUrl'
+import { getPlaybackSettings, savePlaybackSettings, type PlaybackSettings } from '../lib/prefs'
+import type { VideoSource } from '../types'
 
 function parseNext(raw: string | null): PlayEpisode | null {
   if (!raw) return null
@@ -24,6 +26,30 @@ function parseNext(raw: string | null): PlayEpisode | null {
     /* ignore */
   }
   return null
+}
+
+const PREFETCH_KEY = 'animeko:prefetch-next'
+
+function readPrefetch(source: string, playUrl: string): VideoSource | null {
+  try {
+    const raw = sessionStorage.getItem(PREFETCH_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as { source: string; playUrl: string; video: VideoSource; ts: number }
+    if (parsed.source !== source || parsed.playUrl !== playUrl) return null
+    // 预取只保留 5 分钟：源站签名过期后用它播放必然 403，不如重新解析
+    if (Date.now() - parsed.ts > 5 * 60 * 1000) return null
+    return parsed.video
+  } catch {
+    return null
+  }
+}
+
+function writePrefetch(source: string, playUrl: string, video: VideoSource): void {
+  try {
+    sessionStorage.setItem(PREFETCH_KEY, JSON.stringify({ source, playUrl, video, ts: Date.now() }))
+  } catch {
+    // 隐私模式写不进去就只当没有预取
+  }
 }
 
 /** 媒体地址能不能交给浏览器直连：https 页面里不许直连 http 媒体（浏览器会按混合内容拦掉）。 */
@@ -73,6 +99,7 @@ export default function PlayerPage() {
   const [error, setError] = useState('')
   const [manualUrl, setManualUrl] = useState('')
   const [nextCountdown, setNextCountdown] = useState<number | null>(null)
+  const [playback, setPlayback] = useState<PlaybackSettings>(() => getPlaybackSettings())
   /**
    * 连播链条在「URL 里没有下一集」时现场解析出来的那一集。
    *
@@ -149,6 +176,16 @@ export default function PlayerPage() {
     // 序号守卫：解析可能耗时几十秒，期间换集或改用手播时过期响应必须丢弃，
     // 否则它会覆盖新的 src、把「最近观看」记到错误的条目上
     setResolving(true)
+    // 连播预取命中：直接复用上一页已经解析好的地址，省掉一次源站往返
+    const prefetched = readPrefetch(source, playUrl)
+    if (prefetched) {
+      setResolving(false)
+      setFallbackSrc(prefetched.proxyPath)
+      setSrc(getDirectPlayback() ? (directUrlFor(prefetched.url) ?? prefetched.proxyPath) : prefetched.proxyPath)
+      setReloadRequest((n) => n + 1)
+      addRecent({ source, playUrl, title: title || playUrl, anime: animeName, ep, ts: Date.now() })
+      return cleanup
+    }
     api
       .resolveVideo(source, playUrl, controller.signal)
       .then((video) => {
@@ -219,6 +256,15 @@ export default function PlayerPage() {
    * list[i + 1] 就是 list[0]，症状会变成「播完最后一集自动跳回第一集」——
    * 源站在两次抓取之间换了列表（很常见）时就会触发。
    */
+  const prefetchNext = async (next: PlayEpisode) => {
+    try {
+      const video = await api.resolveVideo(next.source, next.play)
+      writePrefetch(next.source, next.play, video)
+    } catch {
+      // 预取失败不影响当前播放；下一集会按原路径重新解析
+    }
+  }
+
   const resolveChain = async () => {
     if (!source || !subjectUrl || !playUrl) return
     chainAbortRef.current?.abort()
@@ -251,6 +297,8 @@ export default function PlayerPage() {
       const nxBep = nextBangumiEpisode(current, nx, currentBep)
       const normalizedNext = mk(nx, nxBep != null ? String(nxBep) : undefined)
       setAutoNext(normalizedNext)
+      // 预取下一集地址：自动连播整页跳转后，下一页可以跳过几十秒的源站解析
+      void prefetchNext(normalizedNext)
       const after = list[i + 2]
       // 必须从已归一化的 next.bep 推导；SP 或断号清掉映射后不可在后一集“复活”。
       const afterBep = nextBangumiEpisode(nx, after,
@@ -266,6 +314,7 @@ export default function PlayerPage() {
   }
 
   useEffect(() => {
+    if (!playback.autoNext) return
     if (nextCountdown == null) return
     if (nextCountdown <= 0) {
       navToNext()
@@ -273,7 +322,7 @@ export default function PlayerPage() {
     }
     const timer = window.setTimeout(() => setNextCountdown((c) => (c ?? 1) - 1), 1000)
     return () => window.clearTimeout(timer)
-  }, [nextCountdown, target, subjectId, subjectUrl])
+  }, [nextCountdown, target, subjectId, subjectUrl, playback.autoNext])
 
   // 播放进度节流写入
   const handleProgress = (time: number, duration: number) => {
@@ -296,6 +345,8 @@ export default function PlayerPage() {
   // URL 里没带下一集时先去找一集（找到才会启动倒计时，找不到就停在这里）
   const handleEnded = () => {
     if (source && playUrl) clearProgress(source, playUrl)
+    // 用户关掉自动连播时，播完就停在当前集，不再去找下一集
+    if (!playback.autoNext) return
     if (target) setNextCountdown(5)
     else void resolveChain()
   }
@@ -480,6 +531,27 @@ export default function PlayerPage() {
           </button>
         </div>
       )}
+
+      <div className="player-tools">
+        <label className="player-tool">
+          <input
+            type="checkbox"
+            checked={playback.autoNext}
+            onChange={(e) => setPlayback(savePlaybackSettings({ autoNext: e.target.checked }))}
+          />
+          自动连播下一集
+        </label>
+        <label className="player-tool">
+          片头跳过
+          <select
+            value={playback.opSkipSeconds}
+            onChange={(e) => setPlayback(savePlaybackSettings({ opSkipSeconds: Number(e.target.value) }))}
+            aria-label="片头跳过秒数"
+          >
+            {[60, 85, 90, 120].map((s) => <option key={s} value={s}>{s} 秒</option>)}
+          </select>
+        </label>
+      </div>
 
       <div className="player-info">
         <h2>{title}</h2>

@@ -30,6 +30,11 @@ export default function DiscoverPage() {
   const [favIds, setFavIds] = useState<Set<number>>(() => favoriteIdSet())
   // 继续观看是本机/账号文档里的最近播放，不需要额外请求；没有记录时整个分区不渲染
   const [recent] = useState<RecentItem[]>(() => listRecent(8))
+  const [sort, setSort] = useState<'rank' | 'score'>('rank')
+  // 排序只影响展示顺序；分页始终按榜单原始顺序取（offset 用 items.length）
+  const displayItems = sort === 'score'
+    ? [...items].sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+    : items
   const [sourceRevision, setSourceRevision] = useState(getSourceRevision)
   const itemsRef = useRef(items)
   const requestRef = useRef<AbortController | null>(null)
@@ -140,6 +145,15 @@ export default function DiscoverPage() {
         <button className="btn-icon" aria-label="刷新排行榜" title="刷新排行榜" onClick={refresh}>
           <IconRefresh />
         </button>
+        <select
+          className="rank-sort"
+          value={sort}
+          onChange={(e) => setSort(e.target.value as 'rank' | 'score')}
+          aria-label="排行榜排序"
+        >
+          <option value="rank">按榜单</option>
+          <option value="score">按评分</option>
+        </select>
       </h2>
 
       {error && <div className="error-box">排行榜加载失败：{error} <button className="btn btn-sm" onClick={() => void load(items.length)}>重试</button></div>}
@@ -156,7 +170,7 @@ export default function DiscoverPage() {
       )}
 
       <div className="result-grid" data-testid="rank-grid">
-        {items.map((s) => {
+        {displayItems.map((s) => {
           const title = s.name_cn || s.name
           const score = scoreOf(s)
           const rank = rankOf(s)

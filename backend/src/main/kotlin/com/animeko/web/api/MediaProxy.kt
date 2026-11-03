@@ -62,6 +62,7 @@ private suspend fun proxyVideoOwned(call: ApplicationCall, fetcher: Fetcher, cfg
         return
     }
     var url = withContext(Dispatchers.IO) { UrlGuard.requireAllowed(requested, cfg.allowPrivateTargets) }
+    com.animeko.web.Metrics.proxyRequests.incrementAndGet()
     val sid = call.request.queryParameters["sid"]?.trim().orEmpty()
     // 源站凭据只在 grant 明确授权的主机上出现；UA/Referer 跨主机也要带（防盗链需要）。
     val sessionHeaders = LinkedHashMap<String, String>()

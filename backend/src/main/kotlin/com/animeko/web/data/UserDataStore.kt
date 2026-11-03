@@ -5,7 +5,12 @@ import com.animeko.web.appLog
 import com.animeko.web.ioReason
 import com.animeko.web.writeFully
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import java.io.IOException
 import java.nio.channels.FileChannel
 import java.nio.file.AtomicMoveNotSupportedException
@@ -247,6 +252,47 @@ class UserDataStore(
             }
         }
         return Snapshot(text, sha256Hex(bytes))
+    }
+
+    /**
+     * 条目级增量写：只改某个分区里的一个键，其余内容原样保留。
+     *
+     * 为什么需要它：播放中的进度每几秒写一次，整档 PUT 会把 512KB 的文档
+     * 全部序列化再传一遍。PATCH 只传「哪个分区、哪个键、改成什么」，
+     * 写入仍复用 write() 的条件写/原子落盘/备份，语义不变。
+     *
+     * value 为 null（或 JSON null）表示删除该键。
+     */
+    fun patch(section: String, key: String, value: JsonElement?, ifMatch: String? = null): Snapshot {
+        val current = read()
+        val root = json.parseToJsonElement(current.text) as? JsonObject
+            ?: throw IllegalArgumentException("个人数据必须是一个 JSON 对象")
+        val updated = root.toMutableMap()
+        when (section) {
+            "progress", "subjectProgress" -> {
+                val map = (updated[section] as? JsonObject)?.toMutableMap() ?: mutableMapOf()
+                if (value == null || value is JsonNull) map.remove(key) else map[key] = value
+                updated[section] = JsonObject(map)
+            }
+            "favorites" -> {
+                val id = key.toIntOrNull() ?: throw IllegalArgumentException("收藏条目 id 必须是整数")
+                val list = (updated["favorites"] as? JsonArray)?.toMutableList() ?: mutableListOf()
+                val idx = list.indexOfFirst {
+                    (it as? JsonObject)?.get("id")?.jsonPrimitive?.intOrNull == id
+                }
+                if (value == null || value is JsonNull) {
+                    if (idx >= 0) list.removeAt(idx)
+                } else if (idx >= 0) {
+                    list[idx] = value
+                } else {
+                    list.add(0, value)
+                }
+                updated["favorites"] = JsonArray(list)
+            }
+            else -> throw IllegalArgumentException("不支持的数据分区：$section")
+        }
+        val text = json.encodeToString(JsonObject.serializer(), JsonObject(updated))
+        return write(text, ifMatch)
     }
 
     /**

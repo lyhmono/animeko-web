@@ -10,6 +10,7 @@ import io.ktor.server.response.header
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondText
 import io.ktor.server.routing.get
+import io.ktor.server.routing.patch
 import io.ktor.server.routing.put
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -55,6 +56,30 @@ internal fun Route.dataRoutes(deps: ApiDeps) {
                 throw e
             } catch (e: IllegalArgumentException) {
                 call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "个人数据格式不正确")))
+            }
+        }
+// ---- 条目级增量写（播放中的进度不再整档 PUT）----
+        patch("/api/data") {
+            val body = bodyObject(call)
+            val section = body?.stringField("section")?.trim().orEmpty()
+            val key = body?.stringField("key")?.trim().orEmpty()
+            if (body == null || section.isEmpty() || key.isEmpty()) {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to "请提供 section 与 key"))
+                return@patch
+            }
+            // value 缺省或显式 null 都表示删除该键
+            val value = body["value"]
+            val ifMatch = call.request.headers[HttpHeaders.IfMatch]?.trim()?.takeIf { it.isNotEmpty() }
+            try {
+                val snapshot = withContext(Dispatchers.IO) { userData.patch(section, key, value, ifMatch) }
+                call.response.header(HttpHeaders.ETag, "\"${snapshot.etag}\"")
+                call.respond(mapOf("ok" to true))
+            } catch (stale: UserDataStore.Stale) {
+                call.respond(HttpStatusCode.Conflict, mapOf("error" to "DATA_STALE"))
+            } catch (e: com.animeko.web.StorageFailure) {
+                throw e
+            } catch (e: IllegalArgumentException) {
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "增量写格式不正确")))
             }
         }
 

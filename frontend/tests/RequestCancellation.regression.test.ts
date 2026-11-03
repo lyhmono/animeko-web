@@ -127,6 +127,7 @@ describe('FP-10 PlayerPage cancels resolution and successor lookup', () => {
       api: { resolveVideo: vi.fn<(name: string, url: string, signal?: AbortSignal) => Promise<VideoSource>>(() => promise) },
       setError: vi.fn(), setFallbackSrc: vi.fn(), setSrc: vi.fn(), setResolving: vi.fn(), setReloadRequest: vi.fn(),
       getDirectPlayback: () => false, addRecent: vi.fn(), directUrlFor: (url: string) => url,
+      readPrefetch: () => null,
       proxyUrlFor: (url: string) => '/api/proxy?url=' + encodeURIComponent(url), errMsg: String,
     }
   }

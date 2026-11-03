@@ -12,7 +12,7 @@ vi.mock('react-router-dom', async (importOriginal) => ({
   useSearchParams: () => [new URLSearchParams({ q: query.q })],
 }))
 vi.mock('../lib/storage', () => ({
-  addSearchHistory: vi.fn(), favoriteIdSet: () => new Set<number>(), onDocChange: () => () => {},
+  addSearchHistory: vi.fn(), favoriteIdSet: () => new Set<number>(), listSearchHistory: () => [], onDocChange: () => () => {},
 }))
 vi.mock('../api', async (importOriginal) => ({
   ...await importOriginal<typeof import('../api')>(),

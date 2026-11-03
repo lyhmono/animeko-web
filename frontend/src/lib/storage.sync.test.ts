@@ -3,7 +3,7 @@ import type { UserData } from '../types'
 
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>()
-  return { ...actual, api: { ...actual.api, loadDataWithEtag: vi.fn(), saveData: vi.fn() } }
+  return { ...actual, api: { ...actual.api, loadDataWithEtag: vi.fn(), saveData: vi.fn(), patchData: vi.fn() } }
 })
 import { api, ApiError, ERR_DATA_STALE } from '../api'
 import * as storage from './storage'
@@ -16,6 +16,7 @@ import {
 const favorite = (id: number) => ({ id, name: `Subject ${id}`, name_cn: '', cover: '', date: '', score: null, ts: id, status: 'wish' as const })
 const load = vi.mocked(api.loadDataWithEtag)
 const save = vi.mocked(api.saveData)
+const patch = vi.mocked(api.patchData)
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -40,6 +41,26 @@ function server(initial: UserData) {
     return { etag, bytes: JSON.stringify(sent).length }
   }
   save.mockImplementation(async (input, base, signal) => commit(input, base, signal))
+  // 条目级 PATCH 与整档 PUT 共用同一份 ETag：版本不符同样要 409，
+  // 否则「增量写」会绕过 mergeWithServer 的冲突恢复路径
+  patch.mockImplementation(async (section: string, key: string, value: unknown, base?: string) => {
+    if (base && base !== etag) throw new ApiError(409, 'stale data', ERR_DATA_STALE)
+    const next = structuredClone(remote) as Record<string, unknown>
+    if (section === 'favorites') {
+      const id = Number(key)
+      const list = ((next.favorites as unknown[]) ?? []).filter((v) => (v as { id: number }).id !== id)
+      if (value != null) list.unshift(value)
+      next.favorites = list
+    } else {
+      const map = { ...((next[section] as Record<string, unknown>) ?? {}) }
+      if (value == null) delete map[key]
+      else map[key] = value
+      next[section] = map
+    }
+    remote = next as UserData
+    etag = `e${++revision}`
+    return etag
+  })
   return {
     commit, writes, doc: () => remote, etag: () => etag,
     externalWrite(next: UserData) { remote = structuredClone(next); etag = `e${++revision}` },
@@ -53,6 +74,7 @@ beforeEach(() => {
   storage.listRetainedUserData().forEach((entry) => Reflect.get(storage, 'discardRetainedUserData')?.(entry.id))
   load.mockReset()
   save.mockReset()
+  patch.mockReset()
 })
 afterEach(() => {
   markUserDataStale()

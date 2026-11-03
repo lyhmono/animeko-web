@@ -40,6 +40,43 @@ class ApiRoutesTest {
     )
 
     @Test
+    fun `patch writes a single entry and enforces If-Match`() = testApplication {
+        val cfg = testConfig()
+        application { module(cfg) }
+
+        val created = client.patch("/api/data") {
+            setBody("""{"section":"progress","key":"s|u","value":{"title":"A","time":12}}""")
+        }
+        assertEquals(HttpStatusCode.OK, created.status, created.bodyAsText())
+        val etagV1 = created.headers[HttpHeaders.ETag]
+
+        val second = client.patch("/api/data") {
+            setBody("""{"section":"subjectProgress","key":"42","value":{"ep":3}}""")
+        }
+        assertEquals(HttpStatusCode.OK, second.status)
+        val doc = client.get("/api/data").bodyAsText()
+        assertTrue("s|u" in doc, doc)
+        assertTrue("42" in doc, doc)
+
+        // 旧指纹不能覆盖别人的新写入
+        val stale = client.patch("/api/data") {
+            header(HttpHeaders.IfMatch, etagV1)
+            setBody("""{"section":"progress","key":"s|u","value":null}""")
+        }
+        assertEquals(HttpStatusCode.Conflict, stale.status)
+
+        // 用最新指纹删除成功，且不影响另一个分区
+        val removed = client.patch("/api/data") {
+            header(HttpHeaders.IfMatch, second.headers[HttpHeaders.ETag])
+            setBody("""{"section":"progress","key":"s|u","value":null}""")
+        }
+        assertEquals(HttpStatusCode.OK, removed.status)
+        val after = client.get("/api/data").bodyAsText()
+        assertFalse("s|u" in after, after)
+        assertTrue("42" in after, after)
+    }
+
+    @Test
     fun `storage failures are 503 without leaking the data path`() = testApplication {
         // 数据目录只读/被占成目录时，底层异常消息里带绝对路径。
         // 这类消息只能进日志：对外必须是可重试的 503 + 通用文案。

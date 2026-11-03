@@ -128,12 +128,19 @@ export function isApiError(e: unknown, status?: number, code?: string): boolean 
 export const UNAUTHORIZED_EVENT = 'animeko-unauthorized'
 const LOGIN_PATH = '/api/session/login'
 
+export interface ServiceMetrics {
+  requests: number
+  proxyRequests: number
+  uptimeSeconds: number
+}
+
 export const api = {
   health: (signal?: AbortSignal) =>
     request<{ status: string; version: string; authEnabled: boolean; authenticated: boolean }>(
       '/api/health',
       { signal },
     ),
+  metrics: (signal?: AbortSignal) => request<ServiceMetrics>('/api/metrics', { signal }),
 
   // ---- 登录会话 ----
   login: (username: string, password: string, signal?: AbortSignal) =>
@@ -181,6 +188,24 @@ export const api = {
     }, {
       method: 'PUT',
       body: JSON.stringify(doc),
+      headers: etag ? { 'If-Match': `"${etag}"` } : undefined,
+      signal,
+    })
+  },
+
+  /** 条目级增量写：只改某个分区的一个键，返回服务端新的 ETag。
+   *  播放中的进度走这里，避免每几秒把整份文档重新 PUT 一遍。 */
+  patchData: async (section: string, key: string, value: unknown, etag?: string, signal?: AbortSignal): Promise<string> => {
+    return send('/api/data', async (resp) => {
+      try {
+        await resp.json()
+      } catch (e) {
+        if (!(e instanceof SyntaxError)) throw e
+      }
+      return unquote(resp.headers.get('ETag'))
+    }, {
+      method: 'PATCH',
+      body: JSON.stringify({ section, key, value }),
       headers: etag ? { 'If-Match': `"${etag}"` } : undefined,
       signal,
     })

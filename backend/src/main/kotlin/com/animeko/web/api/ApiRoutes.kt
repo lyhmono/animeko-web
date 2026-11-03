@@ -133,6 +133,11 @@ fun Application.configureApiRoutes(
             )
         }
 
+        // 运行指标：只给计数，不含任何请求内容；鉴权开启时同样受会话保护
+        get("/api/metrics") {
+            call.respond(com.animeko.web.Metrics.snapshot())
+        }
+
         sessionRoutes(deps)
         bangumiRoutes(deps)
         selectorRoutes(deps)

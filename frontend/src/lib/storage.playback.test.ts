@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>()
-  return { ...actual, api: { ...actual.api, loadDataWithEtag: vi.fn(), saveData: vi.fn() } }
+  return { ...actual, api: { ...actual.api, loadDataWithEtag: vi.fn(), saveData: vi.fn(), patchData: vi.fn() } }
 })
 
 import { api } from '../api'
@@ -21,12 +21,14 @@ beforeEach(async () => {
   vi.useFakeTimers()
   vi.mocked(api.loadDataWithEtag).mockResolvedValue({ doc: {}, etag: 'e1' })
   vi.mocked(api.saveData).mockResolvedValue({ etag: 'e2', bytes: 10 })
+  vi.mocked(api.patchData).mockResolvedValue('e2')
   await loadUserData()
   // 上一轮测试可能留下待写数据，loadUserData 会为它补推一轮。等这轮落地再清零计数，
   // 否则每个测试的第一条断言数的都是上一轮的网络请求。
   await flushUserData()
   await vi.advanceTimersByTimeAsync(0)
   vi.mocked(api.saveData).mockClear()
+  vi.mocked(api.patchData).mockClear()
 })
 
 afterEach(() => {
@@ -45,7 +47,8 @@ describe('playback progress write throttling', () => {
     expect(api.saveData).not.toHaveBeenCalled()
 
     await vi.advanceTimersByTimeAsync(4000)
-    expect(api.saveData).toHaveBeenCalledTimes(1)
+    expect(api.patchData).toHaveBeenCalledTimes(1)
+    expect(api.saveData).not.toHaveBeenCalled()
   })
 
   it('keeps flushing on a fixed cadence rather than being postponed forever by the next tick', async () => {
@@ -55,7 +58,9 @@ describe('playback progress write throttling', () => {
       tick(time)
       await vi.advanceTimersByTimeAsync(4000)
     }
-    expect(vi.mocked(api.saveData).mock.calls.length).toBeGreaterThanOrEqual(3)
+    expect(vi.mocked(api.patchData).mock.calls.length).toBeGreaterThanOrEqual(3)
+    // 高频进度只走条目级 PATCH，不再整档 PUT
+    expect(api.saveData).not.toHaveBeenCalled()
   })
 
   it('does not hold back a favorite made during playback', async () => {

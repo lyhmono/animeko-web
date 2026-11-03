@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api, errMsg } from '../api'
+import { api, errMsg, type ServiceMetrics } from '../api'
 import BangumiChannelCard from '../components/BangumiChannelCard'
 import {
   exportUserData,
@@ -21,6 +21,7 @@ import { IconMoon, IconSun } from '../lib/icons'
 
 export default function SettingsPage() {
   const [health, setHealth] = useState<{ version: string; authEnabled: boolean; authenticated: boolean } | null>(null)
+  const [metrics, setMetrics] = useState<ServiceMetrics | null>(null)
   // 健康检查失败 ≠ 功能未开启：混在一起会给出与实际相反的配置建议
   const [healthError, setHealthError] = useState('')
   const [healthLoading, setHealthLoading] = useState(true)
@@ -35,6 +36,12 @@ export default function SettingsPage() {
   const importInFlight = useRef(false)
 
   useEffect(() => onSyncChange(setSync), [])
+
+  useEffect(() => {
+    let alive = true
+    api.metrics().then((m) => { if (alive) setMetrics(m) }).catch(() => {})
+    return () => { alive = false }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -196,6 +203,19 @@ export default function SettingsPage() {
             设置 <code>ANIMEKO_AUTH_USER</code> 与 <code>ANIMEKO_AUTH_PASSWORD</code>（或
             <code>ANIMEKO_AUTH_TOKEN</code>）后重启即可启用登录页。
           </div>
+        )}
+      </div>
+
+      <div className="settings-group card">
+        <div className="settings-label">服务状态</div>
+        {metrics ? (
+          <div className="metrics-row">
+            <span>累计请求 {metrics.requests}</span>
+            <span>代理请求 {metrics.proxyRequests}</span>
+            <span>已运行 {Math.floor(metrics.uptimeSeconds / 60)} 分钟</span>
+          </div>
+        ) : (
+          <p className="card-hint">服务指标读取中…</p>
         )}
       </div>
 

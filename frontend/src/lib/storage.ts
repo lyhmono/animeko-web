@@ -382,6 +382,33 @@ async function pushOnce(epoch: number, signal: AbortSignal): Promise<void> {
     snapshotValues(round)
     setSync({  status: 'saving', kind: null, error: ''  })
     try {
+      // 只有进度分区、且条目不多时走条目级 PATCH：播放中每几秒一次的高频写
+      // 不再把整份 512KB 文档重新 PUT 一遍。条目多（批量导入/清理）仍走整档。
+      const patchable = round.keys.every((k) => k === 'progress' || k === 'subjectProgress')
+      const patchCount = round.progressKeys.length + round.subjectKeys.length
+      if (patchable && patchCount > 0 && patchCount <= 5) {
+        for (const key of round.progressKeys) {
+          const etag = await api.patchData('progress', key, asMap(doc.progress)[key] ?? null, baseEtag || undefined, signal)
+          if (epoch !== sessionEpoch) return
+          if (etag) baseEtag = etag
+          if (asMap(doc.progress)[key] === round.sentProgress.get(key)) pendingProgressKeys.delete(key)
+        }
+        for (const key of round.subjectKeys) {
+          const etag = await api.patchData('subjectProgress', key, asMap(doc.subjectProgress)[key] ?? null, baseEtag || undefined, signal)
+          if (epoch !== sessionEpoch) return
+          if (etag) baseEtag = etag
+          if (asMap(doc.subjectProgress)[key] === round.sentSubjects.get(key)) pendingSubjectKeys.delete(key)
+        }
+        const changed = changedKeys(round)
+        round.keys.forEach((k) => { if (!changed.includes(k)) pendingKeys.delete(k) })
+        if (changed.length > 0) {
+          scheduleFollowUp(DEBOUNCE_MS, epoch)
+          setSync({ status: 'pending', kind: null, error: '' })
+        } else {
+          setSync({ status: 'ready', kind: null, error: '' })
+        }
+        continue
+      }
       const saved = await api.saveData(doc, baseEtag, signal)
       if (epoch !== sessionEpoch) return
       baseEtag = saved.etag

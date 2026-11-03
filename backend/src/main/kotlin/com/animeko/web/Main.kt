@@ -68,6 +68,7 @@ fun Application.module(
     intercept(ApplicationCallPipeline.Setup) {
         // Ktor 3 的 intercept 接收者是 PipelineContext，ApplicationCall 从 context 取
         val call = context
+        Metrics.requests.incrementAndGet()
         val requestId = java.util.UUID.randomUUID().toString().take(8)
         call.response.header("X-Request-Id", requestId)
         val startedAt = System.nanoTime()

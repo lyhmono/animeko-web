@@ -101,3 +101,39 @@ export function getDirectPlayback(): boolean {
 export function setDirectPlayback(on: boolean): void {
   localWrite(DIRECT_PLAY_KEY, on ? 'on' : 'off')
 }
+
+/**
+ * 播放行为偏好：自动连播、片头跳过秒数。
+ * 与音量/倍速一样属于设备习惯，不进账号文档。
+ */
+const PLAYBACK_SETTINGS_KEY = 'animeko-web:playback-settings'
+
+export interface PlaybackSettings {
+  autoNext: boolean
+  opSkipSeconds: number
+}
+
+const DEFAULT_PLAYBACK_SETTINGS: PlaybackSettings = { autoNext: true, opSkipSeconds: 90 }
+
+export function getPlaybackSettings(): PlaybackSettings {
+  const raw = localRead(PLAYBACK_SETTINGS_KEY)
+  if (!raw) return { ...DEFAULT_PLAYBACK_SETTINGS }
+  try {
+    const parsed = JSON.parse(raw) as Partial<PlaybackSettings>
+    const seconds = typeof parsed.opSkipSeconds === 'number' && parsed.opSkipSeconds >= 0 && parsed.opSkipSeconds <= 300
+      ? Math.round(parsed.opSkipSeconds)
+      : DEFAULT_PLAYBACK_SETTINGS.opSkipSeconds
+    return {
+      autoNext: parsed.autoNext !== false,
+      opSkipSeconds: seconds,
+    }
+  } catch {
+    return { ...DEFAULT_PLAYBACK_SETTINGS }
+  }
+}
+
+export function savePlaybackSettings(next: Partial<PlaybackSettings>): PlaybackSettings {
+  const merged = { ...getPlaybackSettings(), ...next }
+  localWrite(PLAYBACK_SETTINGS_KEY, JSON.stringify(merged))
+  return merged
+}

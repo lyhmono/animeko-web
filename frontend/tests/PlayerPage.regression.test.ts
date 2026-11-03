@@ -134,6 +134,7 @@ describe('FP-05 special episodes stop the entire inferred Bangumi chain', () => 
       chainAbortRef: { current: null },
       api: { sourceEpisodes: vi.fn(async () => ({ groups: [{ name: list[0].channel, episodes: list }], episodes: list })) },
       setAutoNext: (value: typeof autoNext) => { autoNext = value }, successorRef, setNextCountdown: vi.fn(),
+      prefetchNext: vi.fn(async () => {}),
       isSpecialEpisodeName, sourceEpisodeIsSpecial, nextBangumiEpisode,
     }
     await callback<() => Promise<void>>(PLAYER, 'resolveChain', scope)()

@@ -88,7 +88,7 @@ describe('FP-03 native failures are final and same-address retries reload', () =
     expect(scope.onErrorRef.current.mock.calls).toHaveLength(2)
     expect(scope.onErrorRef.current.mock.calls[0][1]).toBeUndefined()
     expect(scope.setError.mock.calls.slice(-1)[0][0]).toContain('MEDIA_ERROR_3')
-    expect(scope.setError.mock.calls.slice(-1)[0][0]).not.toContain('正在重新解析')
+    expect(scope.setError.mock.calls.slice(-1)[0][0]).not.toContain('正在針新解枝')
   })
 
   it('uses a distinct fallback at most once before reporting a final native error', () => {
@@ -223,7 +223,8 @@ describe('FP-06 progress writes belong to a ready media generation', () => {
 
   it('does not clear a persisted breakpoint or queue auto-next from a cleanup ended event', () => {
     const pageScope = { source: 'fixture', playUrl: 'https://source.test/current', target: null,
-      clearProgress: vi.fn(), resolveChain: vi.fn(async () => {}), setNextCountdown: vi.fn() }
+      clearProgress: vi.fn(), resolveChain: vi.fn(async () => {}), setNextCountdown: vi.fn(),
+      playback: { autoNext: true } }
     const scope = { ...timeScope(300), setPlaying: vi.fn(),
       onEndedRef: { current: callback<() => void>(PLAYER, 'handleEnded', pageScope) } }
     const onEnd = callback<() => void>(VIDEO, 'onEnd', scope)
