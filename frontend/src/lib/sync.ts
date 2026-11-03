@@ -1,0 +1,1036 @@
+/**
+ * 个人数据层：播放进度 / 追番收藏 / 搜索历史 / 最近观看。
+ *
+ * 数据存在服务端（{dataDir}/userdata.json），这样换设备、清缓存、开隐私模式都不会丢收藏。
+ * 对外仍是一套同步函数：页面代码不该为了「读一次收藏」到处 await。
+ * 实现是「启动时整份拉回内存 + 写入去抖回传」：
+ *  - 读：命中内存，永远是同步的；
+ *  - 写：立刻更新内存并记下改了哪些键，800ms 内多次写入合并成一次 PUT。
+ *
+ * 三条必须守住的底线（都是真实事故的形状）：
+ *  1. 没读到服务端文档就绝不回写。否则一次读取失败 + 一次收藏点击
+ *     就会把 `{favorites:[…]}` 整份覆盖上去，收藏与进度当场清空。
+ *  2. 回写是条件写（If-Match 带读到的版本）。两个标签页/两台设备各自整份覆盖时，
+ *     后写的会把先写的改动吃掉；版本不符就重读、把自己改过的键贴回去再写。
+ *  3. 写失败必须保留待写状态并重试，界面也不能说「已保存」。
+ */
+import { api, ERR_DATA_STALE, errMsg, isApiError } from '../api'
+import type { UserData } from '../types'
+import { listFavorites, listSourceFavorites, SOURCE_FAV_KEY, sourceFavKeyOf, toFavorite, type FavoriteSubject, type SourceFavorite } from './favorites'
+import { HISTORY_LIMIT, listSearchHistory } from './history'
+import { listRecent, RECENT_LIMIT, type RecentItem } from './recent'
+import {
+  asMap,
+  asItemList,
+  favoritesById,
+  idOfFavorite,
+  idOfSourceFavorite,
+  mergeTouchedItems,
+  pruneByTs,
+  sourceFavoritesById,
+} from './userDataMerge'
+
+let doc: UserData = {}
+let loaded = false
+let baseEtag = ''
+/** 同一时刻只允许一个 loadUserData 在飞；重试按钮连点/两处触发时不能并发整档读取 */
+let loadInFlight: Promise<void> | null = null
+/** 普通读取、PUT 与 409 重读共用的会话代次；取消只是节省资源，代次才保证隔离。 */
+let sessionEpoch = 0
+let sessionController = new AbortController()
+
+// ---------- 同步状态（给界面一个「到底存上了没有」的说法）----------
+
+export type SyncStatus = 'ready' | 'pending' | 'saving' | 'error'
+
+export interface SyncState {
+  status: SyncStatus
+  /** 出错的是读取还是写入：读取失败时界面要停下写入，而不是喊「保存失败」 */
+  kind: 'load' | 'save' | null
+  error: string
+  /** 不是故障但该让用户知道的事（例如个人数据快撞到服务端上限） */
+  note?: string
+}
+
+let sync: SyncState = { status: 'ready', kind: null, error: '', note: '' }
+
+/** 服务端个人数据文档上限 512KB，到八成提醒一次 */
+const DOC_SOFT_LIMIT = 0.8 * 512 * 1024
+let sizeNote = ''
+const syncListeners = new Set<(s: SyncState) => void>()
+
+function setSync(next: SyncState): void {
+  // note 为空时带上体积提醒：状态点每变一次都要重算，否则一次成功的保存
+  // 就把「快满了」的提醒抹掉了，而那个提醒的意义正是「现在还能写，但快写不下了」
+  const merged: SyncState = next.note || !sizeNote ? next : { ...next, note: sizeNote }
+  // 四个字段全同就不下发。scheduleFlush 每次写入都会发一遍 'pending'，播放中每几秒一轮，
+  // 而状态其实没变过：无条件下发等于每次都给订阅方一个新对象，React 无从 bail out，
+  // 于是 Layout 连着它 <Outlet/> 里的当前页面整棵重渲染。
+  if (
+    merged.status === sync.status && merged.kind === sync.kind &&
+    merged.error === sync.error && (merged.note ?? '') === (sync.note ?? '')
+  ) {
+    return
+  }
+  sync = merged
+  syncListeners.forEach((l) => l(sync))
+}
+
+export function getSyncState(): SyncState {
+  return sync
+}
+
+export function onSyncChange(listener: (s: SyncState) => void): () => void {
+  syncListeners.add(listener)
+  return () => syncListeners.delete(listener)
+}
+
+// ---------- 整份换档通知 ----------
+
+const docListeners = new Set<(doc: UserData) => void>()
+
+/**
+ * `doc` 被**整份换掉**时通知：开机读到、冲突合并、注销清档、读取失败清空。
+ *
+ * 为什么需要：页面是同步 API 的消费者，通常在挂载那一刻把 `listFavorites()` /
+ * `listRecent()` 抄进自己的 state。而「启动时读取失败 → 用户点横幅上的重新读取」
+ * 这条路径换掉的是整个 doc，页面没有任何理由重抄 —— 症状是收藏明明读回来了，
+ * 收藏页还是一片「还没有收藏」，必须离开再回来才对，而用户得到的解释是「数据没了」。
+ *
+ * 局部写入**不发**这个通知：那些改动是页面自己发起的，内存与界面本来就一致，
+ * 多发一次只会在渲染里绕一圈。
+ */
+export function onDocChange(listener: (doc: UserData) => void): () => void {
+  docListeners.add(listener)
+  return () => docListeners.delete(listener)
+}
+
+export function getDoc(): UserData {
+  return doc
+}
+
+export function setDoc(next: UserData): void {
+  doc = next
+  docListeners.forEach((l) => l(next))
+}
+
+// ---------- 拉取 ----------
+
+/**
+ * 开机拉一次。失败时保持 loaded=false —— 这是「不许覆盖服务器数据」的唯一开关，
+ * 所以它同时也是「现在不能写」的状态，界面要显示可重试的读取错误。
+ */
+export async function loadUserData(): Promise<void> {
+  if (loadInFlight) return loadInFlight
+  const epoch = sessionEpoch
+  const task = loadOnce(epoch)
+  loadInFlight = task
+  try {
+    await task
+  } finally {
+    if (loadInFlight === task) loadInFlight = null
+  }
+}
+
+async function loadOnce(epoch: number): Promise<void> {
+  try {
+    const remote = await api.loadDataWithEtag(sessionController.signal)
+    // 注销/换账号后返回的旧读取结果必须丢弃，不能把旧会话的 doc 贴回来
+    if (epoch !== sessionEpoch) return
+    // 读取失败期间用户仍可点收藏/播放：这些改动记在 pending 里，但 doc 只有本地
+    // 这一小份。若直接 setDoc(remote) 再清 pending，它们就被静默丢掉了。
+    // 这里把 pending 改动合并到服务端文档上，随后立刻推一轮。
+    const hadPending = hasPendingWrites()
+    const nextDoc = hadPending ? applyPendingTo(remote.doc) : remote.doc
+    setDoc(nextDoc)
+    baseEtag = remote.etag
+    loaded = true
+    if (!hadPending) clearPending()
+    // 体积提醒属于上一份文档：换账号/重新读取后不能继续挂着旧结论
+    sizeNote = ''
+    if (hadPending) {
+      setSync({ status: 'pending', kind: null, error: '' })
+      void flushUserData()
+    } else {
+      setSync({ status: 'ready', kind: null, error: '' })
+    }
+  } catch (e) {
+    if (epoch !== sessionEpoch) return
+    loaded = false
+    baseEtag = ''
+    // 不能 setDoc({})：读取失败期间攒下的本地操作仍要留给下一次成功时合并。
+    // 清掉本地 doc 会让 pendingFavIds/XxxKeys 指向一份空文档，下一次合并反而
+    // 会删掉服务端同 id 的收藏/进度（失败两次就丢数据）。
+    setSync({
+      status: 'error',
+      kind: 'load',
+      error: `个人数据没读到，已暂停写入以免覆盖服务器上的收藏：${errMsg(e)}`,
+    })
+  }
+}
+
+// ---------- 回写 ----------
+
+const DEBOUNCE_MS = 800
+const RETRY_MS = 5000
+/**
+ * 播放中只有进度在动时的推送间隔。
+ *
+ * 单独一档的理由：进度每 4 秒写一次（PlayerPage 的 |time-last|>=4），走的却是整份
+ * 文档的 PUT —— 服务端上限 512KB，每次都要把整份重新序列化再发一遍，只为改一个
+ * time 字段。文档越满，播放中的周期性卡顿越明显，而这份流量全是白付的。
+ * visibilitychange / pagehide 本来就会立即 flush（见本文件底部），拉长间隔不丢数据。
+ */
+const PLAYBACK_FLUSH_MS = 15000
+/** 播放期高频写入的键：只有待写的全是它们时才用上面那档间隔 */
+const PLAYBACK_TICK_KEYS = new Set(['progress', 'subjectProgress'])
+/** 单个剧集一条记录，看久了会无限增长直到撞上限，所以留最新的一部分即可 */
+
+const pendingKeys = new Set<string>()
+/** progress 是一个大 map，整键覆盖会吃掉别的标签页刚写的其它剧集，所以细到条目级 */
+const pendingProgressKeys = new Set<string>()
+/**
+ * 收藏同样细到条目：整键覆盖会让另一个标签页刚删掉的条目「复活」——
+ * 实测两个标签页各删一条不同收藏，最终只保住一份（另一条被对方的旧快照写回去）。
+ */
+const pendingFavIds = new Set<number>()
+const pendingSourceFavKeys = new Set<string>()
+/** subjectProgress 也是 map：整键覆盖会让另一台设备刚记下的条目消失 */
+const pendingSubjectKeys = new Set<string>()
+/** 明确清空与「读取失败所以本地为空」不同；对象身份也保留在飞期间再次清空的意图。 */
+let historyClear: object | null = null
+
+function hasPendingWrites(): boolean {
+  return pendingKeys.size > 0 || pendingProgressKeys.size > 0 || pendingFavIds.size > 0 ||
+    pendingSourceFavKeys.size > 0 || pendingSubjectKeys.size > 0
+}
+
+function clearPending(): void {
+  historyClear = null
+  playbackTickSince = 0
+  pendingKeys.clear()
+  pendingProgressKeys.clear()
+  pendingFavIds.clear()
+  pendingSourceFavKeys.clear()
+  pendingSubjectKeys.clear()
+}
+
+let timer: ReturnType<typeof setTimeout> | undefined
+let running: Promise<void> | null = null
+/** 播放进度这一轮窗口从何时开始记；0 表示当前没有待推的播放进度 */
+let playbackTickSince = 0
+
+/** 待写的全是播放进度。任何别的键在场都按常规间隔走，不能因为正在播放就压住收藏。 */
+function isPlaybackTickOnly(): boolean {
+  if (!hasPendingWrites()) return false
+  if (historyClear || pendingFavIds.size > 0 || pendingSourceFavKeys.size > 0) return false
+  if (pendingKeys.size === 0) return false
+  for (const key of pendingKeys) if (!PLAYBACK_TICK_KEYS.has(key)) return false
+  return true
+}
+
+export function scheduleFlush(key?: string, progressEntry?: string): void {
+  if (key) pendingKeys.add(key)
+  if (progressEntry) pendingProgressKeys.add(progressEntry)
+  if (!loaded) return // 见文件头第 1 条：没有服务端文档就没有可覆盖的基准
+  setSync({  status: 'pending', kind: null, error: ''  })
+  if (timer) clearTimeout(timer)
+  if (isPlaybackTickOnly()) {
+    // 这里必须是「最长等待」而不是「静默期」：进度每 4 秒来一次，纯去抖会让定时器
+    // 被无限重置，整场播放一次都不落盘，直到用户切走标签页才补上。
+    if (!playbackTickSince) playbackTickSince = Date.now()
+    const waited = Date.now() - playbackTickSince
+    timer = setTimeout(() => void flushUserData(), Math.max(0, PLAYBACK_FLUSH_MS - waited))
+  } else {
+    playbackTickSince = 0
+    timer = setTimeout(() => void flushUserData(), DEBOUNCE_MS)
+  }
+}
+
+/** 调用方不能把 Promise resolve 当成保存成功；会话变化同样不是成功确认。 */
+export type FlushResult =
+  | { ok: true; pending: false }
+  | { ok: false; pending: boolean; reason: 'load' | 'save' | 'session-changed'; error: string }
+
+function flushResult(epoch: number): FlushResult {
+  if (epoch !== sessionEpoch) {
+    return { ok: false, pending: true, reason: 'session-changed', error: '会话已变化，未确认旧会话的保存结果' }
+  }
+  const pending = hasPendingWrites()
+  if (loaded && !pending) return { ok: true, pending: false }
+  return {
+    ok: false, pending, reason: !loaded || sync.kind === 'load' ? 'load' : 'save',
+    error: sync.error || '仍有个人数据待保存，请原地重试或导出备份',
+  }
+}
+
+/** 立即推送；失败明确返回并保留待写数据，不向事件监听器抛出网络错误。 */
+export async function flushUserData(): Promise<FlushResult> {
+  const epoch = sessionEpoch
+  if (timer) {
+    clearTimeout(timer)
+    timer = undefined
+  }
+  if (!loaded) {
+    if (sync.status !== 'error') {
+      setSync({  status: 'error', kind: 'load', error: '还没读到服务器数据，写入已暂停'  })
+    }
+    return flushResult(epoch)
+  }
+  // 正在写的那一轮会看到 pendingKeys，不用并发发第二个 PUT（并发 PUT 的到达顺序没有保证）
+  if (running) {
+    await running
+    if (epoch !== sessionEpoch || sync.status === 'error') return flushResult(epoch)
+    if (hasPendingWrites()) return flushUserData()
+    return flushResult(epoch)
+  }
+  const round = pushOnce(epoch, sessionController.signal).finally(() => {
+    if (running === round) running = null
+  })
+  running = round
+  // 这一轮已经把进度发出去了，播放窗口重新计时
+  playbackTickSince = 0
+  await round
+  return flushResult(epoch)
+}
+
+/**
+ * 本轮真正发出去的**值**（按引用记）。
+ *
+ * 为什么需要：api.saveData 在调用那一刻就把 doc 序列化成了请求体，之后的改动
+ * 只存在于内存里，不在这份请求体中。成功回来若无条件把这些键从 pendingKeys 删掉，
+ * 「await 期间点的那两下」就被当成已同步 —— 界面显示收藏了两部，刷新后少一部。
+ * 只有值仍然是发出去那个引用的键，才真的可以清掉。
+ * （所有写入路径都是整体替换 `doc[key] = next`，所以引用比较足以判断「变过」。）
+ */
+interface Round {
+  historyClear: object | null
+  keys: string[]
+  progressKeys: string[]
+  favIds: number[]
+  sourceFavKeys: string[]
+  subjectKeys: string[]
+  sentValues: Map<string, unknown>
+  sentProgress: Map<string, unknown>
+  sentFavs: Map<number, unknown>
+  sentSourceFavs: Map<string, unknown>
+  sentSubjects: Map<string, unknown>
+}
+
+function snapshotValues(round: Round): void {
+  for (const key of round.keys) round.sentValues.set(key, doc[key])
+  const progress = asMap(doc.progress)
+  for (const entry of round.progressKeys) round.sentProgress.set(entry, progress[entry])
+  const favs = favoritesById(doc.favorites)
+  for (const id of round.favIds) round.sentFavs.set(id, favs.get(id))
+  const srcFavs = sourceFavoritesById(doc[SOURCE_FAV_KEY])
+  for (const k of round.sourceFavKeys) round.sentSourceFavs.set(k, srcFavs.get(k))
+  const subjects = asMap(doc.subjectProgress)
+  for (const k of round.subjectKeys) round.sentSubjects.set(k, subjects[k])
+}
+
+/** 发出去之后又被改过的顶层键 */
+function changedKeys(round: Round): string[] {
+  return round.keys.filter((key) => {
+    if (key === 'searchHistory' && historyClear !== round.historyClear) return true
+    if (key === 'progress') {
+      const progress = asMap(doc.progress)
+      // 本轮没带走、但飞行期间新加进来的条目同样要再发一轮。
+      // 只看 round.progressKeys 会漏掉「新 key」，而那时 pendingKeys 会被清掉，
+      // 这一条进度就永远等不到下一次 flush（暂停/关页后就丢了）。
+      if ([...pendingProgressKeys].some((entry) => !round.progressKeys.includes(entry))) return true
+      return round.progressKeys.some((entry) => progress[entry] !== round.sentProgress.get(entry))
+    }
+    if (key === 'favorites') {
+      if ([...pendingFavIds].some((id) => !round.favIds.includes(id))) return true
+      const now = favoritesById(doc.favorites)
+      return round.favIds.some((id) => now.get(id) !== round.sentFavs.get(id))
+    }
+    if (key === SOURCE_FAV_KEY) {
+      if ([...pendingSourceFavKeys].some((k) => !round.sourceFavKeys.includes(k))) return true
+      const now = sourceFavoritesById(doc[SOURCE_FAV_KEY])
+      return round.sourceFavKeys.some((k) => now.get(k) !== round.sentSourceFavs.get(k))
+    }
+    if (key === 'subjectProgress') {
+      if ([...pendingSubjectKeys].some((k) => !round.subjectKeys.includes(k))) return true
+      const now = asMap(doc.subjectProgress)
+      return round.subjectKeys.some((k) => now[k] !== round.sentSubjects.get(k))
+    }
+    return doc[key] !== round.sentValues.get(key)
+  })
+}
+
+/** 还欠着服务端一次写入：排一轮延迟推送（有在途请求时由 flushUserData 排队） */
+function scheduleFollowUp(delay = DEBOUNCE_MS, epoch = sessionEpoch): void {
+  if (epoch !== sessionEpoch || !loaded) return
+  if (timer) clearTimeout(timer)
+  timer = setTimeout(() => {
+    if (epoch === sessionEpoch) void flushUserData()
+  }, delay)
+}
+
+async function pushOnce(epoch: number, signal: AbortSignal): Promise<void> {
+  let attempt = 0
+  while (epoch === sessionEpoch && pendingKeys.size > 0 && attempt < 3) {
+    attempt++
+    const round: Round = {
+      historyClear,
+      keys: [...pendingKeys],
+      progressKeys: [...pendingProgressKeys],
+      favIds: [...pendingFavIds],
+      sourceFavKeys: [...pendingSourceFavKeys],
+      subjectKeys: [...pendingSubjectKeys],
+      sentValues: new Map(),
+      sentProgress: new Map(),
+      sentFavs: new Map(),
+      sentSourceFavs: new Map(),
+      sentSubjects: new Map(),
+    }
+    snapshotValues(round)
+    setSync({  status: 'saving', kind: null, error: ''  })
+    try {
+      // 只有进度分区、且条目不多时走条目级 PATCH：播放中每几秒一次的高频写
+      // 不再把整份 512KB 文档重新 PUT 一遍。条目多（批量导入/清理）仍走整档。
+      const patchable = round.keys.every((k) => k === 'progress' || k === 'subjectProgress')
+      const patchCount = round.progressKeys.length + round.subjectKeys.length
+      if (patchable && patchCount > 0 && patchCount <= 5) {
+        for (const key of round.progressKeys) {
+          const etag = await api.patchData('progress', key, asMap(doc.progress)[key] ?? null, baseEtag || undefined, signal)
+          if (epoch !== sessionEpoch) return
+          if (etag) baseEtag = etag
+          if (asMap(doc.progress)[key] === round.sentProgress.get(key)) pendingProgressKeys.delete(key)
+        }
+        for (const key of round.subjectKeys) {
+          const etag = await api.patchData('subjectProgress', key, asMap(doc.subjectProgress)[key] ?? null, baseEtag || undefined, signal)
+          if (epoch !== sessionEpoch) return
+          if (etag) baseEtag = etag
+          if (asMap(doc.subjectProgress)[key] === round.sentSubjects.get(key)) pendingSubjectKeys.delete(key)
+        }
+        const changed = changedKeys(round)
+        round.keys.forEach((k) => { if (!changed.includes(k)) pendingKeys.delete(k) })
+        if (changed.length > 0) {
+          scheduleFollowUp(DEBOUNCE_MS, epoch)
+          setSync({ status: 'pending', kind: null, error: '' })
+        } else {
+          setSync({ status: 'ready', kind: null, error: '' })
+        }
+        continue
+      }
+      const saved = await api.saveData(doc, baseEtag, signal)
+      if (epoch !== sessionEpoch) return
+      baseEtag = saved.etag
+      // 服务端上限 512KB，撞到之后每次保存都是 400，而症状只是「收藏点不动」。
+      // 提前到八成就说，用户还有机会自己清一清，而不是等写失败去猜原因
+      sizeNote = saved.bytes > 0 && saved.bytes >= DOC_SOFT_LIMIT
+        ? `个人数据已有 ${(saved.bytes / 1024).toFixed(0)}KB，接近服务端 512KB 上限，建议清理不再看的收藏与历史`
+        : ''
+      // 只清「发出去之后没再被动过」的键：await 期间新产生的改动必须留给下一轮
+      const changed = changedKeys(round)
+      round.keys.forEach((k) => { if (!changed.includes(k)) pendingKeys.delete(k) })
+      if (round.keys.includes('searchHistory') && !changed.includes('searchHistory')) historyClear = null
+      round.progressKeys.forEach((k) => {
+        if (asMap(doc.progress)[k] === round.sentProgress.get(k)) pendingProgressKeys.delete(k)
+      })
+      const favsNow = favoritesById(doc.favorites)
+      round.favIds.forEach((id) => {
+        if (favsNow.get(id) === round.sentFavs.get(id)) pendingFavIds.delete(id)
+      })
+      const srcFavsNow = sourceFavoritesById(doc[SOURCE_FAV_KEY])
+      round.sourceFavKeys.forEach((k) => {
+        if (srcFavsNow.get(k) === round.sentSourceFavs.get(k)) pendingSourceFavKeys.delete(k)
+      })
+      const subjectsNow = asMap(doc.subjectProgress)
+      round.subjectKeys.forEach((k) => {
+        if (subjectsNow[k] === round.sentSubjects.get(k)) pendingSubjectKeys.delete(k)
+      })
+      // 确实有改动没被这份请求体带走 → 自己排下一轮，而不是等用户再点一次。
+      // 状态必须跟着排队这件事一起说「待保存」，不能先报 ready。
+      // 这条的**实际窗口有多宽**记在这里，免得把它夸大成用户级故障：
+      // 本轮实测（挂 12 秒的 PUT + 在飞期间再点一次收藏）——如果这段时间里已经有一次
+      // flushUserData 在 `await running` 上排着队，第一轮落地后约 20ms 第二轮就发出去了，
+      // 于是「已保存」只谎称了 20 毫秒，界面上看不出来；只有在没有排队轮次、
+      // 纯靠这里补定时器的那条路径上，这个窗口才是 800 毫秒。
+      // 结论：这是**状态标注的正确性**修复（顺带让文件头第 3 条说得通），
+      // 不是一个可以稳定复现给用户看的缺陷 —— 别在注释里把它写成后者。
+      if (changed.length > 0) {
+        scheduleFollowUp(DEBOUNCE_MS, epoch)
+        setSync({ status: 'pending', kind: null, error: '' })
+      } else {
+        setSync({ status: 'ready', kind: null, error: '' })
+      }
+    } catch (e) {
+      if (epoch !== sessionEpoch) return
+      if (isApiError(e, 409, ERR_DATA_STALE)) {
+        const merged = await mergeWithServer(round, epoch, signal)
+        if (epoch !== sessionEpoch) return
+        if (merged) continue // 换好基准，重试这一次写
+        // mergeWithServer 已保留原始读取原因并按可恢复性安排重试，不能覆盖它。
+        return
+      }
+      // 超上限、格式错这类不会自己变好，别把浏览器变成打服务端的循环
+      const fatal = isApiError(e, 400) || isApiError(e, 413)
+      setSync({ status: 'error', kind: 'save', error: `保存失败：${errMsg(e)}` })
+      if (!fatal) scheduleFollowUp(RETRY_MS, epoch)
+      return
+    }
+  }
+  // 上面那个 while 靠 attempt<3 退出时，pendingKeys 可能还是满的：那意味着
+  // 「合并完再写又被版本冲突弹回来」连续发生了三次（另一个标签页/设备在高频写）。
+  // 原实现到这里就直接 return，于是三份状态一起坏了：待写集合非空、没有定时器、
+  // 界面停在最后一轮那句「保存中」—— 状态点从此永远挂着「保存中…」，
+  // 再没有任何东西会把这份改动推上去，用户以为存好了，刷新一下就没了。
+  // 这里既不骗他（如实报错）也不放弃（定时重试，直到推上去或他刷新为止）。
+  if (epoch === sessionEpoch && pendingKeys.size > 0) {
+    setSync({
+      status: 'error',
+      kind: 'save',
+      error: '本机改动与服务端版本连续冲突三次，已暂停；将在 5 秒后自动重试',
+    })
+    scheduleFollowUp(RETRY_MS, epoch)
+  }
+}
+
+/**
+ * 版本冲突：重读服务端文档，只把「本标签页改过的东西」贴上去。
+ *
+ * 粒度分两档：
+ *  - progress / subjectProgress / favorites / favoritesSource **按条目**合并 ——
+ *    这几个都是「多条目容器」，两个标签页各动一条时，整键覆盖会让另一方的那条复活/消失
+ *    （实测：两个标签页各删一条收藏，最终只保住一份；各播一集，另一集进度丢失）。
+ *  - 其余键（recent、searchHistory 等）仍按整键：它们只是最近记录，上限小、可自愈，
+ *    两个标签页同时各加一条时可能只留下一条，这是已知取舍。
+ */
+async function mergeWithServer(round: Round, epoch: number, signal: AbortSignal): Promise<boolean> {
+  let fresh
+  try {
+    fresh = await api.loadDataWithEtag(signal)
+  } catch (e) {
+    if (epoch !== sessionEpoch) return false
+    const fatal = isApiError(e, 400) || isApiError(e, 413)
+    setSync({
+      status: 'error', kind: 'load',
+      error: `冲突后重读失败，本机改动仍保留：${errMsg(e)}。${fatal ? '请原地重试或导出备份' : '将在 5 秒后自动重试，也可原地重试或导出备份'}`,
+    })
+    if (!fatal) scheduleFollowUp(RETRY_MS, epoch)
+    return false
+  }
+  if (epoch !== sessionEpoch) return false
+  // 合并要按**当前**的待写集合，而不是本轮开始时的快照：
+  // PUT 在飞的这段时间里用户还能继续点（收藏、进度），那些改动记在 pending* 里，
+  // 但不在 round 里。用快照合并会把它们从内存文档里抹掉（setDoc(merged)），
+  // 下一轮再把这个「被抹掉」的文档发上去 —— 改动就这么静默丢了
+  // （实测：删 A → PUT 在飞时删 B → 第一轮 409 → 合并只应用了 A → B 复活）。
+  setDoc(applyPendingTo(fresh.doc, round))
+  baseEtag = fresh.etag
+  return true
+}
+
+/**
+ * 把本机待写改动贴到一份新鲜的服务端文档上。
+ *
+ * round 为 null 表示「读取失败后重新读取成功」：此时本地 doc 只是读取失败期间
+ * 攒下的一小份，recent / searchHistory 必须和服务器并集，不能整键覆盖掉
+ * 另一台设备刚写入的记录。正常 409 合并仍按原语义（本地整键为准）。
+ */
+function applyPendingTo(fresh: UserData, round?: Round, pending = pendingSnapshot()): UserData {
+  const keys = [...new Set([...(round?.keys ?? []), ...pending.keys])]
+  const progressKeys = [...new Set([...(round?.progressKeys ?? []), ...pending.progressKeys])]
+  const favIds = [...new Set([...(round?.favIds ?? []), ...pending.favIds])]
+  const sourceFavKeys = [...new Set([...(round?.sourceFavKeys ?? []), ...pending.sourceFavKeys])]
+  const subjectKeys = [...new Set([...(round?.subjectKeys ?? []), ...pending.subjectKeys])]
+  const local = pending.doc
+  const merged: UserData = { ...fresh }
+  for (const key of keys) {
+    if (key === 'progress') {
+      const theirs = asMap(merged.progress)
+      const mine = asMap(local.progress)
+      const out: Record<string, unknown> = { ...theirs }
+      for (const entry of progressKeys) {
+        if (entry in mine) out[entry] = mine[entry]
+        else delete out[entry]
+      }
+      merged.progress = out
+    } else if (key === 'favorites') {
+      // 按条目合并：只应用本标签页动过的收藏，别人的新增/删除原样保留
+      merged.favorites = mergeTouchedItems(
+        merged.favorites, favoritesById(local.favorites), favIds, idOfFavorite,
+      )
+    } else if (key === SOURCE_FAV_KEY) {
+      merged[SOURCE_FAV_KEY] = mergeTouchedItems(
+        merged[SOURCE_FAV_KEY], sourceFavoritesById(local[SOURCE_FAV_KEY]), sourceFavKeys, idOfSourceFavorite,
+      )
+    } else if (key === 'subjectProgress') {
+      // 与 progress 同构：只把本标签页动过的条目贴上去
+      const theirs = asMap(merged.subjectProgress)
+      const mine = asMap(local.subjectProgress)
+      const out: Record<string, unknown> = { ...theirs }
+      for (const k of subjectKeys) {
+        if (k in mine) {
+          const localEp = numOr(asMap(mine[k]).ep, 0)
+          const remoteEp = numOr(asMap(theirs[k]).ep, 0)
+          // 只前进不后退；时间戳跟获胜集号走，同集号才取更新的记录。
+          out[k] = remoteEp > 0 && (remoteEp > localEp ||
+            (remoteEp === localEp && numOr(asMap(theirs[k]).ts, 0) > numOr(asMap(mine[k]).ts, 0)))
+            ? theirs[k] : mine[k]
+        } else {
+          // 明确删除/剪枝仍是 tombstone，不能因为 max 规则复活它。
+          delete out[k]
+        }
+      }
+      merged.subjectProgress = out
+    } else if (key === 'recent' && round == null) {
+      merged.recent = mergeRecentLists(fresh.recent, local.recent)
+    } else if (key === 'searchHistory' && round == null && pending.historyClear === null) {
+      merged.searchHistory = mergeSearchHistory(fresh.searchHistory, local.searchHistory)
+    } else if (Object.prototype.hasOwnProperty.call(local, key)) {
+      merged[key] = local[key]
+    } else {
+      delete merged[key]
+    }
+  }
+  return merged
+}
+
+/** 读取失败后的重新加载：recent 按 (source, playUrl) 并集，取 ts 更新的一份。 */
+function mergeRecentLists(server: unknown, local: unknown): unknown[] {
+  const byKey = new Map<string, Record<string, unknown>>()
+  for (const item of [...asItemList(local), ...asItemList(server)]) {
+    const playUrl = asMap(item).playUrl
+    if (typeof playUrl !== 'string' || !playUrl.startsWith('http')) continue
+    const key = `${String(asMap(item).source ?? '')}|${playUrl}`
+    const existing = byKey.get(key)
+    if (!existing || numOr(asMap(item).ts, 0) > numOr(existing.ts, 0)) byKey.set(key, item)
+  }
+  return [...byKey.values()]
+    .sort((a, b) => numOr(b.ts, 0) - numOr(a.ts, 0))
+    .slice(0, RECENT_LIMIT)
+}
+
+/** 读取失败后的重新加载：搜索历史并集，本地新增在前，仍受 10 条上限。 */
+function mergeSearchHistory(server: unknown, local: unknown): string[] {
+  const out: string[] = []
+  const values = [...(Array.isArray(local) ? local : []), ...(Array.isArray(server) ? server : [])]
+  for (const value of values) {
+    if (typeof value !== 'string') continue
+    const keyword = value.trim()
+    if (!keyword || out.includes(keyword)) continue
+    out.push(keyword)
+    if (out.length >= HISTORY_LIMIT) break
+  }
+  return out
+}
+
+// 关掉标签页 / 切后台时尽力把待写内容送出去（fetch 在页面卸载后可能被浏览器掐掉，
+// 所以这只是「尽力」，真正的兜底是每次改动都会即时去抖回写）。
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') void flushUserData()
+  })
+  window.addEventListener('pagehide', () => void flushUserData())
+}
+
+// ---------- 底层读写（键即文档字段）----------
+
+export function readJson<T>(key: string, fallback: T): T {
+  const value = doc[key]
+  return value === undefined ? fallback : (value as T)
+}
+
+export function writeJson(key: string, value: unknown): void {
+  doc[key] = value
+  scheduleFlush(key)
+}
+
+/** 写收藏，并记下这次动过哪几个条目（冲突合并只应用这几条） */
+export function writeFavorites(next: FavoriteSubject[], touched: readonly number[]): void {
+  doc.favorites = next
+  touched.forEach((id) => pendingFavIds.add(id))
+  scheduleFlush('favorites')
+}
+
+export function writeSourceFavorites(next: SourceFavorite[], touched: readonly string[]): void {
+  doc[SOURCE_FAV_KEY] = next
+  touched.forEach((k) => pendingSourceFavKeys.add(k))
+  scheduleFlush(SOURCE_FAV_KEY)
+}
+
+export function writeSubjectProgress(next: Record<string, unknown>, touched: readonly string[]): void {
+  doc.subjectProgress = next
+  touched.forEach((k) => pendingSubjectKeys.add(k))
+  scheduleFlush('subjectProgress')
+}
+
+
+/** 服务端文档里没有 progress 时给一个空容器（返回的是活引用，调用方只读） */
+export function progressMap(): Record<string, unknown> {
+  const raw = doc.progress
+  return raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {}
+}
+
+// 条目索引、冲突合并与按时间淘汰的纯函数见 ./userDataMerge（独立可测）。
+
+export function writeProgressMap(map: Record<string, unknown>, entryKey: string): void {
+  // 剪掉最久没动的条目：一条都不删的话，看够了集数就会撞上服务端 512KB 上限，
+  // 之后每一次收藏/进度写入都会 400，等于整个数据层从此写不进去
+  const { next, removed } = pruneByTs(map)
+  removed.forEach((key) => pendingProgressKeys.add(key))
+  doc.progress = next
+  scheduleFlush('progress', entryKey)
+}
+
+// ---------- 设备本地偏好（主题 / 播放器 / 直连）----------
+// 实现在 ./prefs：它们不进 userdata 文档，也不需要同步状态机。
+export {
+  type PlayerPrefs,
+  type Theme,
+  getDirectPlayback,
+  getPlayerPrefs,
+  getTheme,
+  savePlayerPrefs,
+  setDirectPlayback,
+  setTheme,
+  syncThemeColor,
+} from './prefs'
+
+// ---------- 条目级观看进度（「看到第几话」）----------
+
+/**
+ * 按 Bangumi 条目记「看到第几话」。
+ *
+ * 为什么不直接从 progress 推：progress 的键是 (源, 播放地址)，而条目页的剧集
+ * 来自 Bangumi，两边没有可对上的标识 —— 同一个条目在不同源里的播放地址完全不同。
+ * 所以由播放页额外记一条「这个条目我看到第 N 话」，条目页才能显示出来。
+ * 集号来自播放参数里的 ep（数据源的 sortNum），是提示而非权威值：
+ * 不同源的集号可能对不齐，但那也好过完全不显示。
+ */
+// ---------- 追番收藏 ----------
+
+/**
+ * 追番状态。用字符串而不是数字：文档是 JSON、还可能被手改，
+ * 数字枚举在换版本时会静默错位（旧版 1=想看、新版 1=在看），字符串不会。
+ */
+// ---------- 搜索历史 ----------
+
+export function clearSearchHistory(): void {
+  historyClear = {}
+  delete doc.searchHistory
+  // 未加载/本地缺键时仍须记录删除，否则恢复读取会把远端旧历史复活。
+  scheduleFlush('searchHistory')
+}
+
+/**
+ * 丢掉本机文档副本（注销、或服务端说会话已失效）。
+ * 之后任何写入都只会改内存，直到 loadUserData 重新拉到属于新会话的文档为止 ——
+ * 否则「用旧会话的残档去覆盖新会话的数据」这种事真的会发生。
+ */
+export function markUserDataStale(options: { preservePending?: boolean; owner?: string } = {}): void {
+  if (options.preservePending && hasPendingWrites()) {
+    retainedUserData.push({
+      info: { id: ++retainedId, owner: options.owner ?? '', origin: deploymentOrigin(), complete: loaded },
+      pending: pendingSnapshot(structuredClone(doc)),
+    })
+  }
+  // 新会话不等旧请求；旧 finally 只允许清理自己，不能占住或确认新队列。
+  sessionEpoch++
+  sessionController.abort()
+  sessionController = new AbortController()
+  loadInFlight = null
+  running = null
+  if (timer) {
+    clearTimeout(timer)
+    timer = undefined
+  }
+  clearPending()
+  loaded = false
+  setDoc({})
+  baseEtag = ''
+  // 体积提醒属于上一份文档：不清掉的话，换账号后页脚还会说「接近上限」
+  sizeNote = ''
+  setSync({  status: 'ready', kind: null, error: ''  })
+}
+
+/** 会话失效的待写副本只留内存，与可读文档隔离；不自动混入下一次登录的数据。 */
+export interface RetainedUserDataInfo {
+  id: number
+  owner: string
+  origin: string
+  /** 初次读取失败期间的改动只能导出局部副本，不能声称是完整备份。 */
+  complete: boolean
+}
+
+type PendingSnapshot = Pick<Round, 'keys' | 'progressKeys' | 'favIds' | 'sourceFavKeys' | 'subjectKeys' | 'historyClear'> & { doc: UserData }
+function pendingSnapshot(local = doc): PendingSnapshot {
+  return {
+    doc: local, keys: [...pendingKeys], progressKeys: [...pendingProgressKeys], favIds: [...pendingFavIds],
+    sourceFavKeys: [...pendingSourceFavKeys], subjectKeys: [...pendingSubjectKeys], historyClear,
+  }
+}
+
+interface RetainedEntry { info: RetainedUserDataInfo; pending: PendingSnapshot }
+const retainedUserData: RetainedEntry[] = []
+let retainedId = 0
+
+function deploymentOrigin(): string {
+  return typeof location === 'undefined' ? '' : location.origin
+}
+
+export function listRetainedUserData(): RetainedUserDataInfo[] {
+  return retainedUserData.map(({ info }) => ({ ...info }))
+}
+
+export function exportRetainedUserData(id: number): string {
+  const retained = retainedUserData.find((entry) => entry.info.id === id)
+  if (!retained) throw new Error('未找到保留的未同步副本')
+  return JSON.stringify(retained.pending.doc, null, 2)
+}
+
+/** owner 必须由调用方提供本次成功登录响应的身份，不能用可编辑的显示名自动恢复。 */
+export function restoreRetainedUserData(id: number, owner: string): void {
+  const index = retainedUserData.findIndex((entry) => entry.info.id === id)
+  const retained = retainedUserData[index]
+  if (!retained) throw new Error('未找到保留的未同步副本')
+  if (!owner || !retained.info.owner || retained.info.owner !== owner || retained.info.origin !== deploymentOrigin()) {
+    throw new Error('未同步副本属于其他账号或部署，请登录原账号恢复，或先导出备份')
+  }
+  if (!loaded) throw new Error('请先重新读取当前会话的个人数据，再恢复未同步改动')
+  if (hasPendingWrites()) throw new Error('请先保存当前会话的改动，再恢复保留的副本')
+  const pending = retained.pending
+  const merged = applyPendingTo(doc, undefined, pending)
+  pending.keys.forEach((key) => pendingKeys.add(key))
+  pending.progressKeys.forEach((key) => pendingProgressKeys.add(key))
+  pending.favIds.forEach((id) => pendingFavIds.add(id))
+  pending.sourceFavKeys.forEach((key) => pendingSourceFavKeys.add(key))
+  pending.subjectKeys.forEach((key) => pendingSubjectKeys.add(key))
+  historyClear = pending.historyClear
+  setDoc(merged)
+  // 所有权移回当前待写队列；保存失败时仍可导出，或再次失效时重新隔离。
+  retainedUserData.splice(index, 1)
+  scheduleFlush()
+}
+
+/** 仅供用户明确选择放弃，不能在认证失败/普通加载路径自动调用。 */
+export function discardRetainedUserData(id: number): void {
+  const index = retainedUserData.findIndex((entry) => entry.info.id === id)
+  if (index >= 0) retainedUserData.splice(index, 1)
+}
+
+// ---------- 备份导出 / 导入 ----------
+
+export interface ImportSummary {
+  favorites: number
+  sourceFavorites: number
+  subjectProgress: number
+  progress: number
+  searchHistory: number
+  recent: number
+}
+
+/** 个人数据是否已经从服务器读到。导出/导入都要看它，理由见下面两个函数的守卫。 */
+export function isUserDataLoaded(): boolean {
+  return loaded
+}
+
+/** 离线救援用操作快照；不清待写队列，也不冒充可整档导入的完整备份。 */
+export function exportPendingUserData(): string {
+  return JSON.stringify({
+    format: 'animeko-unsynced-partial',
+    complete: false,
+    warning: '局部改动副本，不是完整备份；包含未同步操作记录，不能直接作为完整备份导入。',
+    pending: pendingSnapshot(),
+  }, null, 2)
+}
+
+/** 导出整份个人数据。格式化输出，便于人工查看与 diff。 */
+export function exportUserData(): string {
+  // 读取失败时应用仍可用（浏览与搜索不需要同步），但 doc 是空的。
+  // 此时导出的是一份 {}，用户却会以为备份成功 —— 那比不给备份更糟。
+  if (!loaded) throw new Error('个人数据还没从服务器读到，现在导出只会得到一份空备份')
+  return JSON.stringify(doc, null, 2)
+}
+
+function numOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+}
+
+/**
+ * 导入备份。语义是**合并**而不是覆盖，理由：覆盖一旦选错文件就是不可逆的数据丢失，
+ * 而合并最坏情况只是「多了几条本来就在的」。
+ *
+ * 各类数据的合并规则：
+ *  - 收藏：按 Bangumi id 去重，同 id 保留**本地**版本（本地可能刚改过状态）
+ *  - 数据源收藏：按 (源, 地址) 去重取并集
+ *  - 条目进度：取更大的集号（进度只前进不后退）
+ *  - 每集进度：按 (源, 播放地址) 取 ts 更新的一条
+ *  - 搜索历史 / 最近观看：并集去重，仍受各自上限约束
+ *
+ * 返回各类实际新增的条数，UI 用来说明「带进来了什么」。
+ * 文件不合法时抛错，由调用方展示。
+ */
+export function importUserData(text: string): ImportSummary {
+  // 未加载时写进去的改动既不会被推送（scheduleFlush 在 !loaded 时直接返回），
+  // 还会被随后一次成功的 loadUserData 整份覆盖 —— 而界面已经显示「已合并」。
+  if (!loaded) throw new Error('个人数据还没从服务器读到，现在导入会被随后的加载覆盖')
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new Error('不是合法的 JSON 文件')
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('备份文件格式不对：顶层应该是一个对象')
+  }
+  const incoming = parsed as Record<string, unknown>
+  const summary: ImportSummary = {
+    favorites: 0,
+    sourceFavorites: 0,
+    subjectProgress: 0,
+    progress: 0,
+    searchHistory: 0,
+    recent: 0,
+  }
+
+  if (Array.isArray(incoming.favorites)) {
+    const local = listFavorites()
+    const ids = new Set(local.map((f) => f.id))
+    const added: FavoriteSubject[] = []
+    for (const raw of incoming.favorites) {
+      const fav = toFavorite(raw)
+      if (!fav || ids.has(fav.id)) continue
+      ids.add(fav.id)
+      added.push(fav)
+    }
+    if (added.length > 0) {
+      writeFavorites([...added, ...local], added.map((f) => f.id))
+      summary.favorites = added.length
+    }
+  }
+
+  // 数据源收藏（favoritesSource）。导出是整份 doc，里面就含这一键，
+  // 而导入原先**完全不处理它** —— 于是「备份 → 换设备/换账号恢复」这条路上
+  // 数据源收藏整段静默消失，摘要里一个数字都没有，用户根本不知道少了一批。
+  // 备份功能存在的意义就是别丢数据，这一格不能留白。
+  if (Array.isArray(incoming[SOURCE_FAV_KEY])) {
+    const local = listSourceFavorites()
+    const seen = new Set(local.map((f) => sourceFavKeyOf(f.source, f.url)))
+    const added: SourceFavorite[] = []
+    for (const raw of incoming[SOURCE_FAV_KEY] as unknown[]) {
+      const item = asMap(raw)
+      if (typeof item.url !== 'string' || typeof item.source !== 'string') continue
+      const fav: SourceFavorite = {
+        source: item.source,
+        url: item.url,
+        name: String(item.name ?? ''),
+        cover: String(item.cover ?? ''),
+        ts: numOr(item.ts, 0),
+      }
+      const key = sourceFavKeyOf(fav.source, fav.url)
+      if (seen.has(key)) continue
+      seen.add(key)
+      added.push(fav)
+    }
+    if (added.length > 0) {
+      writeSourceFavorites([...added, ...local], added.map((f) => sourceFavKeyOf(f.source, f.url)))
+      summary.sourceFavorites = added.length
+    }
+  }
+
+  if (incoming.subjectProgress && typeof incoming.subjectProgress === 'object' && !Array.isArray(incoming.subjectProgress)) {
+    const local = asMap(readJson<Record<string, unknown>>('subjectProgress', {}))
+    const merged: Record<string, unknown> = { ...local }
+    const applied: string[] = []
+    for (const [id, raw] of Object.entries(incoming.subjectProgress as Record<string, unknown>)) {
+      const ep = numOr(asMap(raw).ep, 0)
+      if (!(ep > 0)) continue
+      if (ep <= numOr(asMap(merged[id]).ep, 0)) continue
+      merged[id] = { ep, ts: numOr(asMap(raw).ts, Date.now()) }
+      applied.push(id)
+      summary.subjectProgress += 1
+    }
+    // 与 progress 同理：导入必须把**真正改过的条目**记进待写集合，
+    // 否则 409 合并时会按服务端版本整键覆盖，这次导入静默丢失。
+    // 同时走一次上限剪枝：备份可能有几千条，直接合并会撞上 512KB 上限。
+    if (applied.length > 0) {
+      const { next: pruned, removed } = pruneByTs(merged)
+      removed.forEach((k) => pendingSubjectKeys.add(k))
+      writeSubjectProgress(pruned, applied)
+    }
+  }
+
+  if (incoming.progress && typeof incoming.progress === 'object' && !Array.isArray(incoming.progress)) {
+    const merged: Record<string, unknown> = { ...progressMap() }
+    const applied: string[] = []
+    for (const [key, raw] of Object.entries(incoming.progress as Record<string, unknown>)) {
+      const entry = asMap(raw)
+      const time = numOr(entry.time, 0)
+      if (!(time > 0)) continue
+      // 同一个播放地址上，取进度更新的一条
+      if (numOr(entry.ts, 0) <= numOr(asMap(merged[key]).ts, -1)) continue
+      merged[key] = entry
+      applied.push(key)
+      summary.progress += 1
+    }
+    if (applied.length > 0) {
+      // 备份里可能有几千条进度；不剪枝的话一次导入就能超过服务端 512KB，
+      // 之后每一次保存都是 400，用户只能手动清理文档。
+      const { next: pruned, removed } = pruneByTs(merged)
+      removed.forEach((key) => pendingProgressKeys.add(key))
+      doc.progress = pruned
+      // 只标记这次真正写进去的键。把**全部本地键**都记成「我改的」会在 409 合并时
+      // 把另一台设备刚删掉的旧进度又贴回服务端（复活）。
+      for (const key of applied) pendingProgressKeys.add(key)
+      scheduleFlush('progress')
+    }
+  }
+
+  if (Array.isArray(incoming.searchHistory)) {
+    const local = listSearchHistory()
+    // 导入项放前面：本地历史通常已经占满 10 条，若追加到末尾再 slice，
+    // 导入项会被全部裁掉，而摘要仍然报告「已合并 N 条」。
+    const merged: string[] = []
+    for (const raw of incoming.searchHistory) {
+      if (typeof raw !== 'string') continue
+      const keyword = raw.trim()
+      if (!keyword || merged.includes(keyword)) continue
+      merged.push(keyword)
+    }
+    for (const keyword of local) {
+      if (!merged.includes(keyword)) merged.push(keyword)
+    }
+    const next = merged.slice(0, HISTORY_LIMIT)
+    const localSet = new Set(local)
+    const actuallyAdded = next.filter((keyword) => !localSet.has(keyword)).length
+    if (actuallyAdded > 0) {
+      summary.searchHistory += actuallyAdded
+      writeJson('searchHistory', next)
+    }
+  }
+
+  if (Array.isArray(incoming.recent)) {
+    const local = listRecent(999)
+    const keyOf = (r: RecentItem) => `${r.source}:${r.playUrl}`
+    const seen = new Set(local.map(keyOf))
+    const merged = [...local]
+    for (const raw of incoming.recent) {
+      const r = raw as Partial<RecentItem> | null
+      if (!r || typeof r.playUrl !== 'string' || !r.playUrl.startsWith('http')) continue
+      const item: RecentItem = {
+        source: String(r.source ?? ''),
+        playUrl: r.playUrl,
+        title: String(r.title ?? ''),
+        anime: String(r.anime ?? ''),
+        ep: String(r.ep ?? ''),
+        ts: numOr(r.ts, 0),
+      }
+      if (seen.has(keyOf(item))) continue
+      seen.add(keyOf(item))
+      merged.push(item)
+      summary.recent += 1
+    }
+    if (summary.recent > 0) {
+      merged.sort((a, b) => b.ts - a.ts)
+      writeJson('recent', merged.slice(0, RECENT_LIMIT))
+    }
+  }
+
+  return summary
+}
