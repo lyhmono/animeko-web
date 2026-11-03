@@ -97,7 +97,8 @@ export default function DiscoverPage() {
   useEffect(() => onDocChange(() => setFavIds(favoriteIdSet())), [])
 
   const coverOf = (s: BgmSubject) =>
-    s.images?.large ?? s.images?.common ?? s.images?.medium ?? s.images?.small ?? ''
+    // 海报墙小卡片优先用中图，避免每张都拉 large 原图；条目页 spotlight 另有大图需求时可单独取 large
+    s.images?.medium ?? s.images?.large ?? s.images?.common ?? s.images?.small ?? ''
 
   const scoreOf = (s: BgmSubject) => s.rating?.score ?? s.score ?? null
   const rankOf = (s: BgmSubject) => s.rating?.rank ?? s.rank ?? null

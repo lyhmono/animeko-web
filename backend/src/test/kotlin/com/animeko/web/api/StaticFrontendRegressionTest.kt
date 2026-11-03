@@ -38,7 +38,13 @@ class StaticFrontendRegressionTest {
             assertTrue("SPA marker" in response.bodyAsText(), path)
             assertEquals("no-cache", response.headers[HttpHeaders.CacheControl])
             assertEquals("DENY", response.headers["X-Frame-Options"], "登录后的界面不允许被任意站点嵌入")
-            assertTrue("frame-ancestors 'none'" in response.headers["Content-Security-Policy"].orEmpty())
+            val csp = response.headers["Content-Security-Policy"].orEmpty()
+            assertTrue("default-src 'self'" in csp, csp)
+            assertTrue("script-src 'self'" in csp, csp)
+            assertTrue("media-src 'self' https: blob:" in csp, csp)
+            assertTrue("connect-src 'self' https:" in csp, csp)
+            assertTrue("worker-src 'self' blob:" in csp, csp)
+            assertTrue("frame-ancestors 'none'" in csp, csp)
         }
         for ((path, marker) in listOf("/assets/app-123.js" to "asset marker", "/assets/app-123.css" to "color:red")) {
             val response = client.get(path)

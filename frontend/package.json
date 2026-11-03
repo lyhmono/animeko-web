@@ -16,15 +16,16 @@
   },
   "dependencies": {
     "hls.js": "^1.6.13",
-    "react": "^19.3.1",
-    "react-dom": "^19.3.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
     "react-router-dom": "^7.9.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
+    "@rolldown/binding-linux-arm64-gnu": "^1.2.16",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
-    "@vitejs/plugin-react": "^5.0.0",
+    "@vitejs/plugin-react": "^6.2.1",
     "@vitest/coverage-v8": "^5.0.5",
     "eslint": "^9.39.5",
     "eslint-plugin-react-hooks": "^7.1.1",
@@ -33,7 +34,7 @@
     "prettier": "^3.9.10",
     "typescript": "^5.9.0",
     "typescript-eslint": "^8.72.1",
-    "vite": "^7.1.0",
-    "vitest": "^5.0.5"
+    "vite": "^8.3.5",
+    "vitest": "^5.1.0"
   }
 }

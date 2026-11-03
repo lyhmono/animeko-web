@@ -280,7 +280,7 @@ export default function SearchPage() {
   }, [sources, sourceHits, sourceErrors])
 
   const coverOf = (s: BgmSubject) =>
-    s.images?.large ?? s.images?.common ?? s.images?.medium ?? s.images?.small ?? s.images?.grid ?? ''
+    s.images?.medium ?? s.images?.large ?? s.images?.common ?? s.images?.small ?? s.images?.grid ?? ''
 
   // Bangumi 封面多尺寸 srcset：浏览器按实际显示宽度选图，移动端/低 DPR 下载小图省流量。
   // 这里给的是**原始地址**：Poster 在直连失败时才改走代理，那条路径会主动丢掉 srcset

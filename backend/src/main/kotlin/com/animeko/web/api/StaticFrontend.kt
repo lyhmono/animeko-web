@@ -88,7 +88,15 @@ private suspend fun io.ktor.server.application.ApplicationCall.serveStaticFile(a
     // 登录后的界面不允许被任意站点放进 iframe：同源 iframe 会带着会话 Cookie，
     // 「删除数据源」「注销」这类按钮的点击劫持靠 Origin 检查拦不住。
     response.header("X-Frame-Options", "DENY")
-    response.header("Content-Security-Policy", "frame-ancestors 'none'")
+    // 完整 CSP：脚本只许同源；封面/视频/字幕允许 https（数据源与 Bangumi），
+    // hls.js 需要 blob  worker 与媒体，内联样式来自 React 的 style prop。
+    response.header(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+            "img-src 'self' data: https:; media-src 'self' https: blob:; " +
+            "connect-src 'self' https:; font-src 'self' data:; worker-src 'self' blob:; " +
+            "frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+    )
     when {
         relative == "index.html" || relative == "sw.js" || relative == "manifest.webmanifest" ->
             response.header(HttpHeaders.CacheControl, "no-cache")
