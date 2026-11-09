@@ -38,6 +38,6 @@
   },
   "optionalDependencies": {
     "@rolldown/binding-linux-arm64-gnu": "1.2.16",
-    "@rolldown/binding-linux-x64-gnu": "1.2.16"
+    "@rolldown/binding-linux-x64-gnu": "1.3.0"
   }
 }
