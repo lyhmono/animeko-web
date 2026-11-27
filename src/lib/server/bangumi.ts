@@ -97,6 +97,9 @@ async function request(pathAndQuery: string, init?: { method?: string; body?: st
 
   const [first, ...rest] = ordered;
   const HEDGE_MS = 2500;
+  // 条目详情的 404 是「条目不存在」，直通抛出；
+  // 但每日放送的 404 是「该通道不支持此端点」（镜像普遍如此），必须当通道失败继续转移。
+  const notFoundFinal = !pathAndQuery.startsWith('/v0/calendar');
   return new Promise((resolve, reject) => {
     let settled = false;
     let failed = 0;
@@ -127,7 +130,7 @@ async function request(pathAndQuery: string, init?: { method?: string; body?: st
         }
       } catch (err) {
         if (settled) return;
-        if (err instanceof UpstreamError && err.status === 404) {
+        if (err instanceof UpstreamError && err.status === 404 && notFoundFinal) {
           settled = true;
           stopHedge();
           reject(err);
