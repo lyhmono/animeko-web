@@ -4,69 +4,36 @@ services:
     image: animeko-web:latest
     container_name: animeko-web
     restart: unless-stopped
-    # 服务本体已经用 gosu 降到 app 用户，这一条是兜住「降权失效」的最后一格：
-    # 即便进程被某种方式拿到 root，也不允许它再通过 setuid/exec 提权。
     security_opt:
       - no-new-privileges:true
-    # json-file 默认不限大小：这是一个长期运行的自托管服务，日志会一直写到把盘填满，
-    # 而症状是「某天起收藏保存失败」——没人会先想到是日志。
     logging:
       driver: json-file
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: 10m
+        max-file: '3'
     ports:
-      # 默认只绑本机回环，访问时用 SSH 隧道：
-      #   ssh -N -L 8080:127.0.0.1:8080 user@your-vps
-      # 确认已有反代鉴权/防火墙兜底后，才改成 "8080:8080" 直接对外。
-      - "127.0.0.1:8080:8080"
+      # 默认只监听本机回环。需要局域网/公网访问时，先配置登录凭据再放开。
+      - '127.0.0.1:8080:8080'
     volumes:
-      # 数据源配置 + 个人数据（收藏/进度）持久化（删除容器不丢）。
-      # 容器进程以 app 用户（uid 10001）运行，入口脚本会把卷属主改给它；
-      # 若你在别处显式指定 user:，请自行保证该 uid 对这个目录可写。
       - ./data:/data
     environment:
       - TZ=Asia/Shanghai
-      - ANIMEKO_PORT=8080
-      # 端口只发布到 127.0.0.1（见上面的 ports），所以这里显式承认「无鉴权部署」。
-      # 改成 "8080:8080" 对外之前，请先取消下面 ANIMEKO_AUTH_* 的注释并配好口令。
+      - PORT=8080
+      # 无鉴权监听 0.0.0.0 时的显式确认；公网部署请改用账号密码并删除本项
       - ANIMEKO_ALLOW_NO_AUTH=true
-      # 堆上限默认是容器内存的 50%（镜像里 applicationDefaultJvmArgs 定的）。
-      # 内存紧的机器要往下压，或者想让 Jsoup/HLS 有更多堆，都在这里覆盖：
-      # - JAVA_OPTS=-XX:MaxRAMPercentage=40.0
-      # ---- 登录：配了凭据就自动开启登录页（不配则站点打开即用）----
-      # 建议单账号自用；口令请换成足够长的随机串
-      # 注意：USER 与 PASSWORD 必须成对打开，只开一个会在启动时报错退出
-      #（半套凭据等于「谁也进不去」，而鉴权又会被推导为关闭，所以不做静默回落）
-      # - ANIMEKO_AUTH_USER=animeko
-      # - ANIMEKO_AUTH_PASSWORD=***
-      # 也可以只配一个口令（登录页用户名任意、密码填它；API 调用可用 Bearer）
-      # - ANIMEKO_AUTH_TOKEN=请改成足够长的随机字符串
-      # 前面已有反代鉴权时才需要显式关掉登录页
-      # - ANIMEKO_AUTH_ENABLED=false
-      # ---- 反代配好 HTTPS 后打开；纯 HTTP 下开着会让浏览器丢弃会话 Cookie（登录页反复回弹）----
+      # ---- 登录鉴权（对外暴露前务必配置）----
+      # - ANIMEKO_AUTH_USER=your-name
+      # - ANIMEKO_AUTH_PASSWORD=your-strong-password
+      # - ANIMEKO_AUTH_TOKEN=your-api-token
+      # ---- HTTPS 部署 ----
       # - ANIMEKO_COOKIE_SECURE=true
-      # ---- 代理/抓取内网地址（默认拒绝，防 SSRF）----
-      # - ANIMEKO_ALLOW_PRIVATE_TARGETS=true
-      # ---- 反代改写了 Host 导致同源判定误报时才需要放开 ----
-      # - ANIMEKO_ALLOW_CROSS_ORIGIN=true
-      # ---- 服务前面有几层你控制的反代（nginx/Caddy/CDN）。默认 0=直连 ----
-      # 填 N 后：限速按 XFF 从右数第 N 个真实客户端记账（不会全员共享一个计数器），
-      # 同源判定改看 X-Forwarded-Host。层数要如实填：少了把代理 IP 当客户端，
-      # 多了把客户端伪造的 XFF 当真实地址。直连部署不要设。
       # - ANIMEKO_TRUSTED_PROXY_HOPS=1
-      # ---- Bangumi API（默认官方+社区镜像故障转移，可自定义）----
+      # ---- Bangumi 通道 ----
       # - ANIMEKO_BANGUMI_BASE_URLS=https://api.bgm.tv,https://bgmapi.anibt.net
-      # ---- 开机自动导入聚合订阅（可选，默认关闭）----
-      # 这是把第三方选择器配置直接装进服务，是否启用应由你明确决定；
-      # 默认不打开，避免一份被篡改的社区订阅在首次启动时就进入实例。
-      # 逗号分隔可写多个地址。只覆盖同名源，不会删你手动加的源；
-      # 你在界面上「关掉」的源会保持关闭（重启不会偷偷给你打开）。
-      # 导入跑在后台协程里：订阅站挂了或很慢都不影响启动与端口监听。
-      # - ANIMEKO_SUBSCRIPTION_AUTO_IMPORT=https://sub.creamycake.org/v1/css1.json
-      # 只要某几个分级（tier 越低质量越好）。境外 VPS 上高 tier 常是 JS 加密源
-      # 或只对国内 IP 开放的 CDN，导进来只会让每次搜索多打几个死站。留空 = 全导。
-      # - ANIMEKO_SUBSCRIPTION_AUTO_TIERS=0,1
-      # ANIMEKO_SEED_SUBSCRIPTION_URL 是上面那个的别名（旧名字，等价于追加一个地址），
-      # 只配一个就行，别两个都写。
-      # - ANIMEKO_SEED_SUBSCRIPTION_URL=https://sub.creamycake.org/v1/css1.json
+      # ---- 弹幕服务（弹弹 play /api/v2 协议；官方接口需要 AppId/Secret）----
+      # - ANIMEKO_DANMAKU_API_BASE=https://api.dandanplay.net
+      # - ANIMEKO_DANMAKU_APP_ID=your-app-id
+      # - ANIMEKO_DANMAKU_APP_SECRET=your-app-secret
+      # ---- 内网源 / 其他 ----
+      # - ANIMEKO_ALLOW_PRIVATE_TARGETS=true
+      # - ANIMEKO_ALLOW_CROSS_ORIGIN=true

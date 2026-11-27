@@ -1,41 +1,53 @@
 # Animeko Web
 
-自托管的动漫追番 Web 应用：Kotlin (Ktor) 后端 + React 前端，单容器部署，收藏与观看进度保存在你自己的服务器上。
+自托管的动漫追番 Web 应用：**Next.js 全栈（App Router + Tailwind CSS）**，单容器部署，收藏与观看进度保存在你自己的服务器上。
+
+本版本在原有功能基础上对标 MoonTVPlus 做了全面翻新：全新绿色主题 UI、ArtPlayer 播放器、弹幕系统、外挂字幕、外部播放器跳转与浏览器内视频下载。
 
 ## 功能
 
+**全新界面（对标 MoonTVPlus）**
+- 品牌绿主题 + 玻璃拟态：桌面可折叠侧边栏、移动端顶部搜索 + 底部导航、明暗双主题
+- 首页 Banner 轮播（自动播放 / 触屏滑动）、继续观看、今日新番、评分排行榜、在看收藏
+- 海报卡片：评分分档角标、年份徽章、hover 播放遮罩、观看进度条
+- 条目页沉浸式模糊背景、播放页「选集 / 弹幕」双栏面板
+
 **浏览与观看**
-- Plex 风深色界面：海报墙、横向分区、沉浸式条目页、移动端底部导航
-- Bangumi 搜索、条目详情、评分排行榜、每日放送
-- 社区数据源（JS 选择器）导入、启用/停用、搜索与剧集解析
-- 视频播放（HLS / MP4）：快捷键、画中画、倍速、跳过片头、自动连播下一集
-- 连播预取：下一集地址提前解析，切换更快
+- Bangumi 搜索、条目详情、评分排行榜、每日放送；多通道（官方 / 镜像 / 自定义）竞速与 2.5 秒对冲、首选地址记忆、通道探测
+- 社区数据源（web-selector）导入、启停、搜索与剧集解析、订阅预览后勾选导入、健康监控
+- 订阅自动化：开机自动导入（支持 tier 过滤）与已登记订阅的定时自动刷新（首个请求触发，保留已有源的启停状态）
+- ArtPlayer + HLS.js：倍速记忆、画中画、全屏、截图、AirPlay、快捷键
+- 断点续播、自动连播下一集（5 秒倒计时）、跳过片头、连播预解析、直连失败自动回退代理
+
+**播放器增强（新增）**
+- 💬 **弹幕系统**：弹弹 play `/api/v2` 协议搜索 → 分集 → 加载，支持本地上传 B 站 / 弹弹 play XML 弹幕；不透明度 / 字号 / 速度 / 屏蔽规则（普通 + 正则）设置持久化
+- 🎞️ **外挂字幕**：本地 SRT / VTT / SBV / LRC 自动转 WebVTT；ASS / SSA 由 JASSUB（WASM）渲染，保留特效样式，自托管 worker / 字体
+- 🎮 **外部播放器跳转**：PotPlayer、VLC、MPV、MX Player、nPlayer、IINA 一键唤起
+- 📥 **视频下载**：浏览器内 m3u8 分片并发下载（支持 Master 清单选流、AES-128 解密、失败重试），合并为 TS 文件；直链视频直接另存
+- ⚙️ **播放设置持久化**：音量 / 倍速（全局 + 番剧级）、弹幕设置、直连开关、自动连播、片头片尾秒数
 
 **个人数据（服务端同步）**
-- 收藏、观看进度、最近观看、搜索历史跨设备同步
-- 播放中进度走条目级增量写（PATCH），不再整档覆盖
-- 冲突按条目合并，断网自动重试，409 不丢本地改动
-- 一键导出 / 导入备份（JSON）
+- 收藏（想看 / 在看 / 看过 / 搁置）、观看进度、最近观看、搜索历史跨设备同步
+- 播放进度走条目级增量写（PATCH），ETag 条件写 + 409 合并重试，断网自动重试
+- 一键导出 / 导入备份（JSON，合并式导入）
 
 **运维与安全**
-- 数据源健康监控：成功率、平均耗时、最近错误
-- 运行指标端点（请求数、代理数、运行时长）
-- 可选登录鉴权（用户密码或 Token）、CSRF 防护、SSRF 逐跳校验、点击劫持防护
+- 数据源健康监控（成功率、平均耗时、最近错误）、运行指标端点
+- 可选登录鉴权（账号密码或 Token）、SameSite=Strict 会话（按天滑动重写 Cookie）、写请求同源校验、登录限流
+- 媒体代理：SSRF 逐跳校验、HLS 清单改写、代理会话请求头服务端保管（UA / Referer / Cookie 不下发浏览器）
 - 个人数据原子落盘 + 备份恢复，存储故障返回可重试的 503
 
 ## 快速开始（Docker）
 
-### Docker Compose（推荐）
-
 ```bash
 git clone https://github.com/lyhmono/animeko-web.git
 cd animeko-web
-docker compose up -d
+docker compose up -d --build
 ```
 
 打开 <http://127.0.0.1:8080>。数据保存在 `./data`（收藏、进度、数据源配置、会话）。
 
-默认不启用登录鉴权，但只监听本机回环地址。需要局域网或公网访问时，**先配置登录凭据**：
+默认不启用登录鉴权，且只监听本机回环地址。**需要局域网或公网访问时，先配置登录凭据**：
 
 ```yaml
 # docker-compose.yml
@@ -44,127 +56,69 @@ environment:
   - ANIMEKO_AUTH_PASSWORD=your-strong-password
 ```
 
-然后 `docker compose up -d` 重建。
-
-### 单容器
+## 本地开发
 
 ```bash
-docker build -t animeko-web .
-docker run -d -p 127.0.0.1:8080:8080 -v ./data:/data animeko-web
+npm ci
+npm run dev        # http://127.0.0.1:8080
+npm run build      # 类型检查 + 生产构建（standalone）
+npm start          # 生产模式启动
 ```
-
-## 部署安全（务必先读）
-
-- 裸跑 jar 默认只监听 `127.0.0.1`；镜像内监听 `0.0.0.0`，但 **没有配置登录凭据、又监听非回环地址时，服务会拒绝启动**。
-- 想让其他机器访问，二选一：
-  1. 配置 `ANIMEKO_AUTH_USER` + `ANIMEKO_AUTH_PASSWORD`（或 `ANIMEKO_AUTH_TOKEN`）
-  2. 明确接受无鉴权暴露，设置 `ANIMEKO_ALLOW_NO_AUTH=true`（**不要用于公网**）
-- 不要把 8080 直接暴露到公网：推荐「Tailscale/内网穿透」或「反代 + 登录鉴权」。
-- 收藏、数据源、代理地址都能反映你的观看习惯和内网拓扑，请按私密数据对待。
 
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `ANIMEKO_HOST` | `127.0.0.1`（镜像内 `0.0.0.0`） | 监听地址 |
-| `ANIMEKO_PORT` | `8080` | 监听端口 |
-| `ANIMEKO_DATA_DIR` | `/data`（镜像）/ `data`（本地） | 数据目录 |
-| `ANIMEKO_AUTH_USER` | 空 | 登录用户名 |
-| `ANIMEKO_AUTH_PASSWORD` | 空 | 登录密码 |
-| `ANIMEKO_AUTH_TOKEN` | 空 | 单独使用 Token 鉴权（与用户名密码二选一） |
-| `ANIMEKO_AUTH_ENABLED` | 按凭据推导 | 显式开关鉴权；有凭据但想临时关闭可设 `false` |
-| `ANIMEKO_ALLOW_NO_AUTH` | `false` | 无凭据且监听非回环地址时是否允许启动 |
-| `ANIMEKO_SESSION_TTL_DAYS` | `30` | 登录会话有效期（小时或天数，按实现） |
+| `PORT` / `HOSTNAME` | `8080` / `0.0.0.0`（镜像） | Next.js 监听地址 |
+| `ANIMEKO_DATA_DIR` | `./data`（镜像 `/data`） | 数据目录 |
+| `ANIMEKO_AUTH_USER` / `ANIMEKO_AUTH_PASSWORD` | 空 | 登录账号密码（需成对配置） |
+| `ANIMEKO_AUTH_TOKEN` | 空 | 单独 Token 鉴权（与账号密码二选一） |
+| `ANIMEKO_AUTH_ENABLED` | 按凭据推导 | 显式开关鉴权 |
 | `ANIMEKO_COOKIE_SECURE` | `false` | HTTPS 部署时设为 `true` |
-| `ANIMEKO_TRUSTED_PROXY_HOPS` | `0` | 反代层数，用于限速的真实客户端 IP |
-| `ANIMEKO_BANGUMI_API_BASE` | 官方 API | 自定义 Bangumi API 地址（多地址逗号分隔） |
-| `ANIMEKO_REQUEST_TIMEOUT_MS` | `20000` | 上游请求超时（毫秒） |
-| `JAVA_OPTS` | 镜像默认堆上限 50% | JVM 参数 |
-
-> 具体默认值以 `backend/src/main/kotlin/com/animeko/web/config/AppConfig.kt` 为准。
+| `ANIMEKO_ALLOW_NO_AUTH` | `false` | 无鉴权对外暴露的显式确认（勿用于公网） |
+| `ANIMEKO_BANGUMI_BASE_URLS` | 官方 + 社区镜像 | Bangumi 候选地址（逗号分隔，最多 8 个） |
+| `ANIMEKO_DANMAKU_API_BASE` | `https://api.dandanplay.net` | 弹幕服务（弹弹 play `/api/v2` 协议兼容服务） |
+| `ANIMEKO_DANMAKU_APP_ID` / `ANIMEKO_DANMAKU_APP_SECRET` | 空 | 官方弹弹 play 接口签名凭据（自建兼容服务可留空） |
+| `ANIMEKO_SUBSCRIPTION_AUTO_IMPORT` | 空 | 开机自动导入的订阅地址（逗号分隔；`ANIMEKO_SEED_SUBSCRIPTION_URL` 为旧别名） |
+| `ANIMEKO_SUBSCRIPTION_AUTO_TIERS` | 空（全部） | 自动导入时的 tier 过滤（逗号分隔，仅影响自动导入） |
+| `ANIMEKO_SUBSCRIPTION_REFRESH_MS` | `21600000`（6 小时） | 已登记订阅的定时自动刷新间隔 |
+| `ANIMEKO_REQUEST_TIMEOUT_MS` | `20000` | 上游请求超时 |
+| `ANIMEKO_BANGUMI_TIMEOUT_MS` | `45000` | Bangumi 请求超时 |
+| `ANIMEKO_PROXY_TIMEOUT_MS` | `120000` | 媒体代理超时 |
+| `ANIMEKO_ALLOW_PRIVATE_TARGETS` | `false` | 允许代理 / 抓取内网地址 |
+| `ANIMEKO_ALLOW_CROSS_ORIGIN` | `false` | 关闭 API 写接口同源检查 |
+| `ANIMEKO_TRUSTED_PROXY_HOPS` | `0` | 反代层数（真实客户端 IP / Origin 判定） |
 
 ## 使用流程
 
-1. **搜索番剧**：顶部搜索框输入名称，同时检索 Bangumi 与已启用数据源。
-2. **导入数据源**：「数据源」页粘贴社区订阅链接或 JSON，预览后导入；可随时启用/停用、测试关键词。
-3. **收藏与追番**：条目页点收藏，播放页自动记录进度，「继续观看」随时接着看。
-4. **多设备同步**：同一部署登录后，收藏、进度、最近观看自动同步。
-5. **备份**：「设置 → 备份与恢复」导出 JSON；换机或重装后直接导入。
+1. **搜索番剧**：搜索页输入名称，同时检索 Bangumi 与全部启用数据源。
+2. **导入数据源**：「数据源」页粘贴订阅链接或 JSON，预览勾选后导入；可测试关键词、查看健康指标。
+3. **选集播放**：条目页自动匹配各源最佳结果 → 选集进入播放页；右侧「弹幕」页签搜索弹幕库或上传本地 XML。
+4. **增强播放**：工具栏加载外挂字幕、唤起外部播放器、下载当前集、切换直连 / 代理。
+5. **追番同步**：收藏、进度、最近观看自动同步；「设置 → 备份与恢复」导出 JSON 备份。
 
 ## 架构
 
 ```
-backend/   Kotlin + Ktor：API、鉴权、数据源解析、媒体代理、个人数据存储
-frontend/  React + Vite：Plex 风 UI、播放器、同步状态机
-e2e/       Playwright 浏览器冒烟与视觉回归
-scripts/   构建契约与冒烟自检
-Dockerfile 多阶段构建（前端 → 后端 → JRE 运行时）
+src/
+  app/                 Next.js App Router
+    page.tsx           首页（轮播 / 继续观看 / 新番 / 排行）
+    search|discover|favorites|sources|settings|play/
+    subject/[id]/      Bangumi 条目页
+    source/[name]/     数据源条目选集页
+    api/               Route Handlers：会话、Bangumi、个人数据、数据源、媒体代理、弹幕
+  components/          布局导航、海报卡片、轮播、播放器与弹幕面板
+  lib/                 前端数据层（同步状态机 / 收藏 / 进度 / 偏好）
+    player/            弹幕设置、字幕转换、外部播放器、m3u8 下载
+    server/            配置、鉴权、SSRF 守卫、原子存储、Bangumi 客户端、Selector 引擎
+public/assets/jassub/  自托管 ASS 字幕渲染 worker / wasm / 字体
+Dockerfile             多阶段构建（npm ci → next build → standalone 运行时）
 ```
 
-**目录结构**
+**与原 Kotlin + React 版本的关系**：本版本为整体迁移重写，API 路径与个人数据格式保持兼容，`data/` 目录可直接复用。Selector 引擎使用 Cheerio（CSS）+ 自研受限 JsonPath，**不支持 XPath 选择器与需要执行页面 JS 的源**（与原实现一致，不执行 `<script>`）。
 
-```
-backend/src/main/kotlin/com/animeko/web/
-  api/        路由：会话、数据源、个人数据、Bangumi、代理、静态托管
-  auth/       会话与凭据校验、限流
-  bangumi/    Bangumi 客户端与通道
-  data/       个人数据原子存储（含条目级 PATCH）
-  selector/   数据源引擎、健康监控、订阅导入
-  proxy/      代理会话与 HLS 改写
-  http/       SSRF 守卫、JSON 深度限制
-frontend/src/
-  components/ 播放器、布局、海报、Rail 分区
-  pages/      发现/搜索/条目/播放/收藏/数据源/设置
-  lib/        storage（同步）、prefs（设备偏好）、userDataMerge（合并）
-```
-
-## 开发与测试
-
-**后端**
-
-```bash
-cd backend && ./gradlew test          # 全部测试 + JaCoCo 覆盖率报告
-```
-
-**前端**
-
-```bash
-cd frontend
-npm ci
-npm run lint           # ESLint
-npm run test           # Vitest
-npm run test:coverage  # 覆盖率（阈值见 vite.config.ts）
-npm run build          # 类型检查 + 生产构建
-```
-
-**端到端**
-
-```bash
-python3 -m unittest discover -s scripts -p 'test_build_contracts.py'
-python3 -m unittest discover -s e2e -p 'test_smoke.py'
-# 浏览器冒烟（需要 Playwright）：见 e2e/smoke.py
-# 视觉回归（可选，非 CI 门禁）：python e2e/visual.py --update
-```
-
-CI（`.github/workflows/ci.yml`）在 push/PR 上运行：构建契约、后端测试 + JaCoCo、前端 lint/build/测试 + 覆盖率、Docker 构建与浏览器冒烟。
-
-## 数据与备份
-
-- 数据目录默认 `data/`（容器内 `/data`）：`userdata.json`（个人数据）、`selectors/`（数据源）、`bangumi-channel.json`、`sessions.db`。
-- 个人数据写入是「临时文件 + 原子替换 + 上次备份」，异常时自动从 `.bak` 恢复。
-- 备份导出只包含收藏、进度、源收藏、搜索历史、最近观看，不含数据源配置与凭据。
-
-## 常见问题
-
-**为什么搜索不到结果？**
-到「数据源」页检查是否有已启用的源，并用「测试」验证关键词；健康列会显示成功率与最近错误。
-
-**播放失败/一直加载？**
-先切换「直连播放」开关（设置页）；某些源必须走服务端代理才能带 Referer/Cookie。仍失败时看数据源健康状态与浏览器控制台。
-
-**收藏或进度丢失？**
-先确认登录的是同一个部署与账号；再到「设置 → 备份与恢复」导出当前数据，必要时从备份导入。
+**部署注意**：登录会话与媒体代理会话为进程内存态，请单副本部署；重启后需重新登录，正在播放的代理链接会失效（播放页会自动重新解析一次）。
 
 ## 许可证
 
-基于 animeko（AGPL-3.0）架构的服务端化实现。数据源解析逻辑来自社区生态，请遵守各数据源站点的使用条款。
+基于 animeko（AGPL-3.0）架构的服务端化实现。数据源解析逻辑来自社区生态，请遵守各数据源站点的使用条款；弹幕服务遵循弹弹 play 开放接口协议。
