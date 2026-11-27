@@ -1,19 +1,30 @@
 # Dependabot：Actions、Docker 基础镜像与根目录 npm 依赖的周更。
-# 旧 frontend(Vite) 与 backend(Gradle) 已随 Next.js 迁移移除，对应配置一并清理。
+# 只提 minor / patch 升级：major（Next 16、React 19、TypeScript 7 等）需要单独评估迁移，
+# 直接自动升级只会在 CI 上制造失败 PR。
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: '*'
+        update-types: ['version-update:semver-major']
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: '*'
+        update-types: ['version-update:semver-major']
   - package-ecosystem: npm
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: '*'
+        update-types: ['version-update:semver-major']
     groups:
       # 播放器相关依赖总是一起动，拆开只是噪音
       player:
