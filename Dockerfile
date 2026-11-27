@@ -5,6 +5,8 @@ FROM node:22-alpine AS build
 WORKDIR /app
 
 COPY package.json package-lock.json ./
+# postinstall 会执行 scripts/copy-jassub.mjs，依赖层必须提前带上，否则 npm ci 直接失败
+COPY scripts/copy-jassub.mjs ./scripts/copy-jassub.mjs
 RUN --mount=type=cache,target=/root/.npm \
     npm ci --no-audit --no-fund
 
