@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # === 构建阶段：安装依赖并产出 Next.js standalone ===
-FROM node:22-alpine AS build
+FROM node:26-alpine AS build
 WORKDIR /app
 
 COPY package.json package-lock.json ./
@@ -15,7 +15,7 @@ ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
 # === 运行时：standalone + 静态资源，非 root 运行 ===
-FROM node:22-alpine
+FROM node:26-alpine
 WORKDIR /app
 
 RUN apk add --no-cache su-exec curl tzdata \
